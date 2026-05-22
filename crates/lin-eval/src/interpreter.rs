@@ -459,6 +459,9 @@ impl Interpreter {
         // Copy intrinsics into module env
         for name in &[
             "print", "length", "toString",
+            "push", "concat", "keys", "values", "entries",
+            "for", "range", "iterOf", "map", "filter", "reduce", "iter",
+            "toFloat64", "isInt32", "toInt32",
             "__stringSlice", "__stringIndexOf", "__stringToUpper",
             "__stringToLower", "__stringTrim", "__stringLength",
             "__stringContains", "__stringStartsWith", "__stringEndsWith",

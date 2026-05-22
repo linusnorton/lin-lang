@@ -1,8 +1,16 @@
 export val map = (arr: Json, f: Function): Json =>
-  __arrayMap(arr, f)
+  val result = []
+  arr.for(item => push(result, f(item)))
+  result
 
 export val filter = (arr: Json, f: Function): Json =>
-  __arrayFilter(arr, f)
+  val result = []
+  arr.for(item =>
+    if f(item) then push(result, item) else null
+  )
+  result
 
 export val reduce = (arr: Json, init: Json, f: Function): Json =>
-  __arrayReduce(arr, init, f)
+  var acc = init
+  arr.for(item => acc = f(acc, item))
+  acc
