@@ -48,11 +48,13 @@ impl Lexer {
             return tok;
         }
 
-        if self.at_line_start && self.inside_balanced() == false {
+        if self.at_line_start {
             self.at_line_start = false;
-            self.handle_indentation();
-            if let Some(tok) = self.pending_tokens.pop() {
-                return tok;
+            if !self.inside_balanced() {
+                self.handle_indentation();
+                if let Some(tok) = self.pending_tokens.pop() {
+                    return tok;
+                }
             }
         }
 

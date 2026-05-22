@@ -1056,3 +1056,15 @@ fn test_showcase_example() {
     assert!(interp.output.contains(&"Honors: Bob, Diana".to_string()));
     assert!(interp.output.contains(&"fib(9) = 34".to_string()));
 }
+#[test]
+fn test_multiline_import() {
+    let output = run(r#"
+import {
+  trim,
+  toUpper
+} from "std/string"
+
+print("  hello  ".trim().toUpper())
+"#);
+    assert_eq!(output, vec!["HELLO"]);
+}

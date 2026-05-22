@@ -135,6 +135,7 @@ impl Parser {
             self.skip_newlines();
         }
         self.expect(TokenKind::RBrace);
+        self.skip_newlines();
         self.expect_keyword(TokenKind::From);
         let path = self.expect_string();
         Stmt::Import { bindings, path, span }
