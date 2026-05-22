@@ -20,6 +20,7 @@ pub struct Interpreter {
     module_cache: HashMap<String, HashMap<String, Value>>,
     stdlib_sources: HashMap<String, &'static str>,
     base_path: Option<std::path::PathBuf>,
+    source: String,
 }
 
 impl Interpreter {
@@ -30,6 +31,7 @@ impl Interpreter {
             module_cache: HashMap::new(),
             stdlib_sources: HashMap::new(),
             base_path: None,
+            source: String::new(),
         };
         interp.register_intrinsics();
         interp.register_stdlib_sources();
@@ -345,6 +347,14 @@ impl Interpreter {
         });
     }
 
+    fn error_at(&self, span: lin_common::Span, msg: &str) -> String {
+        if self.source.is_empty() || span.start == 0 && span.end == 0 {
+            return msg.to_string();
+        }
+        let (line, col) = span.line_col(&self.source);
+        format!("[line {}:{}] {}", line, col, msg)
+    }
+
     fn define_native(&mut self, name: &str, arity: usize, func: NativeFn) {
         self.global_env.define(
             name.to_string(),
@@ -357,6 +367,7 @@ impl Interpreter {
     }
 
     pub fn run(&mut self, source: &str) -> Result<Value, String> {
+        self.source = source.to_string();
         let mut lexer = Lexer::new(source, 0);
         let tokens = lexer.tokenize();
         let mut parser = Parser::new(tokens);
@@ -594,10 +605,10 @@ impl Interpreter {
             Expr::BoolLit(b, _) => Ok(Value::Bool(*b)),
             Expr::NullLit(_) => Ok(Value::Null),
 
-            Expr::Ident(name, _) => {
+            Expr::Ident(name, span) => {
                 env.get(name)
                     .or_else(|| self.global_env.get(name))
-                    .ok_or_else(|| format!("Undefined variable: {}", name))
+                    .ok_or_else(|| self.error_at(*span, &format!("Undefined variable: {}", name)))
             }
 
             Expr::StringInterp(parts, _) => {
@@ -638,16 +649,17 @@ impl Interpreter {
                 self.eval_binary_op(&l, op, &r)
             }
 
-            Expr::Call { func, args, .. } => {
+            Expr::Call { func, args, span } => {
                 let func_val = self.eval_expr_in_env(func, env)?;
                 let mut arg_vals = Vec::new();
                 for arg in args {
                     arg_vals.push(self.eval_expr_in_env(arg, env)?);
                 }
                 self.call_value(&func_val, arg_vals, env)
+                    .map_err(|e| if e.starts_with('[') { e } else { self.error_at(*span, &e) })
             }
 
-            Expr::DotCall { receiver, method, args, .. } => {
+            Expr::DotCall { receiver, method, args, span } => {
                 let recv = self.eval_expr_in_env(receiver, env)?;
 
                 // Special case: handle TupleArgs receiver
@@ -669,7 +681,7 @@ impl Interpreter {
                 // Look up the method
                 let func_val = env.get(method)
                     .or_else(|| self.global_env.get(method))
-                    .ok_or_else(|| format!("Undefined function: {}", method))?;
+                    .ok_or_else(|| self.error_at(*span, &format!("Undefined function: {}", method)))?;
 
                 let mut all_args = first_args;
                 if let Some(call_args) = args {
@@ -679,12 +691,14 @@ impl Interpreter {
                 }
 
                 self.call_value(&func_val, all_args, env)
+                    .map_err(|e| if e.starts_with('[') { e } else { self.error_at(*span, &e) })
             }
 
-            Expr::Index { object, key, .. } => {
+            Expr::Index { object, key, span } => {
                 let obj = self.eval_expr_in_env(object, env)?;
                 let k = self.eval_expr_in_env(key, env)?;
                 self.eval_index(&obj, &k)
+                    .map_err(|e| if e.starts_with('[') { e } else { self.error_at(*span, &e) })
             }
 
             Expr::If { condition, then_branch, else_branch, .. } => {
