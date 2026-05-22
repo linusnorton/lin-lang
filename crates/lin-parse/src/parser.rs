@@ -201,7 +201,9 @@ impl Parser {
 
     fn parse_or_expr(&mut self) -> Expr {
         let mut left = self.parse_and_expr();
-        while self.check(TokenKind::Or) {
+        loop {
+            self.skip_continuation_newline(TokenKind::Or);
+            if !self.check(TokenKind::Or) { break; }
             let span = self.current_span();
             self.advance();
             self.skip_newlines();
@@ -218,7 +220,9 @@ impl Parser {
 
     fn parse_and_expr(&mut self) -> Expr {
         let mut left = self.parse_equality_expr();
-        while self.check(TokenKind::And) {
+        loop {
+            self.skip_continuation_newline(TokenKind::And);
+            if !self.check(TokenKind::And) { break; }
             let span = self.current_span();
             self.advance();
             self.skip_newlines();
@@ -231,6 +235,18 @@ impl Parser {
             };
         }
         left
+    }
+
+    fn skip_continuation_newline(&mut self, expected: TokenKind) {
+        if self.check(TokenKind::Newline) {
+            let saved = self.pos;
+            self.skip_newlines();
+            if std::mem::discriminant(&self.peek_kind()) == std::mem::discriminant(&expected) {
+                // Continuation line — stay at new position
+            } else {
+                self.pos = saved;
+            }
+        }
     }
 
     fn parse_equality_expr(&mut self) -> Expr {

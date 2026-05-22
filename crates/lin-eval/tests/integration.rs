@@ -764,3 +764,72 @@ print(toString(data["users"][1]["scores"][2]))
 "#);
     assert_eq!(output, vec!["Alice", "90"]);
 }
+
+#[test]
+fn test_continuation_lines_and() {
+    let output = run(r#"
+val person = { "age": 25, "name": "Bob", "active": true }
+val result = person["age"] >= 18
+  && person["name"] == "Bob"
+  && person["active"]
+print(toString(result))
+"#);
+    assert_eq!(output, vec!["true"]);
+}
+
+#[test]
+fn test_continuation_lines_or() {
+    let output = run(r#"
+val x = false
+val y = true
+val result = x
+  || y
+print(toString(result))
+"#);
+    assert_eq!(output, vec!["true"]);
+}
+
+#[test]
+fn test_continuation_in_if_condition() {
+    let output = run(r#"
+val age = 25
+val active = true
+val result = if age >= 18
+  && active
+  then "active adult"
+  else "other"
+print(result)
+"#);
+    assert_eq!(output, vec!["active adult"]);
+}
+
+#[test]
+fn test_import_aliasing() {
+    let output = run(r#"
+import { trim as t } from "std/string"
+val result = "  hi  ".t()
+print(result)
+"#);
+    assert_eq!(output, vec!["hi"]);
+}
+
+#[test]
+fn test_tuple_dot_application() {
+    let output = run(r#"
+val sub = (a: Int32, b: Int32): Int32 => a - b
+val result = (10, 3).sub
+print(toString(result))
+"#);
+    assert_eq!(output, vec!["7"]);
+}
+
+#[test]
+fn test_array_rest_destructuring() {
+    let output = run(r#"
+val [first, ...rest] = [1, 2, 3, 4, 5]
+print(toString(first))
+print(toString(length(rest)))
+print(toString(rest[0]))
+"#);
+    assert_eq!(output, vec!["1", "4", "2"]);
+}
