@@ -1,0 +1,17 @@
+export val trim = (s: String): String =>
+  __stringTrim(s)
+
+export val toUpper = (s: String): String =>
+  __stringToUpper(s)
+
+export val toLower = (s: String): String =>
+  __stringToLower(s)
+
+export val substring = (s: String, start: Int32, end: Int32): String =>
+  __stringSlice(s, start, end)
+
+export val indexOf = (s: String, needle: String): Int32 =>
+  __stringIndexOf(s, needle)
+
+export val length = (s: String): Int32 =>
+  __stringLength(s)

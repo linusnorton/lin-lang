@@ -1,0 +1,16 @@
+// String interpolation
+val name = "Bob"
+val age = 42
+val greeting = "Hello ${name}, you are ${age + 1} next year"
+print(greeting)
+
+// Escape sequences
+val tabbed = "col1\tcol2"
+print(tabbed)
+
+val quoted = "she said \"hi\""
+print(quoted)
+
+// String concatenation
+val full = "Hello" + " " + "World"
+print(full)

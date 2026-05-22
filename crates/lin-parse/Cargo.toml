@@ -1,0 +1,8 @@
+[package]
+name = "lin-parse"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+lin-common = { path = "../lin-common" }
+lin-lex = { path = "../lin-lex" }

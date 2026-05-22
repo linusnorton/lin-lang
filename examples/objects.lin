@@ -1,0 +1,36 @@
+val person = {
+  "name": "Bob",
+  "age": 42,
+  "active": true
+}
+
+// Bracket access
+print(person["name"])
+print(toString(person["age"]))
+
+// Safe access - missing key returns null
+val missing = person["doesnt_exist"]
+print(toString(missing))
+
+// Null propagation
+val deep = person["a"]["b"]["c"]
+print(toString(deep))
+
+// Array access
+val numbers = [1, 2, 3]
+print(toString(numbers[0]))
+print(toString(numbers[2]))
+
+// Equality
+val obj1 = { "a": 1, "b": 2 }
+val obj2 = { "b": 2, "a": 1 }
+print(toString(obj1 == obj2))
+
+// Destructuring
+val { "name": myName } = person
+print(myName)
+
+// Shorthand destructuring
+val { name, age } = person
+print(name)
+print(toString(age))

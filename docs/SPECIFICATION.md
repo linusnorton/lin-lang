@@ -34,6 +34,10 @@ val x = 1 // This is also a comment
 
 Indentation defines blocks. Indentation is always two spaces per level. Tabs are not permitted for indentation.
 
+Source files use LF line endings. CRLF is rejected with a diagnostic; mixed line endings are an error.
+
+Blank lines are permitted anywhere inside a block and do not affect block structure.
+
 ```txt
 val add = (a: Int32, b: Int32) =>
   a + b
@@ -47,11 +51,12 @@ val calculate = (x: Int32): Int32 =>
   doubled + 1
 ```
 
-A logical line may continue on the next line when the continuation begins with `&&` or `||`. In that case, the continuation must be indented one level deeper than the start of the expression.
+A logical line may continue on the next line when the continuation begins with `&&` or `||`. The continuation must be indented at least one level deeper than the start of the line; any deeper indent is acceptable. Multiple stacked continuations are allowed.
 
 ```txt
 val isAdultBob = person["age"] >= 18
   && person["name"] == "Bob"
+  && person["active"]
 ```
 
 ### 3.3 Identifiers
@@ -179,11 +184,17 @@ Without a suffix, integer literals default to `Int32` and floating-point literal
 
 ### 3.7 Negative Literals
 
-A leading `-` immediately preceding a numeric literal, with no whitespace, is part of the literal.
+A leading `-` is part of a numeric literal when:
+
+1. there is no whitespace between the `-` and the digits, and
+2. the previous token cannot end an expression (i.e., it is one of `(`, `,`, `=`, `=>`, `:`, an operator, or a keyword such as `then`, `else`, `is`, `has`, `when`, `return`-style position).
+
+Otherwise the `-` is parsed as the binary subtraction operator.
 
 ```txt
-val temperature: Int32 = -5
-val small: Float64 = -0.001
+val temperature: Int32 = -5      // literal
+val delta: Int32 = x - 5          // subtraction
+val passed = f(-5, x - 3)         // first: literal; second: subtraction
 ```
 
 There is no unary minus operator on arbitrary expressions in this version of the language. To negate a computed value, subtract from zero:
@@ -280,20 +291,42 @@ Iterable<T>
 
 ## 6. JSON Access
 
-JSON object field access uses bracket notation.
+Bracket notation is used for both JSON object key access and array indexing. Bracket access is **safe by default**: object accesses never raise an error, and `Null` propagates through chains.
 
 ```txt
 val name = person["name"]
 val city = person["address"]["city"]
+val first = numbers[0]
 ```
 
 Dot syntax is not used for JSON field access.
 
-Array indexing also uses brackets.
+### 6.1 Runtime Semantics
+
+| Operand kind          | Access                                  | Result                          |
+| ---                   | ---                                     | ---                             |
+| Object, key present   | `obj["k"]`                              | the stored value                |
+| Object, key missing   | `obj["k"]`                              | `Null`                          |
+| `Null`                | `null["k"]`                             | `Null`                          |
+| Array, index in range | `arr[i]`                                | the element                     |
+| Array, index OOB      | `arr[i]`                                | runtime error                   |
+| `Null`                | `null[i]`                               | `Null`                          |
+
+Because `Null` propagates, you may chain accesses through unknown structures without intermediate checks:
 
 ```txt
-val first = numbers[0]
+val deep = obj["some"]["prop"]["that"]["doesnt"]["exist"]  // null
 ```
+
+This is equivalent to the optional-chaining operator (`?.`) in other languages — but it applies to every bracket access by default.
+
+### 6.2 Static Typing of Access
+
+- If the operand's static type is a typed object that declares the key as `T`, the access has type `T`.
+- If the operand's static type is `Json`, the access has type `Json` (which already covers `Null`).
+- If the operand's static type is a typed object that does **not** declare the key, the access is a compile-time error. (Use `Json` if you need free-form access.)
+- If the operand may be `Null` (e.g., a union `T | Null`), the access type widens to include `Null`.
+- Array element access on `T[]` has type `T` (the static type does not include `Null`; the runtime error is the contract for OOB).
 
 ## 7. Bindings
 
@@ -422,7 +455,31 @@ Generic type application also uses angle brackets.
 type ParseInt32Result = Result<Int32, String>
 ```
 
-### 8.7 Structural Typing
+### 8.7 Type Expression Precedence
+
+Type-expression operators bind in this order, tightest first:
+
+```txt
+1. T[]                 (postfix array)
+2. Generic<T1, T2>     (postfix generic application)
+3. (T1, T2) => U       (function arrow)
+4. T | U               (union)
+```
+
+So `Int32 | String[]` parses as `Int32 | (String[])`, and `(Int32) => String[]` parses as `(Int32) => (String[])`. Parenthesise to disambiguate where the surface reading is unclear.
+
+### 8.8 Variance
+
+Generic types are **covariant** in their parameters where they appear in producer position (return type, array element, container content), and **contravariant** in consumer position (function arguments).
+
+Concretely:
+
+- `Person[]` is assignable to `Json[]`.
+- `Iterator<Person>` is assignable to `Iterator<Json>`.
+- `(Person) => Int32` is assignable to `(Bob) => Int32` for any `Bob` compatible with `Person`.
+- A function returning `Person` is assignable to one returning `Json`.
+
+### 8.9 Structural Typing
 
 Types are structural by default.
 
@@ -615,19 +672,18 @@ val result = toUpper(trim("  hello  "))
 
 `if` is an expression and must produce a value. Every `if` requires an `else` branch.
 
-`then` and `else` may appear on the same line as `if`, or on subsequent lines indented one level deeper than `if`. Both forms are valid.
+Three layout forms are supported:
 
 ```txt
+// Single-line
 val a = if cond then x else y
-```
 
-```txt
+// then/else on subsequent lines, one block deeper than `if`
 val b = if cond
   then x
   else y
-```
 
-```txt
+// Block branches, also one block deeper than `if`
 val c = if cond
   then
     val prefix = "ad"
@@ -637,6 +693,8 @@ val c = if cond
     prefix + "ild"
 ```
 
+`then` and `else` must be at the same indent level — exactly one indent level deeper than the column of `if`.
+
 A logical line that begins an `if` may continue using `&&` or `||` as described in §3.2:
 
 ```txt
@@ -645,6 +703,23 @@ val label = if person["age"] >= 18
   then "active adult"
   else "other"
 ```
+
+### 12.1 Nested `if` Inside `match`
+
+`else` always binds to the closest preceding `if` or `match` whose indent is one level shallower. Concretely:
+
+```txt
+match input
+  has { name } =>
+    if name == "Dave"
+      then "Big Dave!"
+      else "regular ${name}"
+
+  else =>
+    "no name"
+```
+
+The inner `if`'s `else` is at column 6 (under `then`); the outer `match`'s `else` is at column 2 (under `has`). No ambiguity.
 
 ## 13. `is` and `has` Expressions
 
@@ -675,6 +750,16 @@ val isDave = (input: String): Boolean =>
 ```
 
 `is` is not supported against generic type applications in v1. Writing `value is Result<Int32, String>` is a compile-time error. Match the underlying tagged shape instead (see §18).
+
+`is` and `has` are expressions of type `Boolean` and may be used in any expression context, not only `if` conditions and `match` arms:
+
+```txt
+val isAdult = person has { age } && person["age"] >= 18
+```
+
+Literal values used with `is` have base type, not singleton type. `"Dave" is "Dave"` is true; the type of the literal `"Dave"` is `String`.
+
+A single `match` arm may not combine `is` and `has` patterns — each arm uses one keyword.
 
 ### 13.2 `has`
 
@@ -1101,9 +1186,25 @@ val message = match divide(10.0, 2.0)
 
 ## 19. Errors
 
-There are no exceptions and no throwing. Errors are ordinary values. A function that may fail should return a union type.
+There are no exceptions and no throwing in user code. Errors are ordinary values. A function that may fail should return a union type.
 
 An `Error` built-in type may exist for conventional error values, but it has no special control-flow behaviour.
+
+### 19.1 Runtime Errors
+
+A small number of language-level operations can fail at runtime. They terminate the program with a diagnostic — they do not produce a value, and they cannot be caught. They are reserved for unrecoverable program errors:
+
+| Operation                                 | Result on failure |
+| ---                                       | --- |
+| Array index out of bounds                 | runtime error |
+| Integer division by zero (`/`, `%`)       | runtime error |
+| Explicit narrowing cast that loses information | runtime error |
+| Non-exhaustive `match` (no arm matched and no `else`) | runtime error |
+| Module initialisation cycle (§20.5)       | runtime error |
+
+Object key access never causes a runtime error — missing keys produce `Null` (§6).
+
+Floating-point operations follow IEEE 754: division by zero produces `±Infinity` or `NaN`, not an error. Integer `%` follows the sign of the dividend (Rust convention).
 
 ## 20. Imports
 
@@ -1310,11 +1411,61 @@ Closures capture `var` bindings by reference. Two closures that capture the same
 
 ### 27.3 Tail Call Optimisation
 
-The compiler is required to perform tail call optimisation for self-recursive calls in tail position. Recursive idioms (factorial, iterator construction over large sequences) must run in constant stack space when expressed tail-recursively.
+The compiler is required to perform tail call optimisation for **direct self-recursive calls** in tail position. Recursive idioms (factorial, iterator construction over large sequences) must run in constant stack space when expressed tail-recursively. Mutual tail recursion is not required to be optimised in v1.
+
+### 27.4 Numbers
+
+Each numeric family has a distinct runtime representation. There is no single "Number" type. Numeric values carry their family tag at runtime so that operations can dispatch on the correct width and signedness.
+
+### 27.5 Objects
+
+JSON objects are stored as insertion-ordered key/value maps. Iteration order matches insertion order. Equality is order-independent (§14).
+
+### 27.6 Iterators
+
+An iterator is an opaque runtime value containing:
+
+1. an initial-state thunk,
+2. a continuation predicate,
+3. a next-state function,
+4. a current-value function,
+5. the current state cell (set lazily on first step).
+
+Only the `for` built-in may step through this state; user code cannot read it.
+
+### 27.7 Partial Application
+
+Partial application produces a value carrying the original function pointer and the accumulated arguments. Further application appends to the buffer. When the buffer matches the original arity, the function is invoked. This avoids allocating a new closure per argument.
+
+### 27.8 `toString`
+
+Every primitive supports `toString`:
+
+- Integers: decimal, no leading zeros, with `-` for negatives.
+- Floats: shortest round-trip decimal representation; integer-valued floats render with a trailing `.0` (e.g. `42.0`).
+- `Boolean`: `"true"` / `"false"`.
+- `Null`: `"null"`.
+- `String`: returns itself.
+
+`toString` is used implicitly by string interpolation `${expr}`.
+
+### 27.9 Comparison
+
+`<`, `<=`, `>`, `>=` on strings compare by codepoint order. On numbers, by mathematical value after widening (§26). On other types: compile-time error.
+
+### 27.10 `length()`
+
+`length()` is defined for:
+
+- `String` → number of codepoints (`Int32`).
+- `T[]` → number of elements (`Int32`).
+- `Json` → for arrays, element count; for objects, key count; for any other variant, runtime error.
+
+It is **not** defined on plain objects of declared shape — those have a fixed schema.
 
 ## 28. Compilation Model
 
-The language is compiled, not interpreted. The compilation pipeline:
+The language is compiled, not interpreted from the user's perspective. The compilation pipeline:
 
 ```txt
 source (.lin files)
@@ -1333,6 +1484,38 @@ A program is built from one entry-point `.lin` file and its transitive imports, 
 
 v1 is pure: there are no language-level effects beyond `print`. There is no async, no concurrency, no IO library beyond textual output.
 
+### 28.1 Reference Implementation
+
+The reference implementation is written in **Rust** and laid out as a Cargo workspace:
+
+```txt
+lin-lang/
+  Cargo.toml                 (workspace root)
+  crates/
+    lin-common/              shared types: Span, Diagnostic, intern table
+    lin-lex/                 lexer, indentation tokenizer
+    lin-parse/               parser, surface AST
+    lin-check/               desugaring, type checker, core AST
+    lin-eval/                tree-walking interpreter (v1 backend)
+    lin-stdlib/              built-in stdlib functions
+    lin/                     the CLI binary
+  docs/
+  examples/
+```
+
+The interpreter in `lin-eval` is the v1 backend. A native codegen target is deferred (§30).
+
+### 28.2 Diagnostics
+
+The compiler halts at the first error in a given phase. Errors are presented with:
+
+- the source span (file, line, column),
+- the surrounding source excerpt,
+- the rule violated,
+- where applicable, a call stack for runtime errors.
+
+The first-error policy keeps the v1 implementation simple; multi-error recovery is deferred.
+
 ## 29. Implementation Notes
 
 Important desugarings:
@@ -1350,45 +1533,59 @@ Iterator construction is not desugared to JSON object construction — it create
 
 ## 30. Open Questions
 
-The following points are deferred and not required to begin implementation:
+Deferred — not required to begin implementation:
 
-1. **Compilation target.** The pipeline produces a single output artifact (§28); the concrete target (native, bytecode, transpiled language) is deferred.
+1. **Native compilation target.** v1 uses a tree-walking interpreter (§28.1). A native or bytecode target is deferred.
 2. **Concurrency model.** v1 is single-threaded and synchronous.
-3. **Exact stdlib API.** Module layout is fixed (§20.6); the precise function signatures within each module are deferred.
-4. **Tooling.** Formatter, LSP, test runner are deferred.
-5. **Object rest destructuring iteration order.** Equality is order-independent (§14); rest-spread iteration order is unspecified.
+3. **Exact stdlib API.** Module layout is fixed (§20.6); precise signatures within each module are still being filled in incrementally.
+4. **Tooling.** Formatter, LSP, test runner as a first-class command are deferred.
+5. **Object rest destructuring iteration order.** Object iteration order matches insertion (§27.5); whether rest-spread preserves that exact order is unspecified.
 6. **`Iterable<T>` mechanism.** Whether it is a true protocol-like type, a compiler-known structural capability, or purely a built-in opaque interface.
-7. **Full numeric widening matrix.** §26 specifies the principle (always widen to safe type); the complete pairwise table is deferred.
+7. **Full numeric widening matrix.** §26 specifies the principle; the complete pairwise table is deferred.
+8. **Multi-error reporting.** First-error-then-halt policy for v1; recoverable parsing/checking is deferred.
 
-The following points are decided:
+Decided:
 
 1. `export` may be used on `val`, `var`, and `type` declarations.
 2. `Json` is a built-in type.
 3. `Unknown` and `Never` are not built-in types initially.
 4. `is Person` is exact; `has Person` or `has { ... }` matches shape and allows extra fields.
-5. `is` on generic type applications (e.g. `is Result<Int32, String>`) is unsupported in v1.
-6. Assignment expressions evaluate to the assigned value.
-7. Operators are built-in, not ordinary functions. No unary operators in v1.
-8. `Iterator<T>` and `Iterable<T>` are opaque runtime types.
-9. Arrays satisfy `Iterable<T>` automatically.
-10. Array types are `T[]` (unbounded) and `[T1, T2, ...]` (fixed-length).
-11. Strings use `"..."` with `${expr}` interpolation and standard escapes; UTF-8, length-prefixed, codepoint-aware indexing via stdlib.
-12. Source files use the `.lin` extension.
-13. The language is compiled to a single output artifact.
-14. `for` is a built-in function; `map`, `filter`, `reduce`, `range`, `iter`, `iterOf` are library functions.
-15. `else` is the catch-all in `match`; arms each take their own indented line; no `_` wildcard.
-16. Over-application of a function is a compile-time error.
-17. JSON objects are unordered for equality; arrays are ordered.
-18. `length()` and other accessor-style functions always require parentheses.
-19. Recursive `val` is permitted only when the right-hand side is a function literal.
-20. Closures capture `var` bindings as shared mutable cells.
-21. The compiler must perform tail call optimisation for self-recursive tail calls.
-22. Generic inference uses bidirectional type checking.
-23. Exhaustiveness is a compile-time error for closed `is`/literal unions and a warning otherwise.
-24. Numeric widening is always to a type that can fully represent both operand ranges.
-25. Standard library layout is `std/string`, `std/number`, `std/array`, `std/result`, `std/io`.
-26. Two-space indentation; `&&` and `||` may begin a continuation line.
-27. Circular imports resolve lazily; first read of an export forces full init; cycles inside an init chain are a runtime error.
+5. `is` on generic type applications is unsupported in v1.
+6. `is`/`has` are expressions of type `Boolean` and may appear in any expression context.
+7. A single `match` arm uses either `is` or `has`, not both.
+8. Assignment expressions evaluate to the assigned value.
+9. Operators are built-in, not ordinary functions. No unary operators in v1.
+10. `Iterator<T>` and `Iterable<T>` are opaque runtime types.
+11. Arrays satisfy `Iterable<T>` automatically.
+12. Array types are `T[]` (unbounded) and `[T1, T2, ...]` (fixed-length).
+13. Strings use `"..."` with `${expr}` interpolation and standard escapes; UTF-8, length-prefixed; codepoint-aware indexing via stdlib (`at`).
+14. Source files use the `.lin` extension; LF line endings only.
+15. The language is compiled; the v1 backend is a tree-walking Rust interpreter.
+16. `for` is a built-in function; `map`, `filter`, `reduce`, `range`, `iter`, `iterOf` are library functions.
+17. `else` is the catch-all in `match`; arms each take their own indented line; no `_` wildcard.
+18. Over-application of a function is a compile-time error.
+19. JSON objects are unordered for equality; insertion-ordered at runtime; arrays are ordered.
+20. `length()` and other accessor-style functions always require parentheses.
+21. Recursive `val` is permitted only when the right-hand side is a function literal.
+22. Closures capture `var` bindings as shared mutable cells.
+23. The compiler must perform TCO for direct self-recursive tail calls.
+24. Generic inference uses bidirectional type checking.
+25. Exhaustiveness is a compile-time error for closed `is`/literal unions and a warning otherwise; non-exhaustive runtime fall-through is a runtime error.
+26. Numeric widening is always to a type that can fully represent both operand ranges; widening is applied everywhere (operators, calls, returns, assignments) but narrowing is never implicit.
+27. Standard library layout is `std/string`, `std/number`, `std/array`, `std/result`, `std/io`.
+28. Two-space indentation; `&&`/`||` may begin a continuation line at any deeper indent.
+29. Circular imports resolve lazily; first read of an export forces full init; cycles inside an init chain are a runtime error.
+30. Bracket access is safe: missing object key → `Null`, `Null` propagates; array OOB is a runtime error.
+31. Generic types are covariant in producer positions, contravariant in consumer positions.
+32. Type-expression precedence: `[]` > `<>` > `=>` > `|`.
+33. Literal types: literal values have their base type (`"Dave"` is `String`), not a singleton type.
+34. Runtime errors halt the program; they cannot be caught.
+35. Integer division by zero is a runtime error; floating-point follows IEEE 754.
+36. `toString` is defined for every primitive (§27.8); used implicitly by string interpolation.
+37. `length()` works on `String`, `T[]`, and `Json` (array or object variants).
+38. Comparison `<`, `<=`, `>`, `>=` uses codepoint order for strings, mathematical order for numbers.
+39. Source files use LF line endings; CRLF is rejected.
+40. Blank lines inside indented blocks are allowed and ignored.
 
 ## 31. Complete Example
 

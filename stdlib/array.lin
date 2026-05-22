@@ -1,0 +1,8 @@
+export val map = (arr: Json, f: Function): Json =>
+  __arrayMap(arr, f)
+
+export val filter = (arr: Json, f: Function): Json =>
+  __arrayFilter(arr, f)
+
+export val reduce = (arr: Json, init: Json, f: Function): Json =>
+  __arrayReduce(arr, init, f)

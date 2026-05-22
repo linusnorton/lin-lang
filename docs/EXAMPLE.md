@@ -126,6 +126,16 @@ val city = person["address"]["city"]
 val firstNumber = numbers[0]
 val firstTag = person["tags"][0]
 
+// Bracket access is safe by default
+// Missing keys return Null, and Null propagates through chains
+
+val missing = person["doesnt_exist"]                                  // null
+val deeplyMissing = person["a"]["b"]["c"]["d"]                        // null
+val nullChained: Null = null["anything"]["here"]                      // null
+
+// Arrays: OOB is a runtime error (not safe)
+// Use length() to guard, or stay within known bounds
+
 
 // ------------------------------------------------------------
 // Types

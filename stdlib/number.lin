@@ -1,0 +1,14 @@
+export val parseInt32 = (s: String): Int32 =>
+  __parseInt32(s)
+
+export val parseFloat64 = (s: String): Float64 =>
+  __parseFloat64(s)
+
+export val toInt32 = (v: Float64): Int32 =>
+  __toInt32(v)
+
+export val toFloat64 = (v: Int32): Float64 =>
+  __toFloat64(v)
+
+export val isInt32 = (s: String): Boolean =>
+  __isInt32(s)

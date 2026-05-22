@@ -1,0 +1,54 @@
+import { trim, toUpper } from "std/string"
+import { print } from "std/io"
+
+val describeName = (input: Json): String =>
+  match input
+    is Null => "No name"
+    is "Dave" => "Big Dave!"
+    has { name, age } when age > 30 => "Old person: ${name}"
+    has { name } => "Young person: ${name}"
+    is String => "Name: ${input}"
+
+print(describeName(null))
+print(describeName("Dave"))
+print(describeName({ "name": "Bob", "age": 42 }))
+print(describeName({ "name": "Alice", "age": 25 }))
+print(describeName("Jane"))
+
+val parseAge = (input: String): Json =>
+  if input.isInt32()
+    then { "type": "success", "value": input.toInt32() }
+    else { "type": "failure", "error": "Invalid age" }
+
+val result = parseAge("42")
+val message = match result
+  has { "type": "success", value } => "Parsed: ${toString(value)}"
+  has { "type": "failure", error } => "Error: ${error}"
+
+print(message)
+
+val errResult = parseAge("abc")
+val errMessage = match errResult
+  has { "type": "success", value } => "Parsed: ${toString(value)}"
+  has { "type": "failure", error } => "Error: ${error}"
+
+print(errMessage)
+
+// Test string stdlib
+val cleaned = "  hello  ".trim().toUpper()
+print(cleaned)
+
+// Test chaining with map/filter/reduce
+val people = [
+  { "name": "Bob", "age": 42 },
+  { "name": "Alice", "age": 17 },
+  { "name": "Charlie", "age": 55 }
+]
+
+val adultNames = people
+  .filter(p => p["age"] >= 18)
+  .map(p => p["name"])
+
+adultNames.for(n =>
+  print(n)
+)

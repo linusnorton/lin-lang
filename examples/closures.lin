@@ -1,0 +1,24 @@
+// Mutable bindings
+var count = 0
+count = count + 1
+print(toString(count))
+
+// Assignment evaluates to the assigned value
+val result = count = count + 1
+print(toString(result))
+print(toString(count))
+
+// Counter closure
+val makeCounter = (start: Int32) =>
+  var count = start
+  () =>
+    count = count + 1
+    count
+
+val counter = makeCounter(0)
+val one = counter()
+val two = counter()
+val three = counter()
+print(toString(one))
+print(toString(two))
+print(toString(three))

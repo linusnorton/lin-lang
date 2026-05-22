@@ -1,0 +1,5 @@
+export val range = (start: Int32, end: Int32): Iterator =>
+  __range(start, end)
+
+export val iterOf = (arr: Json): Iterator =>
+  __iterOf(arr)
