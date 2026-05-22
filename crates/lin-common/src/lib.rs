@@ -13,6 +13,24 @@ impl Span {
     pub fn dummy() -> Self {
         Self { file_id: 0, start: 0, end: 0 }
     }
+
+    pub fn line_col(&self, source: &str) -> (usize, usize) {
+        let offset = self.start as usize;
+        let mut line = 1;
+        let mut col = 1;
+        for (i, ch) in source.char_indices() {
+            if i >= offset {
+                break;
+            }
+            if ch == '\n' {
+                line += 1;
+                col = 1;
+            } else {
+                col += 1;
+            }
+        }
+        (line, col)
+    }
 }
 
 #[derive(Debug, Clone)]

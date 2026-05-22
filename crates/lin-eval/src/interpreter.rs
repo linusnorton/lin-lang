@@ -120,6 +120,66 @@ impl Interpreter {
             }
         });
 
+        self.define_native("__stringContains", 2, |args| {
+            match (&args[0], &args[1]) {
+                (Value::String(haystack), Value::String(needle)) => {
+                    Ok(Value::Bool(haystack.contains(needle.as_str())))
+                }
+                _ => Err("__stringContains: expected (String, String)".to_string()),
+            }
+        });
+
+        self.define_native("__stringStartsWith", 2, |args| {
+            match (&args[0], &args[1]) {
+                (Value::String(s), Value::String(prefix)) => {
+                    Ok(Value::Bool(s.starts_with(prefix.as_str())))
+                }
+                _ => Err("__stringStartsWith: expected (String, String)".to_string()),
+            }
+        });
+
+        self.define_native("__stringEndsWith", 2, |args| {
+            match (&args[0], &args[1]) {
+                (Value::String(s), Value::String(suffix)) => {
+                    Ok(Value::Bool(s.ends_with(suffix.as_str())))
+                }
+                _ => Err("__stringEndsWith: expected (String, String)".to_string()),
+            }
+        });
+
+        self.define_native("__stringSplit", 2, |args| {
+            match (&args[0], &args[1]) {
+                (Value::String(s), Value::String(delim)) => {
+                    let parts: Vec<Value> = s.split(delim.as_str())
+                        .map(|p| Value::String(Rc::new(p.to_string())))
+                        .collect();
+                    Ok(Value::Array(Rc::new(RefCell::new(parts))))
+                }
+                _ => Err("__stringSplit: expected (String, String)".to_string()),
+            }
+        });
+
+        self.define_native("__stringJoin", 2, |args| {
+            match (&args[0], &args[1]) {
+                (Value::Array(arr), Value::String(sep)) => {
+                    let parts: Vec<String> = arr.borrow().iter()
+                        .map(|v| v.to_display_string())
+                        .collect();
+                    Ok(Value::String(Rc::new(parts.join(sep.as_str()))))
+                }
+                _ => Err("__stringJoin: expected (Array, String)".to_string()),
+            }
+        });
+
+        self.define_native("__stringReplace", 3, |args| {
+            match (&args[0], &args[1], &args[2]) {
+                (Value::String(s), Value::String(pattern), Value::String(replacement)) => {
+                    Ok(Value::String(Rc::new(s.replace(pattern.as_str(), replacement.as_str()))))
+                }
+                _ => Err("__stringReplace: expected (String, String, String)".to_string()),
+            }
+        });
+
         self.define_native("__parseInt32", 1, |args| {
             match &args[0] {
                 Value::String(s) => {
@@ -340,6 +400,8 @@ impl Interpreter {
             "print", "length", "toString",
             "__stringSlice", "__stringIndexOf", "__stringToUpper",
             "__stringToLower", "__stringTrim", "__stringLength",
+            "__stringContains", "__stringStartsWith", "__stringEndsWith",
+            "__stringSplit", "__stringJoin", "__stringReplace",
             "__parseInt32", "__parseFloat64", "__isInt32", "__toInt32", "__toFloat64",
         ] {
             if let Some(val) = self.global_env.get(name) {

@@ -15,3 +15,21 @@ export val indexOf = (s: String, needle: String): Int32 =>
 
 export val length = (s: String): Int32 =>
   __stringLength(s)
+
+export val contains = (s: String, needle: String): Boolean =>
+  __stringContains(s, needle)
+
+export val startsWith = (s: String, prefix: String): Boolean =>
+  __stringStartsWith(s, prefix)
+
+export val endsWith = (s: String, suffix: String): Boolean =>
+  __stringEndsWith(s, suffix)
+
+export val split = (s: String, delimiter: String): String[] =>
+  __stringSplit(s, delimiter)
+
+export val join = (arr: String[], separator: String): String =>
+  __stringJoin(arr, separator)
+
+export val replace = (s: String, pattern: String, replacement: String): String =>
+  __stringReplace(s, pattern, replacement)

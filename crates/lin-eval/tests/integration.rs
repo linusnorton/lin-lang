@@ -857,3 +857,61 @@ print(toString(rest[0]))
 "#);
     assert_eq!(output, vec!["1", "4", "2"]);
 }
+
+#[test]
+fn test_stdlib_string_extended() {
+    let output = run(r#"
+import { contains, startsWith, endsWith, split, join, replace } from "std/string"
+
+print(toString("hello world".contains("world")))
+print(toString("hello".startsWith("hel")))
+print(toString("hello".endsWith("xyz")))
+
+val parts = "a,b,c".split(",")
+print(parts.join("-"))
+print("foo bar".replace("bar", "baz"))
+"#);
+    assert_eq!(output, vec!["true", "true", "false", "a-b-c", "foo baz"]);
+}
+
+#[test]
+fn test_higher_order_functions() {
+    let output = run(r#"
+val apply = (f: (Int32) => Int32, x: Int32): Int32 => f(x)
+val double = (n: Int32): Int32 => n * 2
+print(toString(apply(double, 5)))
+
+val adder = (n: Int32) => (x: Int32) => x + n
+val add5 = adder(5)
+print(toString(add5(10)))
+"#);
+    assert_eq!(output, vec!["10", "15"]);
+}
+
+#[test]
+fn test_function_param_destructuring() {
+    let output = run(r#"
+val greetPerson = ({ name, age }: Json): String =>
+  name + " is " + toString(age)
+
+print(greetPerson({ "name": "Bob", "age": 42 }))
+"#);
+    assert_eq!(output, vec!["Bob is 42"]);
+}
+
+#[test]
+fn test_chained_if_else() {
+    let output = run(r#"
+val classify = (x: Int32): String =>
+  if x > 100
+    then "big"
+    else if x > 10
+      then "medium"
+      else "small"
+
+print(classify(200))
+print(classify(50))
+print(classify(5))
+"#);
+    assert_eq!(output, vec!["big", "medium", "small"]);
+}
