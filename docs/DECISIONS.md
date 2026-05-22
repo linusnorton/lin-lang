@@ -127,3 +127,11 @@
 **Rationale**: Multi-file programs need to import user-defined modules. The resolution strategy mirrors Node.js-style relative imports without requiring a leading `./` — the `std/` prefix is the only special case, everything else is relative.
 
 **Consequence**: `import { x } from "lib/math"` in `examples/main.lin` loads `examples/lib/math.lin`. Absolute paths and `..` traversal work naturally via the filesystem.
+
+## ADR-017: Reset at_line_start unconditionally in lexer
+
+**Decision**: The `at_line_start` flag is always reset to false at the top of `next_token()`, regardless of whether the lexer is inside balanced delimiters.
+
+**Rationale**: Previously, `at_line_start` was only cleared when entering `handle_indentation()` (which requires `!inside_balanced()`). This left the flag true when a newline occurred inside braces (e.g., multi-line imports). When the closing brace brought depth back to 0, the stale `at_line_start = true` triggered spurious INDENT tokens on the next call. Always clearing the flag eliminates this class of bugs.
+
+**Consequence**: Multi-line `import { ... } from "path"` statements work correctly. No change in behavior for other constructs since the flag is still set to true on `\n` when appropriate.
