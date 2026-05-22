@@ -1,5 +1,15 @@
 export val range = (start: Int32, end: Int32): Iterator =>
-  __range(start, end)
+  iter(
+    () => start,
+    i => i < end,
+    i => i + 1,
+    i => i
+  )
 
 export val iterOf = (arr: Json): Iterator =>
-  __iterOf(arr)
+  iter(
+    () => 0,
+    i => i < length(arr),
+    i => i + 1,
+    i => arr[i]
+  )
