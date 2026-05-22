@@ -917,6 +917,30 @@ print(classify(5))
 }
 
 #[test]
+fn test_multi_statement_lambda_in_parens() {
+    let output = run(r#"
+val data = [1, 2, 3]
+data.for(x =>
+  val doubled = x * 2
+  print(toString(doubled))
+)
+"#);
+    assert_eq!(output, vec!["2", "4", "6"]);
+}
+
+#[test]
+fn test_multi_statement_paren_function() {
+    let output = run(r#"
+val result = [10, 20, 30].map((x) =>
+  val y = x + 1
+  y * 2
+)
+result.for(r => print(toString(r)))
+"#);
+    assert_eq!(output, vec!["22", "42", "62"]);
+}
+
+#[test]
 fn test_push_and_concat() {
     let output = run(r#"
 val arr = [1, 2]

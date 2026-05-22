@@ -103,3 +103,11 @@
 **Rationale**: The lexer suppresses INDENT/DEDENT for lines starting with `&&`/`||` (per spec §3.2), but still emits a Newline token at the end of the preceding line. Without the parser skip, `x >= 5\n  && active` would parse as just `x >= 5`.
 
 **Consequence**: Multi-line boolean expressions and `if` conditions with continuation lines work as specified.
+
+## ADR-014: Inline block parsing for lambda bodies inside parentheses
+
+**Decision**: `parse_function_body` detects when a function body starts with `val`/`var` (indicating a multi-statement body) and parses an "inline block" — a sequence of statements terminated by `)` rather than DEDENT.
+
+**Rationale**: Inside parentheses, the lexer suppresses all INDENT/DEDENT and Newline tokens (ADR-004). A lambda like `x => val y = x * 2; y` inside `.for(...)` has no indentation markers, so `parse_expr_or_block` cannot detect the block. The inline block parser handles this by treating `val`/`var` as the signal for multi-statement body.
+
+**Consequence**: Multi-statement lambdas work correctly inside `.for()`, `.map()`, and other callback-accepting function calls. Single-expression lambdas are unaffected.

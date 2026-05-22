@@ -682,12 +682,63 @@ impl Parser {
         };
         self.expect(TokenKind::Arrow);
         self.skip_newlines();
-        let body = self.parse_expr_or_block();
+        let body = self.parse_function_body();
         Expr::Function {
             params: vec![param],
             return_type: None,
             body: Box::new(body),
             span,
+        }
+    }
+
+    fn parse_function_body(&mut self) -> Expr {
+        if self.check(TokenKind::Indent) {
+            return self.parse_block();
+        }
+        if matches!(self.peek_kind(), TokenKind::Val | TokenKind::Var) {
+            return self.parse_inline_block();
+        }
+        self.parse_expr()
+    }
+
+    fn parse_inline_block(&mut self) -> Expr {
+        let span = self.current_span();
+        let mut stmts = Vec::new();
+        let mut last_expr: Option<Expr> = None;
+
+        loop {
+            self.skip_newlines();
+            if self.check(TokenKind::RParen) || self.check(TokenKind::Dedent) || self.is_at_end() {
+                break;
+            }
+
+            match self.peek_kind() {
+                TokenKind::Val => {
+                    if let Some(e) = last_expr.take() {
+                        stmts.push(Stmt::Expr(e));
+                    }
+                    stmts.push(self.parse_val(false));
+                }
+                TokenKind::Var => {
+                    if let Some(e) = last_expr.take() {
+                        stmts.push(Stmt::Expr(e));
+                    }
+                    stmts.push(self.parse_var(false));
+                }
+                _ => {
+                    if let Some(e) = last_expr.take() {
+                        stmts.push(Stmt::Expr(e));
+                    }
+                    last_expr = Some(self.parse_expr());
+                }
+            }
+        }
+
+        let final_expr = last_expr.unwrap_or(Expr::NullLit(span));
+        if stmts.is_empty() {
+            final_expr
+        } else {
+            Expr::Block(stmts, Box::new(final_expr), span)
         }
     }
 
@@ -748,7 +799,7 @@ impl Parser {
 
         self.expect(TokenKind::Arrow);
         self.skip_newlines();
-        let body = self.parse_expr_or_block();
+        let body = self.parse_function_body();
         Expr::Function { params, return_type, body: Box::new(body), span }
     }
 
