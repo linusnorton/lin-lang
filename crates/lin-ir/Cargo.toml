@@ -1,15 +1,10 @@
 [package]
-name = "lin-check"
+name = "lin-ir"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 lin-common = { path = "../lin-common" }
+lin-check = { path = "../lin-check" }
 lin-parse = { path = "../lin-parse" }
 indexmap = { workspace = true }
-serde = { workspace = true }
-bincode = { workspace = true }
-sha2 = { workspace = true }
-
-[dev-dependencies]
-lin-lex = { path = "../lin-lex" }

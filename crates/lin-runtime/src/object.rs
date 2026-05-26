@@ -1,4 +1,4 @@
-use std::alloc::{alloc, dealloc, realloc, Layout};
+use std::alloc::{alloc, realloc, Layout};
 use crate::string::LinString;
 use crate::tagged::TaggedVal;
 
@@ -122,8 +122,6 @@ pub unsafe extern "C" fn lin_object_has(obj: *const LinObject, key: *const LinSt
 /// Returns 1 if equal, 0 if not.
 #[no_mangle]
 pub unsafe extern "C" fn lin_object_eq(a: *const LinObject, b: *const LinObject) -> u8 {
-    use crate::tagged::{TaggedVal, TAG_NULL, TAG_BOOL, TAG_INT32, TAG_INT64, TAG_STR};
-    use crate::string::{LinString, lin_string_eq};
 
     if a == b { return 1; }
     if a.is_null() || b.is_null() { return 0; }
@@ -183,4 +181,19 @@ unsafe fn tagged_val_eq(a: *const crate::tagged::TaggedVal, b: *const crate::tag
     }
     // For objects, arrays, etc.: compare by pointer (structural eq not yet recursive).
     ap == bp
+}
+
+/// Decrement refcount and free the object struct + entries buffer if zero.
+/// Does not recurse into entry values.
+#[no_mangle]
+pub unsafe extern "C" fn lin_object_release(obj: *mut LinObject) {
+    if obj.is_null() {
+        return;
+    }
+    (*obj).refcount -= 1;
+    if (*obj).refcount == 0 {
+        let cap = (*obj).cap;
+        std::alloc::dealloc((*obj).entries as *mut u8, entries_layout(cap));
+        std::alloc::dealloc(obj as *mut u8, object_layout());
+    }
 }

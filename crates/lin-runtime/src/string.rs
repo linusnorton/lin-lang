@@ -34,6 +34,18 @@ pub unsafe extern "C" fn lin_string_free(s: *mut LinString) {
     dealloc(s as *mut u8, layout);
 }
 
+/// Decrement refcount and free if zero.
+#[no_mangle]
+pub unsafe extern "C" fn lin_string_release(s: *mut LinString) {
+    if s.is_null() {
+        return;
+    }
+    (*s).refcount -= 1;
+    if (*s).refcount == 0 {
+        lin_string_free(s);
+    }
+}
+
 /// Create a LinString from a raw byte pointer + length. Copies the bytes.
 #[no_mangle]
 pub unsafe extern "C" fn lin_string_from_bytes(data: *const u8, len: u32) -> *mut LinString {

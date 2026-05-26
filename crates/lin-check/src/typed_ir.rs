@@ -3,7 +3,7 @@ use lin_common::Span;
 use lin_parse::ast::BinOp;
 use crate::types::Type;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TypedModule {
     pub statements: Vec<TypedStmt>,
     pub span: Span,
@@ -12,7 +12,7 @@ pub struct TypedModule {
     pub intrinsics: HashMap<usize, String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum TypedStmt {
     Val {
         slot: usize,
@@ -23,7 +23,6 @@ pub enum TypedStmt {
     },
     Var {
         slot: usize,
-        name: Option<String>,
         value: TypedExpr,
         ty: Type,
         span: Span,
@@ -45,14 +44,14 @@ pub enum TypedStmt {
     Expr(TypedExpr),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ImportSlot {
     pub name: String,
     pub slot: usize,
     pub ty: Type,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum TypedExpr {
     IntLit(i64, Type, Span),
     FloatLit(f64, Type, Span),
@@ -215,14 +214,14 @@ impl TypedExpr {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TypedParam {
     pub slot: usize,
     pub name: String,
     pub ty: Type,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Capture {
     pub name: String,
     pub outer_slot: usize,
@@ -230,7 +229,7 @@ pub struct Capture {
     pub ty: Type,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TypedMatchArm {
     pub pattern: TypedMatchPattern,
     pub guard: Option<TypedExpr>,
@@ -238,14 +237,14 @@ pub struct TypedMatchArm {
     pub span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum TypedMatchPattern {
     Is(TypedPattern),
     Has(TypedPattern),
     Else,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum TypedPattern {
     TypeCheck(Type, Span),
     Literal(Box<TypedExpr>),
@@ -263,7 +262,7 @@ pub enum TypedPattern {
     Wildcard(Span),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TypedPatternField {
     pub key: String,
     pub binding_slot: Option<usize>,
@@ -271,7 +270,7 @@ pub struct TypedPatternField {
     pub ty: Type,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum TypedStringPart {
     Literal(String),
     Expr(TypedExpr),

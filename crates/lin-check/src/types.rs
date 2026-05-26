@@ -1,7 +1,7 @@
 use indexmap::IndexMap;
 use std::fmt;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Type {
     Null,
     Bool,

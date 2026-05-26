@@ -296,6 +296,9 @@ Float8 Float16 Float32 Float64
 Function
 Iterator<T>
 Iterable<T>
+Promise<T>
+ThreadPool
+Worker<Msg, Reply>
 ```
 
 `Number` is a union alias covering every numeric family (§4.2).
@@ -1289,14 +1292,19 @@ Circular imports are permitted and resolved lazily. The first read of any export
 The v1 standard library is laid out as follows:
 
 ```txt
-std/string   trim, toUpper, toLower, substring, indexOf, length, ...
-std/number   parseInt32, parseFloat64, toInt32, toFloat64, isInt32, ...
-std/array    map, filter, reduce, length, ...
-std/result   Result type, helpers
-std/io       print
+std/string   trim, toUpper, toLower, substring, charAt, indexOf, length,
+             contains, startsWith, endsWith, split, join, replace, repeat
+std/number   parseInt32, parseFloat64, toInt32, toFloat64, isInt32
+std/array    map, filter, reduce, find, some, every, flatMap, indexOf, reverse
+std/iter     range, iterOf  (also auto-imported as globals)
+std/result   Result<T, E> type alias
+std/io       print, readLine, lines, readAll
+std/fs       readFile, writeFile, appendFile, readLines, readJson, writeJson, exists
+std/http     fetch, fetchWith, fetchJson, postJson
+std/server   serve, json, text, redirect, notFound, badRequest, pathMatch, parseBody
 ```
 
-The exact API of each module is not yet pinned down; the layout above is fixed.
+The full signature of every function is specified in `docs/STDLIB.md`.
 
 ## 21. Standard Library Style
 
@@ -1515,7 +1523,7 @@ source (.lin files)
 
 A program is built from one entry-point `.lin` file and its transitive imports, and emitted as a single output artifact.
 
-v1 is pure: there are no language-level effects beyond `print`. There is no async, no concurrency, no IO library beyond textual output.
+v1 is pure beyond `print` and the concurrency primitives described in §32.
 
 ### 28.1 Reference Implementation
 
@@ -1569,8 +1577,7 @@ Iterator construction is not desugared to JSON object construction — it create
 Deferred — not required to begin implementation:
 
 1. **Native compilation target.** v1 uses a tree-walking interpreter (§28.1). A native or bytecode target is deferred.
-2. **Concurrency model.** v1 is single-threaded and synchronous.
-3. **Exact stdlib API.** Module layout is fixed (§20.6); precise signatures within each module are still being filled in incrementally.
+2. **Exact stdlib API.** Module layout is fixed (§20.6); precise signatures within each module are still being filled in incrementally.
 4. **Tooling.** Formatter, LSP, test runner as a first-class command are deferred.
 5. **Object rest destructuring iteration order.** Specified — see §4.3 and §27.5. Spread inserts source entries in source-iteration order; repeated keys keep their first-occurrence position.
 6. **`Iterable<T>` mechanism.** Whether it is a true protocol-like type, a compiler-known structural capability, or purely a built-in opaque interface.
@@ -1620,6 +1627,284 @@ Decided:
 39. Source files use LF line endings; CRLF is rejected.
 40. Blank lines inside indented blocks are allowed and ignored.
 
+## 32. Concurrency
+
+### 32.1 Design Principles
+
+Concurrency in Lin follows the same pattern as iteration: opaque runtime types constructed with built-in functions, consumed by built-in functions. No new syntax is introduced. Functions do not carry an "async" colour — whether a function runs synchronously or on a separate thread is decided at the call site, not in the function's definition.
+
+### 32.2 `Promise<T>`
+
+`Promise<T>` is an opaque runtime type representing a value of type `T` that is being computed on another OS thread.
+
+`T` must be a **transferable** type: JSON-compatible values (`String`, `Boolean`, `Null`, all numeric types, `T[]`, and object types whose fields are transferable). The opaque types `Function`, `Iterator`, `Iterable`, `Worker`, `ThreadPool`, and `Promise` are not transferable. Attempting to spawn a thunk that returns a non-transferable type is a compile-time error where statically detectable, and a runtime error otherwise.
+
+#### 32.2.1 Spawning
+
+`async` spawns a thunk on a new OS thread and immediately returns a `Promise<T>`:
+
+```txt
+val p: Promise<Int32> = async(() => 1 + 1)
+val p: Promise<Int32> = (() => 1 + 1).async()   // dot form
+```
+
+The thunk must be a zero-argument function: `() => T`.
+
+A thunk may not capture `var` bindings from its enclosing scope. This is a compile-time error:
+
+```txt
+var count = 0
+
+val p = async(() =>
+  count = count + 1    // error: async thunk captures var binding 'count'
+  count
+)
+```
+
+A thunk may capture `val` bindings freely, including functions, provided the function itself does not close over `var` bindings. Functions that close over no `var` bindings are safe to share across threads.
+
+```txt
+val multiplier = 3
+val p = async(() => multiplier * 10)   // ok: multiplier is a val
+
+val addFive = (x: Int32) => x + 5     // no var captures
+val p = async(() => addFive(10))       // ok
+```
+
+#### 32.2.2 Awaiting
+
+`async` wraps its return type in `T | Error`, making the full type `Promise<T | Error>`. `await` blocks the calling thread until the promise resolves and returns the value:
+
+```txt
+val p = async(() => 1 + 1)           // Promise<Int32 | Error>
+val result = await(p)                // Int32 | Error
+val result = p.await()               // dot form
+
+match result
+  is Error => print("failed: ${result}")
+  is Int32 => print("got ${result}")
+```
+
+A runtime error inside the thunk (array out of bounds, integer division by zero, non-exhaustive match, etc.) is caught at the OS thread boundary and surfaces as an `Error` value at the `await` call site rather than halting the program. This makes `async` a **fault isolation boundary** — the only place in Lin where runtime errors become recoverable values. The general rule that runtime errors are uncatchable (§19.1) does not apply inside an async thunk.
+
+If `await` is called and the result is `Error` but the caller does not inspect it (e.g. assigns to a `val` typed as `Int32`), the type checker will reject the assignment at compile time.
+
+#### 32.2.3 Nested Promises
+
+`await` auto-flattens nested promises. If the thunk itself returns a `Promise<T>`, `await` resolves through all layers:
+
+```txt
+val p: Promise<Int32> = async(() => async(() => 42))
+val v: Int32 = await(p)   // 42, not Promise<Int32>
+```
+
+### 32.3 `parallel`
+
+`parallel` is syntactic sugar for spawning an array of thunks and awaiting all results. It is the idiomatic fork/join form:
+
+```txt
+val [a, b, c] = parallel(
+  () => expensiveA(),
+  () => expensiveB(),
+  () => expensiveC()
+)
+```
+
+This is exactly equivalent to:
+
+```txt
+val [a, b, c] = await([
+  async(() => expensiveA()),
+  async(() => expensiveB()),
+  async(() => expensiveC())
+])
+```
+
+Result order matches input order regardless of completion order.
+
+`await` on a `Promise<T>[]` also works directly:
+
+```txt
+val [a, b] = await([myFunc, myFunc2].map(f => async(f)))
+```
+
+The thunks in `parallel` are subject to the same `var`-capture restriction as `async` (§32.2.1).
+
+### 32.4 Promise Combinators
+
+These are built-in functions on `Promise<T>`. All return a new `Promise`:
+
+```txt
+map:     <T, U>(Promise<T | Error>, (T) => U) => Promise<U | Error>
+race:    <T>(Promise<T | Error>[]) => Promise<T | Error>
+timeout: <T>(Promise<T | Error>, Int32) => Promise<T | Error | Null>
+retry:   <T>(() => T, Int32) => Promise<T | Error>
+```
+
+**`map`** — transforms the resolved value without blocking:
+
+```txt
+val doubled: Promise<Int32> = async(() => 21).map(v => v * 2)
+val v = await(doubled)   // 42
+```
+
+**`race`** — resolves with the first promise to complete; the others continue running but their results are discarded:
+
+```txt
+val first = race([
+  async(() => slowFetch("https://mirror-a/data")),
+  async(() => slowFetch("https://mirror-b/data"))
+])
+val data = await(first)
+```
+
+**`timeout`** — resolves with the original value if the promise completes within the given number of milliseconds, or `Null` if it does not. The timed-out thread is abandoned (not cancelled — Lin has no cancellation in v1). The full result type is `T | Error | Null`:
+
+```txt
+val result: String | Error | Null = await(timeout(p, 5000))
+
+match result
+  is Null  => print("timed out")
+  is Error => print("failed")
+  is String => print(result)
+```
+
+**`retry`** — spawns the thunk up to `n` times, returning the first result that is not an `Error`. If all attempts return `Error`, the last `Error` is the result:
+
+```txt
+val p = retry(() => unreliableFetch(), 3)
+val data = await(p)
+```
+
+### 32.5 `ThreadPool`
+
+By default each `async` call spawns a new OS thread. For high-fan-out work, a `ThreadPool` distributes tasks across a fixed number of threads:
+
+```txt
+threadPool: (Int32) => ThreadPool
+```
+
+```txt
+val pool = threadPool(8)
+
+// Single thunk on the pool
+val p = pool.async(() => work())
+
+// Array of thunks distributed across the pool
+val results = await(pool.async([() => work(1), () => work(2), () => work(3)]))
+```
+
+`pool.async` has the same two overloads as the top-level `async`: single thunk `() => T` and array of thunks `(() => T)[]`. The same `var`-capture restriction applies (§32.2.1).
+
+`ThreadPool` also provides `pool.serve` for multi-threaded HTTP servers (§33.5). The handler is dispatched to pool threads on each request, subject to the same `var`-capture restriction as `pool.async`.
+
+A `ThreadPool` is an opaque runtime value. It is not transferable across async boundaries.
+
+### 32.6 Workers
+
+A `Worker<Msg, Reply>` is a long-lived OS thread that processes messages sequentially. It is the right primitive for stateful concurrency (shared counters, connection pools, caches) and for isolating long-running background tasks.
+
+#### 32.6.1 Construction
+
+```txt
+worker: <Msg, Reply>(
+  (Msg) => Reply,
+  () => Null
+) => Worker<Msg, Reply>
+```
+
+The first argument is the message handler. The second is a shutdown handler called once when `close()` is invoked. Both run on the worker's thread.
+
+```txt
+val onMessage = (msg: String): Null =>
+  print("Got ${msg}")
+
+val onShutdown = (): Null =>
+  print("shutting down")
+
+val w: Worker<String, Null> = worker(onMessage, onShutdown)
+```
+
+#### 32.6.2 Sending Messages
+
+`message` is fire-and-forget — it enqueues the message and returns immediately:
+
+```txt
+message: <Msg, Reply>(Worker<Msg, Reply>, Msg) => Null
+
+w.message("Hello")
+```
+
+`request` is synchronous — it enqueues the message and blocks until the handler returns, then returns the reply:
+
+```txt
+request: <Msg, Reply>(Worker<Msg, Reply>, Msg) => Reply
+
+val reply: String = w.request("ping")
+```
+
+The handler's return value is the reply. If the handler is typed `(Msg) => Null`, `request` and `message` are equivalent (the reply is `Null`).
+
+#### 32.6.3 Closing
+
+```txt
+close: <Msg, Reply>(Worker<Msg, Reply>) => Null
+
+w.close()
+```
+
+`close` waits for any in-progress message to finish, calls `onShutdown`, then terminates the worker thread. Sending a message or request to a closed worker is a runtime error.
+
+#### 32.6.4 Worker State and `var`
+
+A worker's `onMessage` handler may close over `var` bindings to maintain state across messages. This is safe because the worker is single-threaded: messages are processed one at a time, with no concurrent access to the worker's closed-over state.
+
+```txt
+val makeCounter = (): Worker<String, Int32> =>
+  var count = 0
+
+  worker(
+    (msg: String) =>
+      count = count + 1
+      count,
+
+    () => null
+  )
+
+val counter = makeCounter()
+val n1 = counter.request("tick")   // 1
+val n2 = counter.request("tick")   // 2
+```
+
+#### 32.6.5 Worker Lifetime and Errors
+
+A runtime error inside a message handler kills the worker. The current `request` call (if any) causes the program to halt with the worker's diagnostic. Subsequent `message` or `request` calls to a dead worker are also runtime errors.
+
+#### 32.6.6 Transferability
+
+`Msg` and `Reply` must be transferable types (§32.2). Functions that close over no `var` bindings may be sent as messages.
+
+### 32.7 `print` Ordering
+
+All workers and async thunks share a single stdout. `print` is line-atomic: a full line is written without interleaving with output from other threads. Partial output within a single `print` call will not be split.
+
+### 32.8 Summary Table
+
+| Primitive | Use case | Blocks caller? |
+| --- | --- | --- |
+| Primitive | Use case | Blocks caller? | Return type |
+| --- | --- | --- | --- |
+| `async(f)` | Spawn one thunk, retrieve later | No (until `await`) | `Promise<T \| Error>` |
+| `await(p)` | Block until promise resolves | Yes | `T \| Error` |
+| `parallel(f1, f2, ...)` | Fork/join, all results needed | Yes | `[T \| Error, ...]` |
+| `race(ps)` | First result wins | No (until `await`) | `Promise<T \| Error>` |
+| `timeout(p, ms)` | Bound wait time | No (until `await`) | `Promise<T \| Error \| Null>` |
+| `retry(f, n)` | Retry on runtime error | No (until `await`) | `Promise<T \| Error>` |
+| `threadPool(n).async(...)` | High-fan-out work, bounded threads | No (until `await`) | `Promise<T \| Error>` |
+| `worker(onMsg, onShutdown)` | Long-lived stateful thread | No | `Worker<Msg, Reply>` |
+| `w.message(x)` | Fire-and-forget message | No | `Null` |
+| `w.request(x)` | Synchronous request/reply | Yes | `Reply` |
+
 ## 31. Complete Example
 
 ```txt
@@ -1663,3 +1948,266 @@ val parseAge = (input: String): Result<Int32, String> =>
       "error": "Invalid age"
     }
 ```
+
+## 33. IO, Filesystem, and HTTP Intrinsics
+
+The functions in `std/io`, `std/fs`, and `std/http` cannot be implemented in Lin because they require OS-level syscalls and network access. They are registered as host-language (Rust) intrinsics and exposed to Lin programs via the module system exactly like any other export. Their signatures are specified here.
+
+### 33.1 Design Principles
+
+All three modules follow the same conventions:
+
+1. **Blocking by default.** Every function runs synchronously. Use `async` at the call site when concurrency is needed.
+2. **`T | Error` for fallible operations.** A function that may fail at the OS or network level returns a `Result`-shaped value (`{ "type": "success", "value": T } | { "type": "failure", "error": String }`). HTTP error status codes are not transport errors and do not produce `Error`.
+3. **`Iterator` for sequences.** Line-oriented reads return iterators rather than loading everything into memory.
+4. **No hidden global state.** Stdin, stdout, and the filesystem are the implicit context; there are no open-handle values exposed to user code.
+
+### 33.2 `std/io` Intrinsics
+
+The following are implemented as Rust intrinsics. `print` is additionally available as a global without importing.
+
+```txt
+__ioPrint:    (Json)   -> Null      // formats and writes to stdout + newline
+__ioReadLine: ()       -> String | Null   // one line from stdin, Null on EOF
+__ioLines:    ()       -> Iterator        // iterator over stdin lines
+__ioReadAll:  ()       -> String          // all of stdin as one string
+```
+
+The Lin stdlib wrappers in `std/io` delegate directly to these intrinsics:
+
+```txt
+export val print    = (v: Json): Null           => __ioPrint(v)
+export val readLine = (): String | Null         => __ioReadLine()
+export val lines    = (): Iterator              => __ioLines()
+export val readAll  = (): String                => __ioReadAll()
+```
+
+### 33.3 `std/fs` Intrinsics
+
+```txt
+__fsReadFile:   (path: String)                    -> String | Error
+__fsWriteFile:  (path: String, content: String)   -> Null | Error
+__fsAppendFile: (path: String, content: String)   -> Null | Error
+__fsReadLines:  (path: String)                    -> Iterator | Error
+__fsReadJson:   (path: String)                    -> Json | Error
+__fsWriteJson:  (path: String, value: Json)       -> Null | Error
+__fsExists:     (path: String)                    -> Boolean
+```
+
+The Lin stdlib wrappers in `std/fs` delegate directly:
+
+```txt
+export val readFile   = (path: String): String | Error          => __fsReadFile(path)
+export val writeFile  = (path: String, content: String): Null | Error  => __fsWriteFile(path, content)
+export val appendFile = (path: String, content: String): Null | Error  => __fsAppendFile(path, content)
+export val readLines  = (path: String): Iterator | Error        => __fsReadLines(path)
+export val readJson   = (path: String): Json | Error            => __fsReadJson(path)
+export val writeJson  = (path: String, value: Json): Null | Error => __fsWriteJson(path, value)
+export val exists     = (path: String): Boolean                 => __fsExists(path)
+```
+
+### 33.4 `std/http` Intrinsics
+
+```txt
+type HttpResponse = {
+  "status":  Int32,
+  "headers": { ...String },
+  "body":    String
+}
+
+type HttpOptions = {
+  "method":  String,
+  "headers": { ...String },
+  "body":    String
+}
+```
+
+```txt
+__httpFetch:     (url: String)                          -> HttpResponse | Error
+__httpFetchWith: (url: String, options: HttpOptions)    -> HttpResponse | Error
+```
+
+The higher-level functions `fetchJson` and `postJson` are written in Lin on top of these two intrinsics:
+
+```txt
+export val fetch     = (url: String): HttpResponse | Error          => __httpFetch(url)
+export val fetchWith = (url: String, opts: HttpOptions): HttpResponse | Error =>
+  __httpFetchWith(url, opts)
+
+export val fetchJson = (url: String): Json | Error =>
+  match __httpFetch(url)
+    is { "type": "failure", "error": e } => { "type": "failure", "error": e }
+    is { "type": "success", "value": resp } =>
+      if resp["status"] >= 200 && resp["status"] < 300
+        then parseJson(resp["body"])
+        else { "type": "failure", "error": "HTTP ${resp["status"]}" }
+
+export val postJson = (url: String, body: Json): HttpResponse | Error =>
+  __httpFetchWith(url, {
+    "method":  "POST",
+    "headers": { "Content-Type": "application/json" },
+    "body":    toString(body)
+  })
+```
+
+`parseJson` is an intrinsic (`__parseJson: (String) -> Json | Error`) that parses a JSON string into a Lin value. It is not part of the public stdlib API but is available internally to `std/http` and `std/server`.
+
+### 33.5 `std/server` Intrinsics
+
+The server module requires two intrinsics — one for sequential serving and one for pool-dispatched serving. Everything else (`json`, `text`, `redirect`, `notFound`, `badRequest`, `pathMatch`, `parseBody`) is written in Lin on top of the `HttpResponse` type and `__parseJson`.
+
+```txt
+__serverServe:         (port: Int32, handler: (HttpRequest) -> HttpResponse) -> Null
+__serverServeWithPool: (pool: ThreadPool, port: Int32, handler: (HttpRequest) -> HttpResponse) -> Null
+```
+
+`__serverServeWithPool` is not called directly from Lin. It is invoked via the `pool.serve` dot-call form, which the runtime dispatches to this intrinsic when `.serve` is called on a `ThreadPool` value. The handler is subject to the same `var`-capture restriction as `pool.async` (§32.2.1) — enforced at compile time where statically detectable.
+
+The Lin stdlib wrappers in `std/server`:
+
+```txt
+export val serve = (port: Int32, handler: (HttpRequest) -> HttpResponse): Null =>
+  __serverServe(port, handler)
+
+// pool.serve dispatches to __serverServeWithPool via the runtime's dot-call dispatch
+// on ThreadPool values; it is not a standalone exported function.
+
+export val json = (status: Int32, body: Json): HttpResponse => {
+  "status":  status,
+  "headers": { "Content-Type": "application/json" },
+  "body":    toString(body)
+}
+
+export val text = (status: Int32, body: String): HttpResponse => {
+  "status":  status,
+  "headers": { "Content-Type": "text/plain" },
+  "body":    body
+}
+
+export val redirect = (url: String): HttpResponse => {
+  "status":  302,
+  "headers": { "Location": url },
+  "body":    ""
+}
+
+export val notFound = (): HttpResponse =>
+  text(404, "Not Found")
+
+export val badRequest = (message: String): HttpResponse =>
+  text(400, message)
+
+export val parseBody = (req: HttpRequest): Json | Error =>
+  __parseJson(req["body"])
+
+export val pathMatch = (pattern: String, path: String): { ...String } | Null =>
+  __serverPathMatch(pattern, path)
+```
+
+`__serverPathMatch: (String, String) -> { ...String } | Null` is a Rust intrinsic that splits both strings on `/`, matches literal segments exactly, captures `:name` segments by name, and returns `Null` on any mismatch.
+
+## 34. Foreign Function Interface
+
+Lin provides a C-compatible FFI so that programs can call into native libraries written in C or Rust.
+
+### 34.1 Design Principles
+
+1. **C ABI only.** Lin speaks the C calling convention. C libraries are called directly. Rust libraries must expose their public API as `extern "C"` functions (with `#[no_mangle]`).
+2. **Explicit, flat signatures.** Only a restricted set of Lin types are legal in `foreign` signatures — those that map cleanly onto C types. Richer Lin values cannot cross the boundary without explicit conversion.
+3. **Static linking.** Foreign declarations are resolved at `lin build` time by the linker. There is no runtime `dlopen`.
+4. **Unsafe by nature.** The compiler trusts the declared types. A mismatch between the declared Lin type and the actual C signature is undefined behaviour. It is the programmer's responsibility to get it right.
+
+### 34.2 `import foreign` Syntax
+
+A foreign import names the library and declares the symbols it provides.
+
+```txt
+import foreign "./libmath.a"
+  val sqrt: (Float64) => Float64
+  val pow:  (Float64, Float64) => Float64
+```
+
+The library path is a string literal on the same line as `import foreign`. Each subsequent indented line declares one binding as `val name: Type`. The indented block ends when indentation returns to the `import` level.
+
+Multiple foreign imports are allowed in a single file:
+
+```txt
+import foreign "./libfoo.a"
+  val fooInit: () => Null
+  val fooProcess: (String, Int32) => Int32
+
+import foreign "./libbar.a"
+  val barVersion: () => String
+```
+
+Foreign bindings are used exactly like any other function in scope:
+
+```txt
+val result = pow(2.0, 10.0)
+```
+
+### 34.3 Legal Foreign Types
+
+Only the following types are legal in `import foreign` signatures:
+
+| Lin type                    | C equivalent                        |
+| ---                         | ---                                 |
+| `Int8`                      | `int8_t`                            |
+| `Int16`                     | `int16_t`                           |
+| `Int32`                     | `int32_t`                           |
+| `Int64`                     | `int64_t`                           |
+| `UInt8`                     | `uint8_t`                           |
+| `UInt16`                    | `uint16_t`                          |
+| `UInt32`                    | `uint32_t`                          |
+| `UInt64`                    | `uint64_t`                          |
+| `Float32`                   | `float`                             |
+| `Float64`                   | `double`                            |
+| `Boolean`                   | `uint8_t` (0 = false, 1 = true)     |
+| `Null` (return type only)   | `void`                              |
+| `String`                    | `LinString` (pointer + length, see §34.4) |
+
+All other Lin types (`Json`, object types, array types, `Iterator`, `Function`, etc.) are not legal in foreign signatures. Attempting to declare one is a compile-time error.
+
+### 34.4 String Passing Convention
+
+Lin strings are UTF-8 length-prefixed values and do not carry a null terminator. Passing a `String` across the FFI boundary uses the `LinString` struct, which the C header `lin.h` defines as:
+
+```c
+typedef struct {
+    const uint8_t *ptr;
+    size_t         len;
+} LinString;
+```
+
+The C function receives a `LinString` by value. The pointed-to bytes are owned by the Lin runtime and must not be freed or stored past the function call. If the C side needs to retain the data it must copy it.
+
+Returning a `String` from a foreign function is not supported in v1. A function that needs to return text should write into a caller-supplied buffer or use an `Int32` return code and a side channel.
+
+### 34.5 Rust Libraries
+
+A Rust crate exposes FFI-compatible functions by:
+
+1. Adding `crate-type = ["staticlib"]` (or `"cdylib"`) to its `Cargo.toml`.
+2. Marking each exported function `#[no_mangle] pub extern "C"`.
+3. Using only C-compatible types (`i32`, `f64`, `*const u8` + `usize` for strings, etc.).
+
+Example Rust side:
+
+```rust
+#[no_mangle]
+pub extern "C" fn add_ints(a: i32, b: i32) -> i32 {
+    a + b
+}
+```
+
+Lin side:
+
+```txt
+import foreign "./libadd.a"
+  val addInts: (Int32, Int32) => Int32
+```
+
+The `lin build` command must be given the path to the compiled `.a` or `.so` file; it passes it to the linker as a `-l` flag.
+
+### 34.6 Static Analysis
+
+The type checker treats every foreign binding as having the declared type and performs no further checking of the library contents. Foreign signatures participate in the normal type system — the declared argument and return types are enforced at every call site in Lin code.

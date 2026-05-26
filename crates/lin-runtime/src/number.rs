@@ -1,4 +1,4 @@
-use crate::string::{LinString, lin_string_from_bytes};
+use crate::string::LinString;
 
 #[no_mangle]
 pub extern "C" fn lin_parse_int32(s: *const LinString) -> i32 {

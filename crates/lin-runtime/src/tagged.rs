@@ -129,3 +129,24 @@ pub unsafe extern "C" fn lin_unbox_bool(p: *const u8) -> u8 {
 pub unsafe extern "C" fn lin_unbox_ptr(p: *const u8) -> *mut u8 {
     (*(p as *const TaggedVal)).payload as *mut u8
 }
+
+/// Release a TaggedVal*: release the pointed-to heap value (if pointer type), then free the box.
+/// Safe to call with null (treated as null — no-op).
+#[no_mangle]
+pub unsafe extern "C" fn lin_tagged_release(p: *mut u8) {
+    if p.is_null() {
+        return;
+    }
+    let tv = p as *mut TaggedVal;
+    let tag = (*tv).tag;
+    let payload = (*tv).payload;
+    // Release the pointed-to value for pointer-typed payloads.
+    match tag {
+        TAG_STR => crate::string::lin_string_release(payload as *mut crate::string::LinString),
+        TAG_ARRAY => crate::array::lin_array_release(payload as *mut crate::array::LinArray),
+        TAG_OBJECT => crate::object::lin_object_release(payload as *mut crate::object::LinObject),
+        _ => {} // Scalars (null, bool, int, float) have no heap payload.
+    }
+    // Free the TaggedVal box itself.
+    std::alloc::dealloc(p, std::alloc::Layout::new::<TaggedVal>());
+}

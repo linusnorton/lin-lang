@@ -1,3 +1,4 @@
 /target
 .vscode/lin-lang/node_modules/
 /build
+.lin-cache/

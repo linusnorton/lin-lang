@@ -1,4 +1,4 @@
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Span {
     pub file_id: u32,
     pub start: u32,
@@ -38,6 +38,10 @@ pub struct Diagnostic {
     pub span: Span,
     pub message: String,
     pub severity: Severity,
+    /// Secondary spans with contextual messages (e.g. "type defined here").
+    pub notes: Vec<(Span, String)>,
+    /// Optional suggestion text shown below the error.
+    pub help: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,8 +52,107 @@ pub enum Severity {
 
 impl Diagnostic {
     pub fn error(span: Span, message: impl Into<String>) -> Self {
-        Self { span, message: message.into(), severity: Severity::Error }
+        Self { span, message: message.into(), severity: Severity::Error, notes: Vec::new(), help: None }
     }
+
+    pub fn warning(span: Span, message: impl Into<String>) -> Self {
+        Self { span, message: message.into(), severity: Severity::Warning, notes: Vec::new(), help: None }
+    }
+
+    pub fn with_note(mut self, span: Span, message: impl Into<String>) -> Self {
+        self.notes.push((span, message.into()));
+        self
+    }
+
+    pub fn with_help(mut self, message: impl Into<String>) -> Self {
+        self.help = Some(message.into());
+        self
+    }
+
+    /// Render this diagnostic to stderr using ariadne with source context.
+    /// `file_name` is the display name shown in the report header.
+    /// `source` is the full source text for span resolution.
+    pub fn render(&self, file_name: &str, source: &str) {
+        use ariadne::{Color, ColorGenerator, Label, Report, ReportKind, Source};
+
+        let kind = match self.severity {
+            Severity::Error => ReportKind::Error,
+            Severity::Warning => ReportKind::Warning,
+        };
+
+        let mut colors = ColorGenerator::new();
+        let primary_color = match self.severity {
+            Severity::Error => Color::Red,
+            Severity::Warning => Color::Yellow,
+        };
+
+        let start = self.span.start as usize;
+        let end = (self.span.end as usize).max(start + 1);
+
+        let mut report = Report::build(kind, (file_name, start..end))
+            .with_message(&self.message)
+            .with_label(
+                Label::new((file_name, start..end))
+                    .with_message(&self.message)
+                    .with_color(primary_color),
+            );
+
+        for (note_span, note_msg) in &self.notes {
+            let ns = note_span.start as usize;
+            let ne = (note_span.end as usize).max(ns + 1);
+            report = report.with_label(
+                Label::new((file_name, ns..ne))
+                    .with_message(note_msg)
+                    .with_color(colors.next()),
+            );
+        }
+
+        if let Some(ref help) = self.help {
+            report = report.with_help(help);
+        }
+
+        report
+            .finish()
+            .eprint((file_name, Source::from(source)))
+            .unwrap_or_else(|_| {
+                // Fallback: plain text if ariadne can't render.
+                let (line, col) = self.span.line_col(source);
+                eprintln!("{}:{}:{}: {:?}: {}", file_name, line, col, self.severity, self.message);
+            });
+    }
+}
+
+// -------------------------------------------------------------------------
+// Edit distance & suggestions
+// -------------------------------------------------------------------------
+
+/// Wagner-Fischer edit distance between two strings.
+pub fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let (m, n) = (a.len(), b.len());
+    let mut dp = vec![vec![0usize; n + 1]; m + 1];
+    for i in 0..=m { dp[i][0] = i; }
+    for j in 0..=n { dp[0][j] = j; }
+    for i in 1..=m {
+        for j in 1..=n {
+            dp[i][j] = if a[i - 1] == b[j - 1] {
+                dp[i - 1][j - 1]
+            } else {
+                1 + dp[i - 1][j].min(dp[i][j - 1]).min(dp[i - 1][j - 1])
+            };
+        }
+    }
+    dp[m][n]
+}
+
+/// Return the closest match from `candidates` to `name` if within `max_dist`, else `None`.
+pub fn closest_match<'a>(name: &str, candidates: impl Iterator<Item = &'a str>, max_dist: usize) -> Option<&'a str> {
+    candidates
+        .map(|c| (c, edit_distance(name, c)))
+        .filter(|(_, d)| *d <= max_dist)
+        .min_by_key(|(_, d)| *d)
+        .map(|(c, _)| c)
 }
 
 use std::collections::HashMap;

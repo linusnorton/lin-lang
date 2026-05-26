@@ -1,7 +1,7 @@
 use indexmap::IndexMap;
 use lin_common::{Diagnostic, Span};
 use lin_parse::ast::{
-    BinOp, Expr, MatchPattern, Module, ObjectField, Param, Pattern, Stmt, StringPart,
+    BinOp, Expr, MatchArm, MatchPattern, Module, ObjectField, Param, Pattern, Stmt, StringPart,
 };
 
 use crate::compat::is_compatible;
@@ -67,6 +67,9 @@ pub struct Checker {
     /// Pre-resolved import types: (module_path, export_name) -> Type.
     /// When set, used instead of fresh TypeVars for import bindings.
     pub import_types: std::collections::HashMap<(String, String), Type>,
+    /// Global accumulator of TypeVar solutions discovered during inference.
+    /// Populated by every call to collect_type_subs. Used by the zonking pass.
+    solved_type_vars: std::collections::HashMap<u32, Type>,
 }
 
 impl Checker {
@@ -82,6 +85,7 @@ impl Checker {
             function_scope_depths: Vec::new(),
             span_type_map: Vec::new(),
             import_types: std::collections::HashMap::new(),
+            solved_type_vars: std::collections::HashMap::new(),
         }
     }
 
@@ -103,11 +107,15 @@ impl Checker {
         if self.diagnostics.iter().any(|d| d.severity == lin_common::Severity::Error) {
             Err(self.diagnostics.clone())
         } else {
-            Ok(TypedModule {
+            let mut typed_module = TypedModule {
                 statements: stmts,
                 span: module.span,
                 intrinsics: self.intrinsic_slots.clone(),
-            })
+            };
+            // Zonking pass: replace solved TypeVar nodes with their concrete types.
+            let subs = self.solved_type_vars.clone();
+            crate::zonk::zonk_module(&mut typed_module, &subs);
+            Ok(typed_module)
         }
     }
 
@@ -232,7 +240,6 @@ impl Checker {
 
                 Ok(TypedStmt::Var {
                     slot,
-                    name: Some(name.clone()),
                     value: typed_value,
                     ty,
                     span: *span,
@@ -316,352 +323,256 @@ impl Checker {
 
     fn infer_expr(&mut self, expr: &Expr) -> Result<TypedExpr, Diagnostic> {
         match expr {
-            Expr::IntLit(v, span) => Ok(TypedExpr::IntLit(*v, Type::Int32, *span)),
-            Expr::FloatLit(v, span) => Ok(TypedExpr::FloatLit(*v, Type::Float64, *span)),
+            Expr::IntLit(v, span)    => Ok(TypedExpr::IntLit(*v, Type::Int32, *span)),
+            Expr::FloatLit(v, span)  => Ok(TypedExpr::FloatLit(*v, Type::Float64, *span)),
             Expr::StringLit(s, span) => Ok(TypedExpr::StringLit(s.clone(), *span)),
-            Expr::BoolLit(b, span) => Ok(TypedExpr::BoolLit(*b, *span)),
-            Expr::NullLit(span) => Ok(TypedExpr::NullLit(*span)),
-
-            Expr::Ident(name, span) => {
-                if let Some(ty) = self.env.effective_type(name) {
-                    let (var_scope_depth, info) = self.env.lookup_with_depth(name).unwrap();
-                    let slot = info.slot;
-                    let is_mutable = info.mutable;
-                    let def_span = info.def_span;
-
-                    // If we're inside a function and this variable lives in an outer scope
-                    // (but not the global scope at depth 0), record it as a capture.
-                    // Global scope variables (intrinsics, top-level named functions) are accessed
-                    // via global_fn_slots/intrinsic_slots in codegen and must not be captured.
-                    if let Some(&fn_entry_depth) = self.function_scope_depths.last() {
-                        if var_scope_depth > 0 && var_scope_depth < fn_entry_depth {
-                            if let Some(captures) = self.capture_stack.last_mut() {
-                                captures.entry(slot).or_insert_with(|| Capture {
-                                    name: name.clone(),
-                                    outer_slot: slot,
-                                    is_mutable,
-                                    ty: ty.clone(),
-                                });
-                            }
-                        }
-                    }
-
-                    self.span_type_map.push((*span, ty.to_string(), def_span));
-
-                    Ok(TypedExpr::LocalGet {
-                        slot,
-                        ty,
-                        span: *span,
-                    })
-                } else {
-                    Err(Diagnostic::error(*span, format!("Undefined variable '{}'", name)))
-                }
-            }
-
-            Expr::BinaryOp {
-                left,
-                op,
-                right,
-                span,
-            } => self.infer_binary_op(left, *op, right, *span),
-
-            Expr::Call { func, args, span } => self.infer_call(func, args, *span),
-
-            Expr::DotCall {
-                receiver,
-                method,
-                args,
-                span,
-            } => self.infer_dot_call(receiver, method, args, *span),
-
-            Expr::Index { object, key, span } => {
-                let typed_obj = self.infer_expr(object)?;
-                let typed_key = self.infer_expr(key)?;
-                let obj_ty = typed_obj.ty();
-
-                let result_type = match &obj_ty {
-                    Type::Array(elem) => *elem.clone(),
-                    Type::FixedArray(elems) => {
-                        if let TypedExpr::IntLit(idx, _, _) = typed_key {
-                            elems.get(idx as usize).cloned().unwrap_or(Type::Null)
-                        } else {
-                            unify_types(elems)
-                        }
-                    }
-                    Type::Object(fields) => {
-                        if let TypedExpr::StringLit(ref key_str, _) = typed_key {
-                            fields.get(key_str).cloned().unwrap_or(Type::Null)
-                        } else {
-                            // Dynamic key access - result could be any field type or Null
-                            Type::Union(vec![
-                                Type::Union(fields.values().cloned().collect()),
-                                Type::Null,
-                            ])
-                        }
-                    }
-                    Type::Null => Type::Null,
-                    // Json (TypeVar wildcard) and plain TypeVar: result is also TypeVar (dynamic)
-                    Type::TypeVar(_) => self.env.fresh_type_var(),
-                    _ => {
-                        return Err(Diagnostic::error(
-                            *span,
-                            format!("Cannot index into type {}", obj_ty),
-                        ));
-                    }
-                };
-
-                Ok(TypedExpr::Index {
-                    object: Box::new(typed_obj),
-                    key: Box::new(typed_key),
-                    result_type,
-                    span: *span,
-                })
-            }
-
-            Expr::If {
-                condition,
-                then_branch,
-                else_branch,
-                span,
-            } => {
-                // Condition is not in tail position; branches inherit tail position.
-                let in_tail = self.in_tail_position;
-                self.in_tail_position = false;
-                let typed_cond = self.check_expr(condition, &Type::Bool)?;
-                self.in_tail_position = in_tail;
-                let typed_then = self.infer_expr(then_branch)?;
-                self.in_tail_position = in_tail;
-                let typed_else = self.infer_expr(else_branch)?;
-
-                let then_ty = typed_then.ty();
-                let else_ty = typed_else.ty();
-                let result_type = if is_compatible(&then_ty, &else_ty) {
-                    else_ty
-                } else if is_compatible(&else_ty, &then_ty) {
-                    then_ty
-                } else {
-                    Type::flatten_union(vec![then_ty, else_ty])
-                };
-
-                Ok(TypedExpr::If {
-                    cond: Box::new(typed_cond),
-                    then_br: Box::new(typed_then),
-                    else_br: Box::new(typed_else),
-                    result_type,
-                    span: *span,
-                })
-            }
-
-            Expr::Match {
-                scrutinee,
-                arms,
-                span,
-            } => {
-                let typed_scrutinee = self.infer_expr(scrutinee)?;
-                let scrutinee_ty = typed_scrutinee.ty();
-                let mut typed_arms = Vec::new();
-                let mut arm_types = Vec::new();
-
-                for arm in arms {
-                    let typed_arm = self.check_match_arm(arm, &scrutinee_ty)?;
-                    arm_types.push(typed_arm.body.ty());
-                    typed_arms.push(typed_arm);
-                }
-
-                let result_type = if arm_types.is_empty() {
-                    Type::Never
-                } else {
-                    unify_types(&arm_types)
-                };
-
-                Ok(TypedExpr::Match {
-                    scrutinee: Box::new(typed_scrutinee),
-                    arms: typed_arms,
-                    result_type,
-                    span: *span,
-                })
-            }
-
-            Expr::Block(stmts, final_expr, span) => {
-                self.env.push_scope();
-                let mut typed_stmts = Vec::new();
-                // Intermediate statements are not in tail position.
-                let block_tail = self.in_tail_position;
-                self.in_tail_position = false;
-                for stmt in stmts {
-                    match self.check_stmt(stmt) {
-                        Ok(ts) => typed_stmts.push(ts),
-                        Err(diag) => {
-                            self.env.pop_scope();
-                            return Err(diag);
-                        }
-                    }
-                }
-                // Final expression inherits tail position from the enclosing context.
-                self.in_tail_position = block_tail;
-                let typed_final = self.infer_expr(final_expr)?;
-                let ty = typed_final.ty();
-                self.env.pop_scope();
-
-                Ok(TypedExpr::Block {
-                    stmts: typed_stmts,
-                    expr: Box::new(typed_final),
-                    ty,
-                    span: *span,
-                })
-            }
-
-            Expr::Function {
-                params,
-                return_type,
-                body,
-                span,
-            } => self.infer_function(params, return_type, body, *span, None),
-
-            Expr::Object(fields, span) => {
-                let mut typed_fields = Vec::new();
-                let mut spreads = Vec::new();
-                let mut obj_type = IndexMap::new();
-
-                for field in fields {
-                    match field {
-                        ObjectField::Pair(key_expr, val_expr) => {
-                            let typed_val = self.infer_expr(val_expr)?;
-                            let val_ty = typed_val.ty();
-                            if let Expr::StringLit(key, _) = key_expr {
-                                obj_type.insert(key.clone(), val_ty);
-                                typed_fields.push((key.clone(), typed_val));
-                            }
-                        }
-                        ObjectField::Spread(expr) => {
-                            let typed_spread = self.infer_expr(expr)?;
-                            if let Type::Object(ref fields) = typed_spread.ty() {
-                                for (k, v) in fields {
-                                    obj_type.insert(k.clone(), v.clone());
-                                }
-                            }
-                            spreads.push(typed_spread);
-                        }
-                    }
-                }
-
-                Ok(TypedExpr::MakeObject {
-                    fields: typed_fields,
-                    spreads,
-                    ty: Type::Object(obj_type),
-                    span: *span,
-                })
-            }
-
-            Expr::Array(elements, span) => {
-                let mut typed_elements = Vec::new();
-                let mut elem_types = Vec::new();
-
-                for elem in elements {
-                    let typed = self.infer_expr(elem)?;
-                    elem_types.push(typed.ty());
-                    typed_elements.push(typed);
-                }
-
-                let ty = if elem_types.is_empty() {
-                    Type::Array(Box::new(Type::Never))
-                } else {
-                    let unified = unify_types(&elem_types);
-                    Type::Array(Box::new(unified))
-                };
-
-                Ok(TypedExpr::MakeArray {
-                    elements: typed_elements,
-                    ty,
-                    span: *span,
-                })
-            }
-
-            Expr::Assign { target, value, span } => {
-                let info = self.env.lookup(target).ok_or_else(|| {
-                    Diagnostic::error(*span, format!("Undefined variable '{}'", target))
-                })?;
-
-                if !info.mutable {
-                    return Err(Diagnostic::error(
-                        *span,
-                        format!("Cannot assign to immutable binding '{}'", target),
-                    ));
-                }
-
-                let expected_ty = info.ty.clone();
-                let slot = info.slot;
-                let def_span = info.def_span;
-                let typed_value = self.check_expr(value, &expected_ty)?;
-                self.span_type_map.push((*span, expected_ty.to_string(), def_span));
-
-                self.env.clear_narrowing(target);
-
-                Ok(TypedExpr::LocalSet {
-                    slot,
-                    value: Box::new(typed_value),
-                    ty: expected_ty,
-                    span: *span,
-                })
-            }
-
-            Expr::StringInterp(parts, span) => {
-                let mut typed_parts = Vec::new();
-                for part in parts {
-                    match part {
-                        StringPart::Literal(s) => {
-                            typed_parts.push(TypedStringPart::Literal(s.clone()));
-                        }
-                        StringPart::Expr(e) => {
-                            let typed = self.infer_expr(e)?;
-                            typed_parts.push(TypedStringPart::Expr(typed));
-                        }
-                    }
-                }
-                Ok(TypedExpr::StringInterp {
-                    parts: typed_parts,
-                    span: *span,
-                })
-            }
-
+            Expr::BoolLit(b, span)   => Ok(TypedExpr::BoolLit(*b, *span)),
+            Expr::NullLit(span)      => Ok(TypedExpr::NullLit(*span)),
+            Expr::Ident(name, span)  => self.infer_ident(name, *span),
+            Expr::BinaryOp { left, op, right, span } => self.infer_binary_op(left, *op, right, *span),
+            Expr::Call { func, args, span }           => self.infer_call(func, args, *span),
+            Expr::DotCall { receiver, method, args, span } => self.infer_dot_call(receiver, method, args, *span),
+            Expr::Index { object, key, span }         => self.infer_index(object, key, *span),
+            Expr::If { condition, then_branch, else_branch, span } => self.infer_if(condition, then_branch, else_branch, *span),
+            Expr::Match { scrutinee, arms, span }     => self.infer_match(scrutinee, arms, *span),
+            Expr::Block(stmts, final_expr, span)      => self.infer_block(stmts, final_expr, *span),
+            Expr::Function { params, return_type, body, span } => self.infer_function(params, return_type, body, *span, None),
+            Expr::Object(fields, span)                => self.infer_object(fields, *span),
+            Expr::Array(elements, span)               => self.infer_array(elements, *span),
+            Expr::Assign { target, value, span }      => self.infer_assign(target, value, *span),
+            Expr::StringInterp(parts, span)           => self.infer_string_interp(parts, *span),
             Expr::Is { expr, pattern, span } => {
                 let typed_expr = self.infer_expr(expr)?;
                 let typed_pattern = self.check_pattern(pattern, &typed_expr.ty())?;
-                Ok(TypedExpr::Is {
-                    expr: Box::new(typed_expr),
-                    pattern: typed_pattern,
-                    span: *span,
-                })
+                Ok(TypedExpr::Is { expr: Box::new(typed_expr), pattern: typed_pattern, span: *span })
             }
-
             Expr::Has { expr, pattern, span } => {
                 let typed_expr = self.infer_expr(expr)?;
                 let typed_pattern = self.check_pattern(pattern, &typed_expr.ty())?;
-                Ok(TypedExpr::Has {
-                    expr: Box::new(typed_expr),
-                    pattern: typed_pattern,
-                    span: *span,
-                })
+                Ok(TypedExpr::Has { expr: Box::new(typed_expr), pattern: typed_pattern, span: *span })
             }
-
             Expr::TupleArgs(exprs, span) => {
-                // TupleArgs is used as a receiver in dot calls; infer each element
                 if exprs.len() == 1 {
                     self.infer_expr(&exprs[0])
                 } else {
-                    let mut typed = Vec::new();
-                    for e in exprs {
-                        typed.push(self.infer_expr(e)?);
-                    }
+                    let typed: Result<Vec<_>, _> = exprs.iter().map(|e| self.infer_expr(e)).collect();
+                    let typed = typed?;
                     let types: Vec<Type> = typed.iter().map(|t| t.ty()).collect();
-                    Ok(TypedExpr::MakeArray {
-                        elements: typed,
-                        ty: Type::FixedArray(types),
-                        span: *span,
-                    })
+                    Ok(TypedExpr::MakeArray { elements: typed, ty: Type::FixedArray(types), span: *span })
                 }
             }
         }
+    }
+
+    fn infer_ident(&mut self, name: &str, span: Span) -> Result<TypedExpr, Diagnostic> {
+        let ty = self.env.effective_type(name).ok_or_else(|| {
+            let all_names = self.env.all_names();
+            let suggestion = lin_common::closest_match(name, all_names.into_iter(), 2);
+            let mut diag = Diagnostic::error(span, format!("Undefined variable '{}'", name));
+            if let Some(s) = suggestion {
+                diag = diag.with_help(format!("did you mean '{}'?", s));
+            }
+            diag
+        })?;
+        let (var_scope_depth, info) = self.env.lookup_with_depth(name).unwrap();
+        let slot = info.slot;
+        let is_mutable = info.mutable;
+        let def_span = info.def_span;
+        // Record as a capture if inside a function and defined in a non-global outer scope.
+        // Global scope (depth 0) is accessed via global_fn_slots/intrinsic_slots in codegen.
+        if let Some(&fn_entry_depth) = self.function_scope_depths.last() {
+            if var_scope_depth > 0 && var_scope_depth < fn_entry_depth {
+                if let Some(captures) = self.capture_stack.last_mut() {
+                    captures.entry(slot).or_insert_with(|| Capture {
+                        name: name.to_string(),
+                        outer_slot: slot,
+                        is_mutable,
+                        ty: ty.clone(),
+                    });
+                }
+            }
+        }
+        self.span_type_map.push((span, ty.to_string(), def_span));
+        Ok(TypedExpr::LocalGet { slot, ty, span })
+    }
+
+    fn infer_index(&mut self, object: &Expr, key: &Expr, span: Span) -> Result<TypedExpr, Diagnostic> {
+        let typed_obj = self.infer_expr(object)?;
+        let typed_key = self.infer_expr(key)?;
+        let obj_ty = typed_obj.ty();
+        let result_type = match &obj_ty {
+            Type::Array(elem) => *elem.clone(),
+            Type::FixedArray(elems) => {
+                if let TypedExpr::IntLit(idx, _, _) = typed_key {
+                    elems.get(idx as usize).cloned().unwrap_or(Type::Null)
+                } else {
+                    unify_types(elems)
+                }
+            }
+            Type::Object(fields) => {
+                if let TypedExpr::StringLit(ref key_str, _) = typed_key {
+                    if !fields.contains_key(key_str) && !fields.is_empty() {
+                        // Key not in the known object type — emit a warning with a "did you mean" hint.
+                        let suggestion = lin_common::closest_match(
+                            key_str,
+                            fields.keys().map(|s| s.as_str()),
+                            3,
+                        );
+                        let mut diag = lin_common::Diagnostic::warning(
+                            span,
+                            format!("field \"{}\" does not exist on this object type", key_str),
+                        );
+                        if let Some(s) = suggestion {
+                            diag = diag.with_help(format!("did you mean \"{}\"?", s));
+                        }
+                        self.diagnostics.push(diag);
+                    }
+                    fields.get(key_str).cloned().unwrap_or(Type::Null)
+                } else {
+                    Type::Union(vec![Type::Union(fields.values().cloned().collect()), Type::Null])
+                }
+            }
+            Type::Null => Type::Null,
+            Type::TypeVar(_) => self.env.fresh_type_var(),
+            _ => return Err(Diagnostic::error(span, format!("Cannot index into type {}", obj_ty))),
+        };
+        Ok(TypedExpr::Index { object: Box::new(typed_obj), key: Box::new(typed_key), result_type, span })
+    }
+
+    fn infer_if(&mut self, condition: &Expr, then_branch: &Expr, else_branch: &Expr, span: Span) -> Result<TypedExpr, Diagnostic> {
+        // Condition is not in tail position; branches inherit it.
+        let in_tail = self.in_tail_position;
+        self.in_tail_position = false;
+        let typed_cond = self.check_expr(condition, &Type::Bool)?;
+        self.in_tail_position = in_tail;
+        let typed_then = self.infer_expr(then_branch)?;
+        self.in_tail_position = in_tail;
+        let typed_else = self.infer_expr(else_branch)?;
+        let then_ty = typed_then.ty();
+        let else_ty = typed_else.ty();
+        let result_type = if is_compatible(&then_ty, &else_ty) {
+            else_ty
+        } else if is_compatible(&else_ty, &then_ty) {
+            then_ty
+        } else {
+            Type::flatten_union(vec![then_ty, else_ty])
+        };
+        Ok(TypedExpr::If {
+            cond: Box::new(typed_cond),
+            then_br: Box::new(typed_then),
+            else_br: Box::new(typed_else),
+            result_type,
+            span,
+        })
+    }
+
+    fn infer_match(&mut self, scrutinee: &Expr, arms: &[MatchArm], span: Span) -> Result<TypedExpr, Diagnostic> {
+        let typed_scrutinee = self.infer_expr(scrutinee)?;
+        let scrutinee_ty = typed_scrutinee.ty();
+        let mut typed_arms = Vec::new();
+        let mut arm_types = Vec::new();
+        for arm in arms {
+            let typed_arm = self.check_match_arm(arm, &scrutinee_ty)?;
+            arm_types.push(typed_arm.body.ty());
+            typed_arms.push(typed_arm);
+        }
+        let result_type = if arm_types.is_empty() { Type::Never } else { unify_types(&arm_types) };
+
+        // Exhaustiveness check: emit diagnostics but don't fail — warnings stay as warnings,
+        // errors are collected alongside other diagnostics and reported together.
+        let exhaustiveness_diags = crate::exhaustiveness::check_exhaustiveness(
+            &scrutinee_ty,
+            &typed_arms,
+            span,
+        );
+        for d in exhaustiveness_diags {
+            self.diagnostics.push(d);
+        }
+
+        Ok(TypedExpr::Match { scrutinee: Box::new(typed_scrutinee), arms: typed_arms, result_type, span })
+    }
+
+    fn infer_block(&mut self, stmts: &[Stmt], final_expr: &Expr, span: Span) -> Result<TypedExpr, Diagnostic> {
+        self.env.push_scope();
+        let mut typed_stmts = Vec::new();
+        let block_tail = self.in_tail_position;
+        self.in_tail_position = false;
+        for stmt in stmts {
+            match self.check_stmt(stmt) {
+                Ok(ts) => typed_stmts.push(ts),
+                Err(diag) => { self.env.pop_scope(); return Err(diag); }
+            }
+        }
+        self.in_tail_position = block_tail;
+        let typed_final = self.infer_expr(final_expr)?;
+        let ty = typed_final.ty();
+        self.env.pop_scope();
+        Ok(TypedExpr::Block { stmts: typed_stmts, expr: Box::new(typed_final), ty, span })
+    }
+
+    fn infer_object(&mut self, fields: &[ObjectField], span: Span) -> Result<TypedExpr, Diagnostic> {
+        let mut typed_fields = Vec::new();
+        let mut spreads = Vec::new();
+        let mut obj_type = IndexMap::new();
+        for field in fields {
+            match field {
+                ObjectField::Pair(key_expr, val_expr) => {
+                    let typed_val = self.infer_expr(val_expr)?;
+                    let val_ty = typed_val.ty();
+                    if let Expr::StringLit(key, _) = key_expr {
+                        obj_type.insert(key.clone(), val_ty);
+                        typed_fields.push((key.clone(), typed_val));
+                    }
+                }
+                ObjectField::Spread(expr) => {
+                    let typed_spread = self.infer_expr(expr)?;
+                    if let Type::Object(ref fields) = typed_spread.ty() {
+                        for (k, v) in fields { obj_type.insert(k.clone(), v.clone()); }
+                    }
+                    spreads.push(typed_spread);
+                }
+            }
+        }
+        Ok(TypedExpr::MakeObject { fields: typed_fields, spreads, ty: Type::Object(obj_type), span })
+    }
+
+    fn infer_array(&mut self, elements: &[Expr], span: Span) -> Result<TypedExpr, Diagnostic> {
+        let typed_elements: Result<Vec<_>, _> = elements.iter().map(|e| self.infer_expr(e)).collect();
+        let typed_elements = typed_elements?;
+        let elem_types: Vec<Type> = typed_elements.iter().map(|t| t.ty()).collect();
+        let ty = if elem_types.is_empty() {
+            Type::Array(Box::new(Type::Never))
+        } else {
+            Type::Array(Box::new(unify_types(&elem_types)))
+        };
+        Ok(TypedExpr::MakeArray { elements: typed_elements, ty, span })
+    }
+
+    fn infer_assign(&mut self, target: &str, value: &Expr, span: Span) -> Result<TypedExpr, Diagnostic> {
+        let info = self.env.lookup(target).ok_or_else(|| {
+            Diagnostic::error(span, format!("Undefined variable '{}'", target))
+        })?;
+        if !info.mutable {
+            return Err(Diagnostic::error(span, format!("Cannot assign to immutable binding '{}'", target)));
+        }
+        let expected_ty = info.ty.clone();
+        let slot = info.slot;
+        let def_span = info.def_span;
+        let typed_value = self.check_expr(value, &expected_ty)?;
+        self.span_type_map.push((span, expected_ty.to_string(), def_span));
+        self.env.clear_narrowing(target);
+        Ok(TypedExpr::LocalSet { slot, value: Box::new(typed_value), ty: expected_ty, span })
+    }
+
+    fn infer_string_interp(&mut self, parts: &[StringPart], span: Span) -> Result<TypedExpr, Diagnostic> {
+        let mut typed_parts = Vec::new();
+        for part in parts {
+            match part {
+                StringPart::Literal(s) => typed_parts.push(TypedStringPart::Literal(s.clone())),
+                StringPart::Expr(e) => typed_parts.push(TypedStringPart::Expr(self.infer_expr(e)?)),
+            }
+        }
+        Ok(TypedExpr::StringInterp { parts: typed_parts, span })
     }
 
     fn infer_binary_op(
@@ -733,6 +644,7 @@ impl Checker {
         let (typed_args, result_type) = match &func_ty {
             Type::Function { params, ret } => {
                 if args.len() > params.len() {
+                    let extra = args.len() - params.len();
                     return Err(Diagnostic::error(
                         span,
                         format!(
@@ -740,7 +652,12 @@ impl Checker {
                             params.len(),
                             args.len()
                         ),
-                    ));
+                    ).with_help(format!(
+                        "remove the {} extra argument{}{}",
+                        extra,
+                        if extra == 1 { "" } else { "s" },
+                        if params.len() > 0 { format!(" — this function takes {}", params.len()) } else { " — this function takes no arguments".to_string() }
+                    )));
                 }
 
                 // First pass: infer non-function arguments to collect TypeVar substitutions.
@@ -749,7 +666,7 @@ impl Checker {
                 for (i, (arg, param_ty)) in args.iter().zip(params.iter()).enumerate() {
                     if !matches!(arg, Expr::Function { .. }) {
                         let typed = self.infer_expr(arg)?;
-                        collect_type_subs(param_ty, &typed.ty(), &mut subs);
+                        self.collect_and_save_subs(param_ty, &typed.ty(), &mut subs);
                         partially_typed[i] = Some(typed);
                     }
                 }
@@ -775,7 +692,7 @@ impl Checker {
                         }
                     };
                     // Collect substitutions from function args too (e.g. lambda return types).
-                    collect_type_subs(&params[i], &typed.ty(), &mut subs);
+                    self.collect_and_save_subs(&params[i], &typed.ty(), &mut subs);
                     typed_args.push(typed);
                 }
                 self.in_tail_position = prev_tail;
@@ -867,7 +784,7 @@ impl Checker {
                 // First pass: collect substitutions from non-lambda args (receiver already typed).
                 let mut subs = std::collections::HashMap::new();
                 if let Some(p0) = method_params.first() {
-                    collect_type_subs(p0, &typed_receiver.ty(), &mut subs);
+                    self.collect_and_save_subs(p0, &typed_receiver.ty(), &mut subs);
                 }
                 let mut partially_typed: Vec<Option<TypedExpr>> = vec![None; all_arg_exprs.len()];
                 partially_typed[0] = Some(typed_receiver);
@@ -875,7 +792,7 @@ impl Checker {
                     for (i, (arg, param_ty)) in arg_exprs.iter().zip(method_params.iter().skip(1)).enumerate() {
                         if !matches!(arg, Expr::Function { .. }) {
                             let typed = self.infer_expr(arg)?;
-                            collect_type_subs(param_ty, &typed.ty(), &mut subs);
+                            self.collect_and_save_subs(param_ty, &typed.ty(), &mut subs);
                             partially_typed[i + 1] = Some(typed);
                         }
                     }
@@ -902,7 +819,7 @@ impl Checker {
                     };
                     // Collect substitutions from lambda/function args too (e.g. to resolve return TypeVars).
                     if let Some(param_ty) = method_params.get(i) {
-                        collect_type_subs(param_ty, &typed.ty(), &mut subs);
+                        self.collect_and_save_subs(param_ty, &typed.ty(), &mut subs);
                     }
                     all_args.push(typed);
                 }
@@ -1334,6 +1251,18 @@ impl Checker {
                 Ok(self.env.next_slot() - 1)
             }
             _ => Ok(0),
+        }
+    }
+
+    /// Collect TypeVar substitutions from a (pattern, actual) pair and save them
+    /// to the global solved_type_vars map so the zonking pass can apply them later.
+    fn collect_and_save_subs(&mut self, pattern: &Type, actual: &Type, local: &mut std::collections::HashMap<u32, Type>) {
+        collect_type_subs(pattern, actual, local);
+        for (id, ty) in local.iter() {
+            // Intrinsic TypeVars (≥ 9000) are generic slots — don't solve them globally.
+            if *id < 9000 {
+                self.solved_type_vars.entry(*id).or_insert_with(|| ty.clone());
+            }
         }
     }
 

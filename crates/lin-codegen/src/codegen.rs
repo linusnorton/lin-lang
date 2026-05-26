@@ -5,7 +5,7 @@ use inkwell::passes::PassBuilderOptions;
 use inkwell::targets::{
     CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
 };
-use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, StructType};
+use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum};
 use inkwell::values::{
     BasicMetadataValueEnum, BasicValueEnum, FunctionValue, PointerValue,
 };
@@ -50,8 +50,6 @@ pub struct Codegen<'ctx> {
     module: Module<'ctx>,
     builder: Builder<'ctx>,
     // Runtime function declarations
-    #[allow(dead_code)]
-    rt_string_alloc: FunctionValue<'ctx>,
     rt_string_concat: FunctionValue<'ctx>,
     rt_string_from_bytes: FunctionValue<'ctx>,
     rt_string_length: FunctionValue<'ctx>,
@@ -90,12 +88,12 @@ pub struct Codegen<'ctx> {
     rt_object_has: FunctionValue<'ctx>,
     rt_object_eq: FunctionValue<'ctx>,
     rt_tagged_to_string: FunctionValue<'ctx>,
+    // Release functions (decrement refcount, free if zero)
+    rt_string_release: FunctionValue<'ctx>,
+    rt_array_release: FunctionValue<'ctx>,
     // Cached LLVM types
     string_ptr_type: inkwell::types::PointerType<'ctx>,
     array_ptr_type: inkwell::types::PointerType<'ctx>,
-    // Closure type cache: fn_sig -> { fn_ptr, env_ptr }
-    #[allow(dead_code)]
-    closure_types: HashMap<String, StructType<'ctx>>,
     // Named functions (for call resolution and TCO detection)
     named_fns: HashMap<String, FunctionValue<'ctx>>,
     // Intrinsic slot -> name map from type checker
@@ -124,11 +122,6 @@ impl<'ctx> Codegen<'ctx> {
         let void_type = context.void_type();
         let bool_type = context.bool_type();
 
-        let rt_string_alloc = module.add_function(
-            "lin_string_alloc",
-            string_ptr_type.fn_type(&[i32_type.into()], false),
-            None,
-        );
         let rt_string_concat = module.add_function(
             "lin_string_concat",
             string_ptr_type.fn_type(&[string_ptr_type.into(), string_ptr_type.into()], false),
@@ -240,12 +233,14 @@ impl<'ctx> Codegen<'ctx> {
         let rt_object_has = module.add_function("lin_object_has", i8_type.fn_type(&[ptr_type.into(), ptr_type.into()], false), None);
         // lin_object_eq(a: ptr, b: ptr) -> i8
         let rt_object_eq = module.add_function("lin_object_eq", i8_type.fn_type(&[ptr_type.into(), ptr_type.into()], false), None);
+        // Release functions: decrement refcount, free if zero.
+        let rt_string_release = module.add_function("lin_string_release", void_type.fn_type(&[ptr_type.into()], false), None);
+        let rt_array_release = module.add_function("lin_array_release", void_type.fn_type(&[ptr_type.into()], false), None);
 
         Self {
             context,
             module,
             builder,
-            rt_string_alloc,
             rt_string_concat,
             rt_string_from_bytes,
             rt_string_length,
@@ -282,9 +277,10 @@ impl<'ctx> Codegen<'ctx> {
             rt_object_has,
             rt_object_eq,
             rt_tagged_to_string,
+            rt_string_release,
+            rt_array_release,
             string_ptr_type,
             array_ptr_type,
-            closure_types: HashMap::new(),
             named_fns: HashMap::new(),
             intrinsic_slots: HashMap::new(),
             global_fn_slots: HashMap::new(),
@@ -306,29 +302,24 @@ impl<'ctx> Codegen<'ctx> {
             self.intrinsic_slots.insert(*slot, name.clone());
         }
 
-        // Collect the module-local slot→fn mapping so intra-module calls resolve.
-        let mut module_slots: Vec<(usize, FunctionValue<'ctx>)> = Vec::new();
+        // Collect the module-local slot→fn mapping. This is passed to compile_function_body
+        // so intra-module calls (e.g. clamp calling max/min) resolve without polluting
+        // the global slot map.
+        let mut module_slots: HashMap<usize, FunctionValue<'ctx>> = HashMap::new();
         for stmt in &module.statements {
             if let TypedStmt::Val {
                 slot,
                 value: TypedExpr::Function { name: Some(name), params, ret_type, .. },
                 ..
             } = stmt {
-                // Declare (or find) the function in the LLVM module.
                 let llvm_fn = self.declare_function(name, params, ret_type);
                 self.named_fns.insert(name.clone(), llvm_fn);
                 self.imported_fns.insert((path.to_string(), name.clone()), llvm_fn);
-                module_slots.push((*slot, llvm_fn));
+                module_slots.insert(*slot, llvm_fn);
             }
         }
-        // Temporarily install the imported module's slot→fn mapping into global_fn_slots
-        // so that intra-module calls (e.g. clamp calling max/min) resolve correctly.
-        let mut displaced: Vec<(usize, Option<FunctionValue<'ctx>>)> = Vec::new();
-        for (slot, llvm_fn) in &module_slots {
-            let old = self.global_fn_slots.insert(*slot, *llvm_fn);
-            displaced.push((*slot, old));
-        }
-        // Compile the bodies of imported functions.
+        // Compile the bodies of imported functions, passing the module-local slot map
+        // so sibling calls resolve without touching global state.
         for stmt in &module.statements {
             if let TypedStmt::Val {
                 value: TypedExpr::Function { name: Some(name), params, body, ret_type, captures, .. },
@@ -336,20 +327,11 @@ impl<'ctx> Codegen<'ctx> {
             } = stmt {
                 if captures.is_empty() {
                     if let Some(&llvm_fn) = self.named_fns.get(name.as_str()) {
-                        // Only compile if not already compiled (no basic blocks).
                         if llvm_fn.count_basic_blocks() == 0 {
-                            self.compile_function_body(llvm_fn, params, body, ret_type, &[], name);
+                            self.compile_function_body(llvm_fn, params, body, ret_type, &[], name, &module_slots);
                         }
                     }
                 }
-            }
-        }
-        // Restore displaced global_fn_slots entries.
-        for (slot, old) in displaced {
-            if let Some(old_fn) = old {
-                self.global_fn_slots.insert(slot, old_fn);
-            } else {
-                self.global_fn_slots.remove(&slot);
             }
         }
     }
@@ -419,7 +401,7 @@ impl<'ctx> Codegen<'ctx> {
             {
                 if captures.is_empty() {
                     let llvm_fn = *self.named_fns.get(name.as_str()).unwrap();
-                    self.compile_function_body(llvm_fn, params, body, ret_type, &[], name);
+                    self.compile_function_body(llvm_fn, params, body, ret_type, &[], name, &HashMap::new());
                 }
             }
         }
@@ -532,6 +514,12 @@ impl<'ctx> Codegen<'ctx> {
     /// True if `ty` is a union or TypeVar (i.e., needs tagged representation).
     fn is_union_type(ty: &Type) -> bool {
         matches!(ty, Type::Union(_) | Type::TypeVar(_))
+    }
+
+    /// True if the expression produces a freshly heap-allocated value that the caller owns.
+    /// Used to decide whether to release the value after consuming it.
+    fn expr_is_owned_alloc(expr: &TypedExpr) -> bool {
+        matches!(expr, TypedExpr::Call { .. } | TypedExpr::MakeArray { .. } | TypedExpr::MakeObject { .. })
     }
 
     /// Box a value of known concrete type `val_ty` into a tagged union pointer.
@@ -670,9 +658,9 @@ impl<'ctx> Codegen<'ctx> {
             Type::Float64 => 5,
             Type::Str => 6,
             Type::Object(_) => 7,
-            Type::Array(_) | Type::FixedArray(_) => 8,
+            Type::Array(_) | Type::FixedArray(_) | Type::Iterator(_) => 8,
             Type::Function { .. } => 9,
-            _ => 255,
+            _ => 0,
         }
     }
 
@@ -721,6 +709,8 @@ impl<'ctx> Codegen<'ctx> {
         ret_type: &Type,
         captures: &[Capture],
         fn_name: &str,
+        // Extra slot→fn bindings visible during compilation (for intra-module calls in imported modules).
+        module_slots: &HashMap<usize, FunctionValue<'ctx>>,
     ) {
         // Check if this function can use the TCO loop transform.
         // Condition: name is known, and fn_name matches the function being compiled.
@@ -729,8 +719,13 @@ impl<'ctx> Codegen<'ctx> {
         let entry_block = self.context.append_basic_block(llvm_fn, "entry");
         self.builder.position_at_end(entry_block);
 
+        // Pre-populate with module-local slots so intra-module calls resolve.
+        let module_slot_storage: HashMap<usize, SlotStorage<'ctx>> = module_slots
+            .iter()
+            .map(|(&slot, &fn_val)| (slot, SlotStorage::Value(fn_val.as_global_value().as_pointer_value().into())))
+            .collect();
         let mut fn_ctx = FnCtx {
-            slots: HashMap::new(),
+            slots: module_slot_storage,
             llvm_fn,
             env_ptr: None,
             tco: None,
@@ -1198,6 +1193,7 @@ impl<'ctx> Codegen<'ctx> {
     ) -> BasicValueEnum<'ctx> {
         if *lty == Type::Str || *rty == Type::Str {
             // String concatenation: convert each operand to LinString* if needed.
+            let lv_converted = !matches!(lty, Type::Str);
             let lv_str = if matches!(lty, Type::TypeVar(_)) && lv.is_pointer_value() {
                 self.builder
                     .build_call(self.rt_tagged_to_string, &[lv.into()], "lv_ts")
@@ -1207,6 +1203,7 @@ impl<'ctx> Codegen<'ctx> {
             } else {
                 self.value_to_string_simple(lv, lty)
             };
+            let rv_converted = !matches!(rty, Type::Str);
             let rv_str = if matches!(rty, Type::TypeVar(_)) && rv.is_pointer_value() {
                 self.builder
                     .build_call(self.rt_tagged_to_string, &[rv.into()], "rv_ts")
@@ -1216,7 +1213,7 @@ impl<'ctx> Codegen<'ctx> {
             } else {
                 self.value_to_string_simple(rv, rty)
             };
-            self.builder
+            let result = self.builder
                 .build_call(
                     self.rt_string_concat,
                     &[lv_str.into(), rv_str.into()],
@@ -1224,7 +1221,20 @@ impl<'ctx> Codegen<'ctx> {
                 )
                 .unwrap()
                 .try_as_basic_value()
-                .unwrap_basic()
+                .unwrap_basic();
+            // Release conversion temporaries (numeric/bool/null -> string) only.
+            // Don't release Str (borrowed) or TypeVar (may not have allocated).
+            let is_numeric = |ty: &Type| matches!(ty,
+                Type::Int8 | Type::Int16 | Type::Int32 | Type::Int64 |
+                Type::UInt8 | Type::UInt16 | Type::UInt32 | Type::UInt64 |
+                Type::Float32 | Type::Float64 | Type::Bool | Type::Null);
+            if lv_converted && is_numeric(lty) {
+                self.builder.build_call(self.rt_string_release, &[lv_str.into()], "").unwrap();
+            }
+            if rv_converted && is_numeric(rty) {
+                self.builder.build_call(self.rt_string_release, &[rv_str.into()], "").unwrap();
+            }
+            result
         } else if lty.is_float() {
             self.builder
                 .build_float_add(lv.into_float_value(), rv.into_float_value(), "fadd")
@@ -1448,16 +1458,6 @@ impl<'ctx> Codegen<'ctx> {
     // Function calls
     // -------------------------------------------------------------------------
 
-    /// Compile an argument, boxing it if the expected parameter type is Union/TypeVar.
-    fn compile_arg_for_param(&mut self, arg: &TypedExpr, param_ty: &Type, fn_ctx: &mut FnCtx<'ctx, '_>) -> BasicValueEnum<'ctx> {
-        let val = self.compile_expr(arg, fn_ctx);
-        if Self::is_union_type(param_ty) && !Self::is_union_type(&arg.ty()) {
-            self.box_value(val, &arg.ty())
-        } else {
-            val
-        }
-    }
-
     fn compile_call(
         &mut self,
         func: &TypedExpr,
@@ -1466,128 +1466,31 @@ impl<'ctx> Codegen<'ctx> {
         is_tail: bool,
         fn_ctx: &mut FnCtx<'ctx, '_>,
     ) -> BasicValueEnum<'ctx> {
-        // Check for direct tail self-call (TCO loop transform).
+        // TCO: tail self-calls become a branch back to the loop header.
         if is_tail {
             if let TypedExpr::LocalGet { .. } = func {
-                // Extract TCO state without holding a borrow across the args compilation.
-                let tco_info = fn_ctx.tco.as_ref().map(|tco| {
-                    (tco.loop_block, tco.param_allocs.clone(), tco.param_allocs.len())
-                });
-                if let Some((loop_block, param_allocs, param_count)) = tco_info {
-                    if args.len() == param_count {
-                        // Compile all args before storing (evaluates old values, not new).
-                        let compiled_args: Vec<_> = args
-                            .iter()
-                            .map(|a| self.compile_expr(a, fn_ctx))
-                            .collect();
-                        for (alloc, val) in param_allocs.iter().zip(compiled_args.iter()) {
-                            self.builder.build_store(*alloc, *val).unwrap();
-                        }
-                        self.builder.build_unconditional_branch(loop_block).unwrap();
-                        // Unreachable continuation block to keep IR valid.
-                        let post_block = self.context.append_basic_block(fn_ctx.llvm_fn, "tco_post");
-                        self.builder.position_at_end(post_block);
-                        return self.llvm_type(result_type).const_zero();
-                    }
+                if let Some(result) = self.try_tco_tail_call(args, result_type, fn_ctx) {
+                    return result;
                 }
             }
         }
 
-        // Compile the function value, then call it.
         match func {
             TypedExpr::LocalGet { slot, .. } => {
-                // Check if this is an intrinsic call (e.g. print, toString, length).
-                let intrinsic_name = self.intrinsic_slots.get(slot).cloned();
-                if let Some(name) = intrinsic_name {
+                if let Some(name) = self.intrinsic_slots.get(slot).cloned() {
                     return self.compile_intrinsic_call(&name, args, result_type, fn_ctx);
                 }
-
-                // Try to resolve to a global named function (including sibling top-level fns).
                 if let Some(llvm_fn) = self.global_fn_slots.get(slot).copied() {
-                    // Partial application: fewer args than the function has params.
-                    let total_params = llvm_fn.count_params() as usize;
-                    if args.len() < total_params {
-                        if let Type::Function { params: remaining_params, ret: final_ret } = result_type {
-                            return self.build_partial_application(llvm_fn, args, remaining_params, final_ret, fn_ctx);
-                        }
-                    }
-                    // Get the Lin param types from the function's type signature to decide boxing.
-                    let lin_param_types: Vec<Type> = if let Type::Function { params, .. } = func.ty() {
-                        params
-                    } else {
-                        vec![]
-                    };
-                    let compiled_args: Vec<BasicMetadataValueEnum> = args
-                        .iter()
-                        .enumerate()
-                        .map(|(i, a)| {
-                            let val = self.compile_expr(a, fn_ctx);
-                            let param_ty = lin_param_types.get(i).cloned().unwrap_or_else(|| a.ty());
-                            // Box only if the Lin parameter type is a Union/TypeVar (needs tagged representation).
-                            if Self::is_union_type(&param_ty) && !Self::is_union_type(&a.ty()) {
-                                self.box_value(val, &a.ty()).into()
-                            } else {
-                                val.into()
-                            }
-                        })
-                        .collect();
-                    let call = self.builder.build_call(llvm_fn, &compiled_args, "call").unwrap();
-                    return call.try_as_basic_value().basic().unwrap_or_else(|| {
-                        self.llvm_type(result_type).const_zero()
-                    });
+                    return self.call_global_fn(llvm_fn, func, args, result_type, fn_ctx);
                 }
-
-                // Check if this is a closure (has env_ptr) — unpack and call.
-                if let Some(SlotStorage::Closure(closure_ptr)) = fn_ctx.slots.get(slot).cloned() {
-                    return self.build_closure_call(closure_ptr, args, result_type, fn_ctx);
+                if let Some(SlotStorage::Closure(cls)) = fn_ctx.slots.get(slot).cloned() {
+                    return self.build_closure_call(cls, args, result_type, fn_ctx);
                 }
-
-                // Try to resolve to a known LLVM function from fn_ctx slot.
-                if let Some(SlotStorage::Value(fn_val)) = fn_ctx.slots.get(slot) {
+                if let Some(SlotStorage::Value(fn_val)) = fn_ctx.slots.get(slot).cloned() {
                     if let BasicValueEnum::PointerValue(ptr) = fn_val {
-                        let ptr = *ptr;
-                        // Get param types from func type for determining expected LLVM arg types.
-                        let fn_param_types: Vec<Type> = if let Type::Function { params, .. } = func.ty() {
-                            params
-                        } else {
-                            vec![]
-                        };
-                        let compiled_args: Vec<BasicMetadataValueEnum> = args
-                            .iter()
-                            .enumerate()
-                            .map(|(i, a)| {
-                                let param_ty = fn_param_types.get(i).cloned().unwrap_or_else(|| a.ty());
-                                let val = self.compile_expr(a, fn_ctx);
-                                // Box if function expects Union/TypeVar and arg is concrete type.
-                                if Self::is_union_type(&param_ty) && !Self::is_union_type(&a.ty()) {
-                                    self.box_value(val, &a.ty()).into()
-                                } else {
-                                    val.into()
-                                }
-                            })
-                            .collect();
-
-                        // Determine the function type from the return type and expected param types.
-                        let ret_llvm = self.llvm_type(result_type);
-                        let param_meta_types: Vec<BasicMetadataTypeEnum> = fn_param_types
-                            .iter()
-                            .map(|pt| self.llvm_type(pt).into())
-                            .chain(args.iter().skip(fn_param_types.len()).map(|a| self.llvm_type(&a.ty()).into()))
-                            .collect();
-                        let fn_ty = ret_llvm.fn_type(&param_meta_types, false);
-
-                        let call = self
-                            .builder
-                            .build_indirect_call(fn_ty, ptr, &compiled_args, "call")
-                            .unwrap();
-
-                        return call.try_as_basic_value().basic().unwrap_or_else(|| {
-                            self.llvm_type(result_type).const_zero()
-                        });
+                        return self.call_slot_fn(ptr, func, args, result_type, fn_ctx);
                     }
                 }
-
-                // Fallback: compile function expression, then indirect call.
                 let fn_val = self.compile_expr(func, fn_ctx);
                 self.build_indirect_call(fn_val, args, result_type, fn_ctx)
             }
@@ -1596,6 +1499,110 @@ impl<'ctx> Codegen<'ctx> {
                 self.build_indirect_call(fn_val, args, result_type, fn_ctx)
             }
         }
+    }
+
+    /// Attempt a TCO loop-back for a tail self-call. Returns Some if TCO was emitted.
+    fn try_tco_tail_call(
+        &mut self,
+        args: &[TypedExpr],
+        result_type: &Type,
+        fn_ctx: &mut FnCtx<'ctx, '_>,
+    ) -> Option<BasicValueEnum<'ctx>> {
+        let tco_info = fn_ctx.tco.as_ref().map(|tco| {
+            (tco.loop_block, tco.param_allocs.clone(), tco.param_allocs.len())
+        });
+        let (loop_block, param_allocs, param_count) = tco_info?;
+        if args.len() != param_count {
+            return None;
+        }
+        // Evaluate all args before any stores so we use the old values.
+        let compiled_args: Vec<_> = args.iter().map(|a| self.compile_expr(a, fn_ctx)).collect();
+        for (alloc, val) in param_allocs.iter().zip(compiled_args.iter()) {
+            self.builder.build_store(*alloc, *val).unwrap();
+        }
+        self.builder.build_unconditional_branch(loop_block).unwrap();
+        // Unreachable block to keep IR well-formed after the branch.
+        let post = self.context.append_basic_block(fn_ctx.llvm_fn, "tco_post");
+        self.builder.position_at_end(post);
+        Some(self.llvm_type(result_type).const_zero())
+    }
+
+    /// Call a known global LLVM function, boxing args where the Lin param type is Union/TypeVar.
+    fn call_global_fn(
+        &mut self,
+        llvm_fn: FunctionValue<'ctx>,
+        func: &TypedExpr,
+        args: &[TypedExpr],
+        result_type: &Type,
+        fn_ctx: &mut FnCtx<'ctx, '_>,
+    ) -> BasicValueEnum<'ctx> {
+        let total_params = llvm_fn.count_params() as usize;
+        if args.len() < total_params {
+            if let Type::Function { params: remaining, ret: final_ret } = result_type {
+                return self.build_partial_application(llvm_fn, args, remaining, final_ret, fn_ctx);
+            }
+        }
+        let lin_param_types = Self::fn_param_types(func);
+        let compiled_args: Vec<BasicMetadataValueEnum> = args
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                let val = self.compile_expr(a, fn_ctx);
+                let param_ty = lin_param_types.get(i).cloned().unwrap_or_else(|| a.ty());
+                if Self::is_union_type(&param_ty) && !Self::is_union_type(&a.ty()) {
+                    self.box_value(val, &a.ty()).into()
+                } else {
+                    val.into()
+                }
+            })
+            .collect();
+        self.builder.build_call(llvm_fn, &compiled_args, "call")
+            .unwrap()
+            .try_as_basic_value()
+            .basic()
+            .unwrap_or_else(|| self.llvm_type(result_type).const_zero())
+    }
+
+    /// Call a function via a slot-stored pointer (closure or bare fn ptr), boxing args where needed.
+    fn call_slot_fn(
+        &mut self,
+        ptr: PointerValue<'ctx>,
+        func: &TypedExpr,
+        args: &[TypedExpr],
+        result_type: &Type,
+        fn_ctx: &mut FnCtx<'ctx, '_>,
+    ) -> BasicValueEnum<'ctx> {
+        let fn_param_types = Self::fn_param_types(func);
+        let compiled_args: Vec<BasicMetadataValueEnum> = args
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                let param_ty = fn_param_types.get(i).cloned().unwrap_or_else(|| a.ty());
+                let val = self.compile_expr(a, fn_ctx);
+                if Self::is_union_type(&param_ty) && !Self::is_union_type(&a.ty()) {
+                    self.box_value(val, &a.ty()).into()
+                } else {
+                    val.into()
+                }
+            })
+            .collect();
+        let ret_llvm = self.llvm_type(result_type);
+        let param_meta_types: Vec<BasicMetadataTypeEnum> = fn_param_types
+            .iter()
+            .map(|pt| self.llvm_type(pt).into())
+            .chain(args.iter().skip(fn_param_types.len()).map(|a| self.llvm_type(&a.ty()).into()))
+            .collect();
+        let fn_ty = ret_llvm.fn_type(&param_meta_types, false);
+        self.builder.build_indirect_call(fn_ty, ptr, &compiled_args, "call")
+            .unwrap()
+            .try_as_basic_value()
+            .basic()
+            .unwrap_or_else(|| self.llvm_type(result_type).const_zero())
+    }
+
+    /// Extract the Lin parameter types from a function expression's type annotation.
+    fn fn_param_types(func: &TypedExpr) -> Vec<Type> {
+        if let Type::Function { params, .. } = func.ty() { params } else { vec![] }
     }
 
     fn build_indirect_call(
@@ -1805,13 +1812,20 @@ impl<'ctx> Codegen<'ctx> {
         match name {
             "print" => {
                 // print: (value: any) => Null
-                // Coerce arg to string then call lin_print.
+                // Coerce arg to string, print it, release the temp string if we created one.
                 let arg_val = self.compile_expr(&args[0], fn_ctx);
                 let arg_ty = args[0].ty();
                 let str_val = self.value_to_string(arg_val, &arg_ty, fn_ctx);
-                self.builder
-                    .build_call(self.rt_print, &[str_val.into()], "")
-                    .unwrap();
+                self.builder.build_call(self.rt_print, &[str_val.into()], "").unwrap();
+                // Release the string if it was a guaranteed-fresh allocation (numeric/bool/null conversion).
+                // Don't release Str (borrowed from slot) or TypeVar (lin_tagged_to_string may not allocate).
+                let is_fresh_alloc = matches!(arg_ty,
+                    Type::Int8 | Type::Int16 | Type::Int32 | Type::Int64 |
+                    Type::UInt8 | Type::UInt16 | Type::UInt32 | Type::UInt64 |
+                    Type::Float32 | Type::Float64 | Type::Bool | Type::Null);
+                if is_fresh_alloc {
+                    self.builder.build_call(self.rt_string_release, &[str_val.into()], "").unwrap();
+                }
                 null_val()
             }
             "toString" => {
@@ -1913,14 +1927,9 @@ impl<'ctx> Codegen<'ctx> {
                 let start_i32 = start_val.into_int_value();
                 let end_i32 = end_val.into_int_value();
 
-                // cap = max(end - start, 4)
-                let raw_cap = self.builder.build_int_sub(end_i32, start_i32, "rng_cap_raw").unwrap();
-                let cap_i64 = self.builder.build_int_s_extend(raw_cap, self.context.i64_type(), "rng_cap").unwrap();
-                let min_cap = self.context.i64_type().const_int(4, false);
-                let cap_cond = self.builder.build_int_compare(IntPredicate::SGT, cap_i64, min_cap, "rng_cap_cond").unwrap();
-                let final_cap = self.builder.build_select(cap_cond, cap_i64, min_cap, "rng_final_cap").unwrap().into_int_value();
-
-                let arr_ptr = self.builder.build_call(self.rt_array_alloc, &[final_cap.into()], "rng_arr").unwrap()
+                // Allocate with a small initial capacity; push will grow it as needed.
+                let init_cap = self.context.i64_type().const_int(4, false);
+                let arr_ptr = self.builder.build_call(self.rt_array_alloc, &[init_cap.into()], "rng_arr").unwrap()
                     .try_as_basic_value().unwrap_basic().into_pointer_value();
 
                 // Fill the array: for i = start; i < end; i++
@@ -1948,10 +1957,15 @@ impl<'ctx> Codegen<'ctx> {
             }
             "for" => {
                 // for(iterable, body) — generate an inline loop.
+                let owns_iterable = Self::expr_is_owned_alloc(&args[0]);
                 let iterable_ty = args[0].ty();
                 let iterable_val = self.compile_expr(&args[0], fn_ctx);
                 let body_expr = &args[1];
-                self.compile_for_loop(iterable_val, &iterable_ty, body_expr, fn_ctx)
+                let result = self.compile_for_loop(iterable_val, &iterable_ty, body_expr, fn_ctx);
+                if owns_iterable {
+                    self.builder.build_call(self.rt_array_release, &[iterable_val.into()], "").unwrap();
+                }
+                result
             }
             "iter" => {
                 // iter(init, cond, next, current) => Iterator<T>
@@ -1980,8 +1994,8 @@ impl<'ctx> Codegen<'ctx> {
                 // State alloca to hold current state across iterations.
                 let state_alloc = self.builder.build_alloca(state_llvm_ty, "iter_state").unwrap();
 
-                // Call init() to get initial state — use call_body_noarg_ret.
-                let init_state = self.call_body_noarg_ret(&args[0], &state_ty, fn_ctx);
+                // Call init() to get initial state.
+                let init_state = self.call_body(&args[0], &[], &state_ty, fn_ctx);
                 self.builder.build_store(state_alloc, init_state).unwrap();
 
                 // Loop blocks.
@@ -1993,7 +2007,7 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.position_at_end(check_b);
                 let state_val = self.builder.build_load(state_llvm_ty, state_alloc, "state").unwrap();
                 // Call cond(state) -> Bool.
-                let cond_result = self.call_body_with_arg_ret(&args[1], state_val, &Type::Bool, fn_ctx);
+                let cond_result = self.call_body(&args[1], &[state_val], &Type::Bool, fn_ctx);
                 let cond_bool = if cond_result.is_int_value() {
                     self.builder.build_int_truncate(cond_result.into_int_value(), self.context.bool_type(), "cond_b").unwrap()
                 } else {
@@ -2004,7 +2018,7 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.position_at_end(body_b);
                 let state_val2 = self.builder.build_load(state_llvm_ty, state_alloc, "state2").unwrap();
                 // Call current(state) -> T (use args[3] = current).
-                let elem_val = self.call_body_with_arg_ret(&args[3], state_val2, &elem_ty, fn_ctx);
+                let elem_val = self.call_body(&args[3], &[state_val2], &elem_ty, fn_ctx);
                 // Push elem_val into out_arr.
                 let elem_llvm_ty = self.llvm_type(&elem_ty);
                 let cell = self.builder.build_alloca(elem_llvm_ty, "iter_cell").unwrap();
@@ -2014,7 +2028,7 @@ impl<'ctx> Codegen<'ctx> {
                 let state_val3 = self.builder.build_load(state_llvm_ty, state_alloc, "state3").unwrap();
                 self.builder.build_call(self.rt_array_push, &[out_arr.into(), cell.into(), tag.into()], "").unwrap();
                 // Call next(state) -> state (use args[2] = next).
-                let next_state = self.call_body_with_arg_ret(&args[2], state_val3, &state_ty, fn_ctx);
+                let next_state = self.call_body(&args[2], &[state_val3], &state_ty, fn_ctx);
                 self.builder.build_store(state_alloc, next_state).unwrap();
                 self.builder.build_unconditional_branch(check_b).unwrap();
 
@@ -2023,7 +2037,7 @@ impl<'ctx> Codegen<'ctx> {
             }
             "map" => {
                 // map(iterable, fn) => Iterator<U>
-                // Compile: iterate the input, call fn on each element, push into a new array.
+                let owns_iterable = Self::expr_is_owned_alloc(&args[0]);
                 let iterable_val = self.compile_expr(&args[0], fn_ctx);
                 let iterable_ty = args[0].ty();
                 let body_expr = &args[1];
@@ -2032,10 +2046,15 @@ impl<'ctx> Codegen<'ctx> {
                     Type::Array(t) => *t.clone(),
                     _ => Type::Null,
                 };
-                self.compile_map_loop(iterable_val, &iterable_ty, body_expr, &out_elem_ty, fn_ctx)
+                let result = self.compile_map_loop(iterable_val, &iterable_ty, body_expr, &out_elem_ty, fn_ctx);
+                if owns_iterable {
+                    self.builder.build_call(self.rt_array_release, &[iterable_val.into()], "").unwrap();
+                }
+                result
             }
             "filter" => {
                 // filter(iterable, pred) => Iterator<T>
+                let owns_iterable = Self::expr_is_owned_alloc(&args[0]);
                 let iterable_val = self.compile_expr(&args[0], fn_ctx);
                 let iterable_ty = args[0].ty();
                 let body_expr = &args[1];
@@ -2044,16 +2063,25 @@ impl<'ctx> Codegen<'ctx> {
                     Type::Iterator(t) => *t.clone(),
                     _ => Type::Null,
                 };
-                self.compile_filter_loop(iterable_val, &iterable_ty, body_expr, &elem_ty, fn_ctx)
+                let result = self.compile_filter_loop(iterable_val, &iterable_ty, body_expr, &elem_ty, fn_ctx);
+                if owns_iterable {
+                    self.builder.build_call(self.rt_array_release, &[iterable_val.into()], "").unwrap();
+                }
+                result
             }
             "reduce" => {
                 // reduce(iterable, initial, fn) => U
+                let owns_iterable = Self::expr_is_owned_alloc(&args[0]);
                 let iterable_val = self.compile_expr(&args[0], fn_ctx);
                 let iterable_ty = args[0].ty();
                 let init_val = self.compile_expr(&args[1], fn_ctx);
                 let init_ty = args[1].ty();
                 let body_expr = &args[2];
-                self.compile_reduce_loop(iterable_val, &iterable_ty, init_val, &init_ty, body_expr, result_type, fn_ctx)
+                let result = self.compile_reduce_loop(iterable_val, &iterable_ty, init_val, &init_ty, body_expr, result_type, fn_ctx);
+                if owns_iterable {
+                    self.builder.build_call(self.rt_array_release, &[iterable_val.into()], "").unwrap();
+                }
+                result
             }
             "keys" | "values" => {
                 // Not yet fully implemented.
@@ -2406,14 +2434,14 @@ impl<'ctx> Codegen<'ctx> {
 
             // Compile the function body (deferred — save/restore builder position).
             let current_block = self.builder.get_insert_block().unwrap();
-            self.compile_function_body(llvm_fn, params, body, ret_type, captures, &closure_name);
+            self.compile_function_body(llvm_fn, params, body, ret_type, captures, &closure_name, &HashMap::new());
             self.builder.position_at_end(current_block);
 
             closure_alloc.into()
         } else {
             // Pure function (no captures) — just return its pointer.
             let current_block = self.builder.get_insert_block().unwrap();
-            self.compile_function_body(llvm_fn, params, body, ret_type, &[], &closure_name);
+            self.compile_function_body(llvm_fn, params, body, ret_type, &[], &closure_name, &HashMap::new());
             self.builder.position_at_end(current_block);
 
             llvm_fn.as_global_value().as_pointer_value().into()
@@ -2433,33 +2461,53 @@ impl<'ctx> Codegen<'ctx> {
             return self.compile_string_lit("");
         }
 
-        let mut acc = self.compile_string_part_to_string(&parts[0], fn_ctx);
+        let (mut acc, mut acc_is_owned) = self.compile_string_part_owned(&parts[0], fn_ctx);
         for part in &parts[1..] {
-            let s = self.compile_string_part_to_string(part, fn_ctx);
+            let (s, s_is_owned) = self.compile_string_part_owned(part, fn_ctx);
+            let prev_acc = acc;
+            let prev_owned = acc_is_owned;
             acc = self
                 .builder
-                .build_call(self.rt_string_concat, &[acc.into(), s.into()], "interp")
+                .build_call(self.rt_string_concat, &[prev_acc.into(), s.into()], "interp")
                 .unwrap()
                 .try_as_basic_value()
                 .unwrap_basic();
+            // concat produced a new string; release inputs only if we owned them.
+            if prev_owned {
+                self.builder.build_call(self.rt_string_release, &[prev_acc.into()], "").unwrap();
+            }
+            if s_is_owned {
+                self.builder.build_call(self.rt_string_release, &[s.into()], "").unwrap();
+            }
+            acc_is_owned = true; // the new acc is always a freshly-allocated concat result
         }
         acc
     }
 
-    fn compile_string_part_to_string(
+    /// Compile a string interpolation part to a LinString* and return whether the caller owns it.
+    /// Owned = freshly allocated (numeric/bool/null conversion). Not owned = Str slot or literal.
+    fn compile_string_part_owned(
         &mut self,
         part: &TypedStringPart,
         fn_ctx: &mut FnCtx<'ctx, '_>,
-    ) -> BasicValueEnum<'ctx> {
+    ) -> (BasicValueEnum<'ctx>, bool) {
         match part {
-            TypedStringPart::Literal(s) => self.compile_string_lit(s),
+            TypedStringPart::Literal(s) => (self.compile_string_lit(s), false),
             TypedStringPart::Expr(e) => {
                 let val = self.compile_expr(e, fn_ctx);
                 let ty = e.ty();
-                self.value_to_string(val, &ty, fn_ctx)
+                // Only numeric/bool/null conversions are guaranteed to produce fresh allocations.
+                // Str values are borrowed from slots; TypeVar may or may not allocate.
+                let is_fresh = matches!(ty,
+                    Type::Int8 | Type::Int16 | Type::Int32 | Type::Int64 |
+                    Type::UInt8 | Type::UInt16 | Type::UInt32 | Type::UInt64 |
+                    Type::Float32 | Type::Float64 | Type::Bool | Type::Null);
+                let str_val = self.value_to_string(val, &ty, fn_ctx);
+                (str_val, is_fresh)
             }
         }
     }
+
 
     fn value_to_string(
         &mut self,
@@ -2552,6 +2600,28 @@ impl<'ctx> Codegen<'ctx> {
     // Arrays
     // -------------------------------------------------------------------------
 
+    /// Returns true when the element type maps to a flat unboxed scalar array.
+    /// Only concrete fixed-width numeric scalars qualify — not Bool (stored as i1,
+    /// awkward to pack densely), not pointers, not unions.
+    fn is_flat_scalar(ty: &Type) -> bool {
+        matches!(ty,
+            Type::Int32 | Type::UInt32 |
+            Type::Int64 | Type::UInt64 |
+            Type::Float32 | Type::Float64
+        )
+    }
+
+    /// Suffix used in runtime function names for flat array variants.
+    fn flat_suffix(ty: &Type) -> &'static str {
+        match ty {
+            Type::Int32 | Type::UInt32 => "i32",
+            Type::Int64 | Type::UInt64 => "i64",
+            Type::Float32 => "f32",
+            Type::Float64 => "f64",
+            _ => unreachable!("flat_suffix called with non-scalar type"),
+        }
+    }
+
     fn compile_make_array(
         &mut self,
         elements: &[TypedExpr],
@@ -2559,6 +2629,32 @@ impl<'ctx> Codegen<'ctx> {
         fn_ctx: &mut FnCtx<'ctx, '_>,
     ) -> BasicValueEnum<'ctx> {
         let cap = self.context.i64_type().const_int(elements.len().max(4) as u64, false);
+
+        // If all elements have the same flat scalar type, use a flat (unboxed) array.
+        let elem_ty = match ty {
+            Type::Array(inner) => (**inner).clone(),
+            _ => elements.first().map(|e| e.ty()).unwrap_or(Type::Null),
+        };
+
+        if Self::is_flat_scalar(&elem_ty) {
+            let suffix = Self::flat_suffix(&elem_ty);
+            let alloc_name = format!("lin_flat_array_alloc_{}", suffix);
+            let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
+            let i64_ty = self.context.i64_type();
+            let alloc_fn = self.get_or_declare_fn(&alloc_name,
+                ptr_ty.fn_type(&[i64_ty.into()], false));
+            let arr = self.builder
+                .build_call(alloc_fn, &[cap.into()], "flat_arr")
+                .unwrap()
+                .try_as_basic_value()
+                .unwrap_basic();
+            for elem in elements {
+                let val = self.compile_expr(elem, fn_ctx);
+                self.flat_array_push(arr, val, &elem_ty);
+            }
+            return arr;
+        }
+
         let arr = self
             .builder
             .build_call(self.rt_array_alloc, &[cap.into()], "arr")
@@ -2575,9 +2671,57 @@ impl<'ctx> Codegen<'ctx> {
         arr
     }
 
+    /// Allocate either a flat or tagged array depending on element type.
+    fn alloc_array(&mut self, cap: inkwell::values::IntValue<'ctx>, elem_ty: &Type) -> BasicValueEnum<'ctx> {
+        if Self::is_flat_scalar(elem_ty) {
+            let suffix = Self::flat_suffix(elem_ty);
+            let alloc_name = format!("lin_flat_array_alloc_{}", suffix);
+            let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
+            let i64_ty = self.context.i64_type();
+            let alloc_fn = self.get_or_declare_fn(&alloc_name,
+                ptr_ty.fn_type(&[i64_ty.into()], false));
+            self.builder.build_call(alloc_fn, &[cap.into()], "flat_arr")
+                .unwrap().try_as_basic_value().unwrap_basic()
+        } else {
+            self.builder.build_call(self.rt_array_alloc, &[cap.into()], "arr")
+                .unwrap().try_as_basic_value().unwrap_basic()
+        }
+    }
+
+    /// Push a scalar into a flat unboxed array (lin_flat_array_push_<suffix>).
+    fn flat_array_push(&mut self, arr: BasicValueEnum<'ctx>, val: BasicValueEnum<'ctx>, elem_ty: &Type) {
+        let suffix = Self::flat_suffix(elem_ty);
+        let push_name = format!("lin_flat_array_push_{}", suffix);
+        let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
+        let llvm_elem_ty = self.llvm_type(elem_ty);
+        let push_fn = self.get_or_declare_fn(&push_name,
+            self.context.void_type().fn_type(&[ptr_ty.into(), llvm_elem_ty.into()], false));
+        self.builder.build_call(push_fn, &[arr.into(), val.into()], "").unwrap();
+    }
+
+    /// Load a scalar element from a flat unboxed array (lin_flat_array_get_<suffix>).
+    fn flat_array_get(&mut self, arr: BasicValueEnum<'ctx>, idx: inkwell::values::IntValue<'ctx>, elem_ty: &Type) -> BasicValueEnum<'ctx> {
+        let suffix = Self::flat_suffix(elem_ty);
+        let get_name = format!("lin_flat_array_get_{}", suffix);
+        let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
+        let i64_ty = self.context.i64_type();
+        let llvm_elem_ty = self.llvm_type(elem_ty);
+        let get_fn = self.get_or_declare_fn(&get_name,
+            llvm_elem_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false));
+        self.builder.build_call(get_fn, &[arr.into(), idx.into()], "flat_get")
+            .unwrap()
+            .try_as_basic_value()
+            .unwrap_basic()
+    }
+
     /// Push a value into a LinArray*, using the correct tag for inline storage.
     /// All elements are stored inline as { tag, pad, payload } (same layout as TaggedVal).
     fn array_push_value(&mut self, arr: BasicValueEnum<'ctx>, val: BasicValueEnum<'ctx>, val_ty: &Type) {
+        // Flat scalars that ended up here (e.g. in map output): use flat path.
+        if Self::is_flat_scalar(val_ty) {
+            self.flat_array_push(arr, val, val_ty);
+            return;
+        }
         let i8_ty = self.context.i8_type();
         match val_ty {
             Type::TypeVar(_) | Type::Union(_) => {
@@ -2592,7 +2736,7 @@ impl<'ctx> Codegen<'ctx> {
             }
             _ => {
                 // Concrete type: store with correct tag.
-                let tag_val = Self::type_tag_byte(val_ty);
+                let tag_val = Self::type_tag(val_ty);
                 let tag = i8_ty.const_int(tag_val as u64, false);
                 // For pointer types, store the pointer in a ptr-sized cell; for scalars use the direct type.
                 let (store_val, store_llvm_ty) = match val_ty {
@@ -2605,24 +2749,6 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.build_store(cell, store_val).unwrap();
                 self.builder.build_call(self.rt_array_push, &[arr.into(), cell.into(), tag.into()], "arr_push").unwrap();
             }
-        }
-    }
-
-    /// Return the TAG_* byte for a Lin type (must match lin-runtime tagged.rs constants).
-    fn type_tag_byte(ty: &Type) -> u8 {
-        match ty {
-            Type::Null => 0,
-            Type::Bool => 1,
-            Type::Int8 | Type::Int16 | Type::Int32 |
-            Type::UInt8 | Type::UInt16 | Type::UInt32 => 2,  // TAG_INT32
-            Type::Int64 | Type::UInt64 => 3,                  // TAG_INT64
-            Type::Float32 => 4,
-            Type::Float64 => 5,
-            Type::Str => 6,
-            Type::Object(_) => 7,
-            Type::Array(_) | Type::FixedArray(_) | Type::Iterator(_) => 8,
-            Type::Function { .. } => 9,
-            _ => 0,
         }
     }
 
@@ -2692,14 +2818,18 @@ impl<'ctx> Codegen<'ctx> {
                     .unwrap();
 
                 self.builder.position_at_end(body_block);
-                // Get element pointer and load the payload, then interpret as elem_ty.
-                let elem_ptr_val = self.builder
-                    .build_call(self.rt_array_get, &[iterable_val.into(), cur_i.into()], "elem_ptr")
-                    .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_basic()
-                    .into_pointer_value();
-                let elem_val = self.load_array_element(elem_ptr_val, &elem_ty);
+                // Load element: flat path for known scalars, tagged path otherwise.
+                let elem_val = if Self::is_flat_scalar(&elem_ty) {
+                    self.flat_array_get(iterable_val, cur_i, &elem_ty)
+                } else {
+                    let elem_ptr_val = self.builder
+                        .build_call(self.rt_array_get, &[iterable_val.into(), cur_i.into()], "elem_ptr")
+                        .unwrap()
+                        .try_as_basic_value()
+                        .unwrap_basic()
+                        .into_pointer_value();
+                    self.load_array_element(elem_ptr_val, &elem_ty)
+                };
                 self.call_body_with_arg(body_expr, elem_val, fn_ctx);
 
                 // Increment counter.
@@ -2736,13 +2866,9 @@ impl<'ctx> Codegen<'ctx> {
         let llvm_fn = fn_ctx.llvm_fn;
         let i64_ty = self.context.i64_type();
 
-        // Allocate output array.
+        // Allocate output array (flat if output element type is a known scalar).
         let cap = i64_ty.const_int(4, false);
-        let out_arr = self.builder
-            .build_call(self.rt_array_alloc, &[cap.into()], "map_out")
-            .unwrap()
-            .try_as_basic_value()
-            .unwrap_basic();
+        let out_arr = self.alloc_array(cap, out_elem_ty);
 
         let (i_alloc, len, elem_ty) = self.setup_iteration(iterable_val, iterable_ty, fn_ctx);
         let check_block = self.context.append_basic_block(llvm_fn, "map_check");
@@ -2758,7 +2884,7 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.position_at_end(body_block);
         let elem_val = self.load_iteration_element(iterable_val, iterable_ty, cur_i, &elem_ty, fn_ctx);
         // Call body: get mapped value.
-        let out_val = self.call_body_with_arg_ret(body_expr, elem_val, out_elem_ty, fn_ctx);
+        let out_val = self.call_body(body_expr, &[elem_val], out_elem_ty, fn_ctx);
         // Push out_val into out_arr with correct tag.
         let out_arr_clone = out_arr;
         self.array_push_value(out_arr_clone, out_val, out_elem_ty);
@@ -2782,15 +2908,11 @@ impl<'ctx> Codegen<'ctx> {
         let llvm_fn = fn_ctx.llvm_fn;
         let i64_ty = self.context.i64_type();
 
-        let cap = i64_ty.const_int(4, false);
-        let out_arr = self.builder
-            .build_call(self.rt_array_alloc, &[cap.into()], "filt_out")
-            .unwrap()
-            .try_as_basic_value()
-            .unwrap_basic();
-
         let (i_alloc, len, inferred_elem_ty) = self.setup_iteration(iterable_val, iterable_ty, fn_ctx);
         let actual_elem_ty = if matches!(elem_ty, Type::Null) { inferred_elem_ty } else { elem_ty.clone() };
+
+        let cap = i64_ty.const_int(4, false);
+        let out_arr = self.alloc_array(cap, &actual_elem_ty);
 
         let check_block = self.context.append_basic_block(llvm_fn, "filt_check");
         let body_block = self.context.append_basic_block(llvm_fn, "filt_body");
@@ -2806,7 +2928,7 @@ impl<'ctx> Codegen<'ctx> {
 
         self.builder.position_at_end(body_block);
         let elem_val = self.load_iteration_element(iterable_val, iterable_ty, cur_i, &actual_elem_ty, fn_ctx);
-        let keep = self.call_body_with_arg_ret(body_expr, elem_val, &Type::Bool, fn_ctx);
+        let keep = self.call_body(body_expr, &[elem_val], &Type::Bool, fn_ctx);
         self.builder.build_conditional_branch(keep.into_int_value(), push_block, next_block).unwrap();
 
         self.builder.position_at_end(push_block);
@@ -2858,7 +2980,7 @@ impl<'ctx> Codegen<'ctx> {
         let elem_val = self.load_iteration_element(iterable_val, iterable_ty, cur_i, &elem_ty, fn_ctx);
         let acc_val = self.builder.build_load(acc_llvm_ty, acc_alloc, "acc_v").unwrap();
         // body is (acc, elem) => new_acc — call with both args
-        let new_acc = self.call_body_with_two_args(body_expr, acc_val, elem_val, init_ty, &elem_ty, result_type, fn_ctx);
+        let new_acc = self.call_body(body_expr, &[acc_val, elem_val], result_type, fn_ctx);
         self.builder.build_store(acc_alloc, new_acc).unwrap();
 
         let next_i = self.builder.build_int_add(cur_i, i64_ty.const_int(1, false), "ri_next").unwrap();
@@ -2932,6 +3054,10 @@ impl<'ctx> Codegen<'ctx> {
         };
         match iterable_ty {
             Type::Array(_) | Type::FixedArray(_) | Type::Iterator(_) | Type::TypeVar(_) | Type::Union(_) => {
+                // Use flat path for known scalar element types.
+                if Self::is_flat_scalar(elem_ty) {
+                    return self.flat_array_get(arr_val, cur_i, elem_ty);
+                }
                 let elem_ptr = self.builder
                     .build_call(self.rt_array_get, &[arr_val.into(), cur_i.into()], "elem_ptr")
                     .unwrap()
@@ -2942,211 +3068,91 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
-    /// Call body with one argument and return the result.
-    /// Call a zero-arg body expression: `init => result_ty`.
-    fn call_body_noarg_ret(
+    /// Call a body expression (function or closure) with the given arguments, return result_ty.
+    /// Handles: LocalGet (closure/value/global), inline Function (with or without captures), fallback.
+    fn call_body(
         &mut self,
         body_expr: &TypedExpr,
+        args: &[BasicValueEnum<'ctx>],
         result_ty: &Type,
         fn_ctx: &mut FnCtx<'ctx, '_>,
     ) -> BasicValueEnum<'ctx> {
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         let ret_llvm = self.llvm_type(result_ty);
-        match body_expr {
-            TypedExpr::LocalGet { slot, .. } => {
-                if let Some(SlotStorage::Closure(cls_ptr)) = fn_ctx.slots.get(slot).cloned() {
-                    let cls_struct_type = self.context.struct_type(&[ptr_ty.into(), ptr_ty.into()], false);
-                    let fn_field = self.builder.build_struct_gep(cls_struct_type, cls_ptr, 0, "ci_p").unwrap();
-                    let fn_ptr = self.builder.build_load(ptr_ty, fn_field, "ci").unwrap().into_pointer_value();
-                    let env_field = self.builder.build_struct_gep(cls_struct_type, cls_ptr, 1, "cie_p").unwrap();
-                    let env_ptr = self.builder.build_load(ptr_ty, env_field, "cie").unwrap();
-                    let fn_type = ret_llvm.fn_type(&[ptr_ty.into()], false);
-                    return self.builder.build_indirect_call(fn_type, fn_ptr, &[env_ptr.into()], "ci_call")
-                        .unwrap().try_as_basic_value().basic().unwrap_or_else(|| ret_llvm.const_zero());
-                }
-                if let Some(SlotStorage::Value(fn_val)) = fn_ctx.slots.get(slot).cloned() {
-                    if let BasicValueEnum::PointerValue(fn_ptr) = fn_val {
-                        let fn_type = ret_llvm.fn_type(&[], false);
-                        return self.builder.build_indirect_call(fn_type, fn_ptr, &[], "ci_call")
-                            .unwrap().try_as_basic_value().basic().unwrap_or_else(|| ret_llvm.const_zero());
-                    }
-                }
-                if let Some(llvm_fn) = self.global_fn_slots.get(slot).copied() {
-                    return self.builder.build_call(llvm_fn, &[], "ci_call")
-                        .unwrap().try_as_basic_value().basic().unwrap_or_else(|| ret_llvm.const_zero());
-                }
-                ret_llvm.const_zero()
-            }
-            TypedExpr::Function { params, body, captures, .. } if captures.is_empty() && params.is_empty() => {
-                // No-arg inline lambda — directly compile the body.
-                self.compile_expr(body, fn_ctx)
-            }
-            TypedExpr::Function { params, body, captures, .. } => {
-                // Capturing no-arg closure: compile and call via { fn_ptr, env_ptr }.
-                let ptr_ty = self.context.ptr_type(AddressSpace::default());
-                let cls_ptr = self.compile_closure(None, params, body, result_ty, captures, fn_ctx).into_pointer_value();
-                let cls_struct = self.context.struct_type(&[ptr_ty.into(), ptr_ty.into()], false);
-                let fn_field = self.builder.build_struct_gep(cls_struct, cls_ptr, 0, "cin_p").unwrap();
-                let fn_ptr = self.builder.build_load(ptr_ty, fn_field, "cin").unwrap().into_pointer_value();
-                let env_field = self.builder.build_struct_gep(cls_struct, cls_ptr, 1, "cine_p").unwrap();
-                let env_ptr = self.builder.build_load(ptr_ty, env_field, "cine").unwrap();
-                let fn_type = ret_llvm.fn_type(&[ptr_ty.into()], false);
-                self.builder.build_indirect_call(fn_type, fn_ptr, &[env_ptr.into()], "ci_call")
-                    .unwrap().try_as_basic_value().basic().unwrap_or_else(|| ret_llvm.const_zero())
-            }
-            _ => {
-                let fn_val = self.compile_expr(body_expr, fn_ctx);
-                if let BasicValueEnum::PointerValue(fn_ptr) = fn_val {
-                    let fn_type = ret_llvm.fn_type(&[], false);
-                    self.builder.build_indirect_call(fn_type, fn_ptr, &[], "ci_call")
-                        .unwrap().try_as_basic_value().basic().unwrap_or_else(|| ret_llvm.const_zero())
-                } else {
-                    ret_llvm.const_zero()
-                }
-            }
-        }
-    }
+        let arg_metas: Vec<BasicMetadataTypeEnum> = args.iter().map(|a| a.get_type().into()).collect();
+        let arg_vals: Vec<BasicMetadataValueEnum> = args.iter().map(|a| (*a).into()).collect();
 
-    fn call_body_with_arg_ret(
-        &mut self,
-        body_expr: &TypedExpr,
-        arg: BasicValueEnum<'ctx>,
-        result_ty: &Type,
-        fn_ctx: &mut FnCtx<'ctx, '_>,
-    ) -> BasicValueEnum<'ctx> {
         match body_expr {
             TypedExpr::LocalGet { slot, .. } => {
-                let ptr_ty = self.context.ptr_type(AddressSpace::default());
-                let arg_meta: BasicMetadataTypeEnum = arg.get_type().into();
-                let ret_llvm = self.llvm_type(result_ty);
-                // Check for closure.
                 if let Some(SlotStorage::Closure(cls_ptr)) = fn_ctx.slots.get(slot).cloned() {
-                    let cls_struct_type = self.context.struct_type(&[ptr_ty.into(), ptr_ty.into()], false);
-                    let fn_field = self.builder.build_struct_gep(cls_struct_type, cls_ptr, 0, "cbrf_p").unwrap();
-                    let fn_ptr = self.builder.build_load(ptr_ty, fn_field, "cbrf").unwrap().into_pointer_value();
-                    let env_field = self.builder.build_struct_gep(cls_struct_type, cls_ptr, 1, "cbre_p").unwrap();
-                    let env_ptr = self.builder.build_load(ptr_ty, env_field, "cbre").unwrap();
-                    let fn_type = ret_llvm.fn_type(&[ptr_ty.into(), arg_meta], false);
-                    return self.builder.build_indirect_call(fn_type, fn_ptr, &[env_ptr.into(), arg.into()], "cbr_call")
+                    let cls_ty = self.context.struct_type(&[ptr_ty.into(), ptr_ty.into()], false);
+                    let fn_ptr = self.builder.build_load(ptr_ty,
+                        self.builder.build_struct_gep(cls_ty, cls_ptr, 0, "cb_fp").unwrap(), "cb_fn").unwrap().into_pointer_value();
+                    let env_ptr = self.builder.build_load(ptr_ty,
+                        self.builder.build_struct_gep(cls_ty, cls_ptr, 1, "cb_ep").unwrap(), "cb_env").unwrap();
+                    let mut param_types: Vec<BasicMetadataTypeEnum> = vec![ptr_ty.into()];
+                    param_types.extend_from_slice(&arg_metas);
+                    let mut call_args: Vec<BasicMetadataValueEnum> = vec![env_ptr.into()];
+                    call_args.extend_from_slice(&arg_vals);
+                    let fn_type = ret_llvm.fn_type(&param_types, false);
+                    return self.builder.build_indirect_call(fn_type, fn_ptr, &call_args, "cb_call")
                         .unwrap().try_as_basic_value().basic().unwrap_or_else(|| ret_llvm.const_zero());
                 }
                 if let Some(SlotStorage::Value(fn_val)) = fn_ctx.slots.get(slot).cloned() {
                     if let BasicValueEnum::PointerValue(fn_ptr) = fn_val {
-                        let fn_type = ret_llvm.fn_type(&[arg_meta], false);
-                        return self.builder.build_indirect_call(fn_type, fn_ptr, &[arg.into()], "cbr_call")
+                        let fn_type = ret_llvm.fn_type(&arg_metas, false);
+                        return self.builder.build_indirect_call(fn_type, fn_ptr, &arg_vals, "cb_call")
                             .unwrap().try_as_basic_value().basic().unwrap_or_else(|| ret_llvm.const_zero());
                     }
                 }
                 if let Some(llvm_fn) = self.global_fn_slots.get(slot).copied() {
-                    return self.builder.build_call(llvm_fn, &[arg.into()], "cbr_call")
+                    return self.builder.build_call(llvm_fn, &arg_vals, "cb_call")
                         .unwrap().try_as_basic_value().basic().unwrap_or_else(|| ret_llvm.const_zero());
                 }
                 ret_llvm.const_zero()
             }
             TypedExpr::Function { params, body, captures, .. } if captures.is_empty() => {
-                // Inline lambda.
-                if let Some(param) = params.first() {
-                    let old = fn_ctx.slots.insert(param.slot, SlotStorage::Value(arg));
-                    let result = self.compile_expr(body, fn_ctx);
-                    if let Some(prev) = old {
-                        fn_ctx.slots.insert(param.slot, prev);
-                    } else {
-                        fn_ctx.slots.remove(&param.slot);
-                    }
-                    result
-                } else {
-                    self.llvm_type(result_ty).const_zero()
-                }
-            }
-            TypedExpr::Function { params, body, captures, .. } => {
-                // Capturing lambda — compile as closure and call via { fn_ptr, env_ptr }.
-                let ptr_ty = self.context.ptr_type(AddressSpace::default());
-                let ret_llvm = self.llvm_type(result_ty);
-                let arg_meta: BasicMetadataTypeEnum = arg.get_type().into();
-                let cls_ptr = self.compile_closure(None, params, body, result_ty, captures, fn_ctx).into_pointer_value();
-                let cls_struct_type = self.context.struct_type(&[ptr_ty.into(), ptr_ty.into()], false);
-                let fn_field = self.builder.build_struct_gep(cls_struct_type, cls_ptr, 0, "clf_p").unwrap();
-                let fn_ptr = self.builder.build_load(ptr_ty, fn_field, "clf").unwrap().into_pointer_value();
-                let env_field = self.builder.build_struct_gep(cls_struct_type, cls_ptr, 1, "cle_p").unwrap();
-                let env_ptr = self.builder.build_load(ptr_ty, env_field, "cle").unwrap();
-                let fn_type = ret_llvm.fn_type(&[ptr_ty.into(), arg_meta], false);
-                self.builder.build_indirect_call(fn_type, fn_ptr, &[env_ptr.into(), arg.into()], "cbr_call")
-                    .unwrap().try_as_basic_value().basic().unwrap_or_else(|| ret_llvm.const_zero())
-            }
-            _ => {
-                let fn_val = self.compile_expr(body_expr, fn_ctx);
-                if let BasicValueEnum::PointerValue(fn_ptr) = fn_val {
-                    let ret_llvm = self.llvm_type(result_ty);
-                    let arg_meta: BasicMetadataTypeEnum = arg.get_type().into();
-                    let fn_type = ret_llvm.fn_type(&[arg_meta], false);
-                    self.builder.build_indirect_call(fn_type, fn_ptr, &[arg.into()], "cbr_call")
-                        .unwrap().try_as_basic_value().basic().unwrap_or_else(|| ret_llvm.const_zero())
-                } else {
-                    self.llvm_type(result_ty).const_zero()
-                }
-            }
-        }
-    }
-
-    /// Call a 2-arg body (acc, elem) => new_acc for reduce.
-    fn call_body_with_two_args(
-        &mut self,
-        body_expr: &TypedExpr,
-        acc: BasicValueEnum<'ctx>,
-        elem: BasicValueEnum<'ctx>,
-        acc_ty: &Type,
-        _elem_ty: &Type,
-        result_ty: &Type,
-        fn_ctx: &mut FnCtx<'ctx, '_>,
-    ) -> BasicValueEnum<'ctx> {
-        let ret_llvm = self.llvm_type(result_ty);
-        match body_expr {
-            TypedExpr::LocalGet { slot, .. } => {
-                let ptr_ty = self.context.ptr_type(AddressSpace::default());
-                let acc_meta: BasicMetadataTypeEnum = acc.get_type().into();
-                let elem_meta: BasicMetadataTypeEnum = elem.get_type().into();
-                if let Some(SlotStorage::Closure(cls_ptr)) = fn_ctx.slots.get(slot).cloned() {
-                    let cls_struct_type = self.context.struct_type(&[ptr_ty.into(), ptr_ty.into()], false);
-                    let fn_field = self.builder.build_struct_gep(cls_struct_type, cls_ptr, 0, "r2_fn_p").unwrap();
-                    let fn_ptr = self.builder.build_load(ptr_ty, fn_field, "r2_fn").unwrap().into_pointer_value();
-                    let env_field = self.builder.build_struct_gep(cls_struct_type, cls_ptr, 1, "r2_env_p").unwrap();
-                    let env_ptr = self.builder.build_load(ptr_ty, env_field, "r2_env").unwrap();
-                    let fn_type = ret_llvm.fn_type(&[ptr_ty.into(), acc_meta, elem_meta], false);
-                    return self.builder.build_indirect_call(fn_type, fn_ptr, &[env_ptr.into(), acc.into(), elem.into()], "r2_call")
-                        .unwrap().try_as_basic_value().basic().unwrap_or_else(|| ret_llvm.const_zero());
-                }
-                if let Some(llvm_fn) = self.global_fn_slots.get(slot).copied() {
-                    return self.builder.build_call(llvm_fn, &[acc.into(), elem.into()], "r2_call")
-                        .unwrap().try_as_basic_value().basic().unwrap_or_else(|| ret_llvm.const_zero());
-                }
-                ret_llvm.const_zero()
-            }
-            TypedExpr::Function { params, body, captures, .. } if captures.is_empty() => {
-                // Inline 2-param lambda.
-                let old0 = params.get(0).map(|p| {
-                    let old = fn_ctx.slots.insert(p.slot, SlotStorage::Value(acc));
-                    (p.slot, old)
-                });
-                let old1 = params.get(1).map(|p| {
-                    let old = fn_ctx.slots.insert(p.slot, SlotStorage::Value(elem));
-                    (p.slot, old)
-                });
+                // Inline lambda: bind params to args directly, compile body.
+                let saved: Vec<(usize, Option<SlotStorage<'ctx>>)> = params.iter().zip(args.iter())
+                    .map(|(p, &a)| {
+                        let old = fn_ctx.slots.insert(p.slot, SlotStorage::Value(a));
+                        (p.slot, old)
+                    }).collect();
                 let result = self.compile_expr(body, fn_ctx);
-                // Restore.
-                if let Some((slot, old)) = old0 {
-                    if let Some(prev) = old { fn_ctx.slots.insert(slot, prev); } else { fn_ctx.slots.remove(&slot); }
+                for (slot, old) in saved {
+                    match old {
+                        Some(prev) => { fn_ctx.slots.insert(slot, prev); }
+                        None => { fn_ctx.slots.remove(&slot); }
+                    }
                 }
-                if let Some((slot, old)) = old1 {
-                    if let Some(prev) = old { fn_ctx.slots.insert(slot, prev); } else { fn_ctx.slots.remove(&slot); }
-                }
-                // Coerce result to acc_ty if needed.
-                if result.get_type() != self.llvm_type(acc_ty) {
-                    ret_llvm.const_zero()
+                result
+            }
+            TypedExpr::Function { params, body, captures, ret_type, .. } => {
+                // Capturing lambda — compile closure and call immediately.
+                let cls_ptr = self.compile_closure(None, params, body, ret_type, captures, fn_ctx).into_pointer_value();
+                let cls_ty = self.context.struct_type(&[ptr_ty.into(), ptr_ty.into()], false);
+                let fn_ptr = self.builder.build_load(ptr_ty,
+                    self.builder.build_struct_gep(cls_ty, cls_ptr, 0, "cbc_fp").unwrap(), "cbc_fn").unwrap().into_pointer_value();
+                let env_ptr = self.builder.build_load(ptr_ty,
+                    self.builder.build_struct_gep(cls_ty, cls_ptr, 1, "cbc_ep").unwrap(), "cbc_env").unwrap();
+                let mut param_types: Vec<BasicMetadataTypeEnum> = vec![ptr_ty.into()];
+                param_types.extend_from_slice(&arg_metas);
+                let mut call_args: Vec<BasicMetadataValueEnum> = vec![env_ptr.into()];
+                call_args.extend_from_slice(&arg_vals);
+                let fn_type = ret_llvm.fn_type(&param_types, false);
+                self.builder.build_indirect_call(fn_type, fn_ptr, &call_args, "cbc_call")
+                    .unwrap().try_as_basic_value().basic().unwrap_or_else(|| ret_llvm.const_zero())
+            }
+            _ => {
+                let fn_val = self.compile_expr(body_expr, fn_ctx);
+                if let BasicValueEnum::PointerValue(fn_ptr) = fn_val {
+                    let fn_type = ret_llvm.fn_type(&arg_metas, false);
+                    self.builder.build_indirect_call(fn_type, fn_ptr, &arg_vals, "cb_call")
+                        .unwrap().try_as_basic_value().basic().unwrap_or_else(|| ret_llvm.const_zero())
                 } else {
-                    result
+                    ret_llvm.const_zero()
                 }
             }
-            _ => ret_llvm.const_zero(),
         }
     }
 
@@ -3249,54 +3255,6 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.build_load(llvm_ty, payload_ptr, "tv_int").unwrap()
             }
         }
-    }
-
-    /// Call a function value (closure or bare fn ptr) with no arguments. Returns the result as `ret_ty`.
-    fn call_fn_val_noarg(&mut self, fn_val: BasicValueEnum<'ctx>, ret_ty: &Type, fn_ctx: &mut FnCtx<'ctx, '_>) -> BasicValueEnum<'ctx> {
-        let ptr_ty = self.context.ptr_type(AddressSpace::default());
-        let ret_llvm_ty = self.llvm_type(ret_ty);
-        let ret_meta: BasicMetadataTypeEnum = ret_llvm_ty.into();
-        // Closures: { fn_ptr, env_ptr } struct on heap.
-        if fn_val.is_pointer_value() {
-            let cls_ptr = fn_val.into_pointer_value();
-            let cls_struct = self.context.struct_type(&[ptr_ty.into(), ptr_ty.into()], false);
-            // Try loading as closure.
-            let fn_field = self.builder.build_struct_gep(cls_struct, cls_ptr, 0, "cfn_p").unwrap();
-            let fn_ptr = self.builder.build_load(ptr_ty, fn_field, "cfn").unwrap().into_pointer_value();
-            let env_field = self.builder.build_struct_gep(cls_struct, cls_ptr, 1, "cenv_p").unwrap();
-            let env_ptr = self.builder.build_load(ptr_ty, env_field, "cenv").unwrap();
-            let fn_type = ret_llvm_ty.fn_type(&[ptr_ty.into()], false);
-            return self.builder
-                .build_indirect_call(fn_type, fn_ptr, &[env_ptr.into()], "cfn_call")
-                .unwrap()
-                .try_as_basic_value()
-                .basic()
-                .unwrap_or_else(|| ret_llvm_ty.const_zero());
-        }
-        ret_llvm_ty.const_zero()
-    }
-
-    /// Call a function value (closure or bare fn ptr) with one argument. Returns the result as `ret_ty`.
-    fn call_fn_val_with_arg(&mut self, fn_val: BasicValueEnum<'ctx>, arg: BasicValueEnum<'ctx>, ret_ty: &Type, fn_ctx: &mut FnCtx<'ctx, '_>) -> BasicValueEnum<'ctx> {
-        let ptr_ty = self.context.ptr_type(AddressSpace::default());
-        let ret_llvm_ty = self.llvm_type(ret_ty);
-        let arg_meta: BasicMetadataTypeEnum = arg.get_type().into();
-        if fn_val.is_pointer_value() {
-            let cls_ptr = fn_val.into_pointer_value();
-            let cls_struct = self.context.struct_type(&[ptr_ty.into(), ptr_ty.into()], false);
-            let fn_field = self.builder.build_struct_gep(cls_struct, cls_ptr, 0, "cfn1_p").unwrap();
-            let fn_ptr = self.builder.build_load(ptr_ty, fn_field, "cfn1").unwrap().into_pointer_value();
-            let env_field = self.builder.build_struct_gep(cls_struct, cls_ptr, 1, "cenv1_p").unwrap();
-            let env_ptr = self.builder.build_load(ptr_ty, env_field, "cenv1").unwrap();
-            let fn_type = ret_llvm_ty.fn_type(&[ptr_ty.into(), arg_meta], false);
-            return self.builder
-                .build_indirect_call(fn_type, fn_ptr, &[env_ptr.into(), arg.into()], "cfn1_call")
-                .unwrap()
-                .try_as_basic_value()
-                .basic()
-                .unwrap_or_else(|| ret_llvm_ty.const_zero());
-        }
-        ret_llvm_ty.const_zero()
     }
 
     /// Call the body expression (a closure or function) with a single argument.
@@ -3422,27 +3380,6 @@ impl<'ctx> Codegen<'ctx> {
             }
             BasicValueEnum::PointerValue(_) => Type::TypeVar(0), // still unknown
             _ => Type::TypeVar(0),
-        }
-    }
-
-    /// Reverse-map an LLVM BasicValueEnum to a Lin type (for TypeVar substitution).
-    fn basic_value_to_type(&self, val: BasicValueEnum<'ctx>) -> Type {
-        match val {
-            BasicValueEnum::IntValue(iv) => {
-                match iv.get_type().get_bit_width() {
-                    1 => Type::Bool,
-                    8 => Type::Int8,
-                    16 => Type::Int16,
-                    32 => Type::Int32,
-                    64 => Type::Int64,
-                    _ => Type::Int64,
-                }
-            }
-            BasicValueEnum::FloatValue(fv) => {
-                if fv.get_type() == self.context.f32_type() { Type::Float32 } else { Type::Float64 }
-            }
-            BasicValueEnum::PointerValue(_) => Type::Str, // approximation
-            _ => Type::Null,
         }
     }
 
@@ -3607,6 +3544,11 @@ impl<'ctx> Codegen<'ctx> {
                 } else {
                     self.context.i64_type().const_int(0, false)
                 };
+                // Use flat path for known scalar element types.
+                if Self::is_flat_scalar(result_type) {
+                    return self.flat_array_get(obj_val, idx, result_type);
+                }
+
                 let elem_ptr = self
                     .builder
                     .build_call(self.rt_array_get, &[obj_val.into(), idx.into()], "aref")
@@ -3676,6 +3618,111 @@ impl<'ctx> Codegen<'ctx> {
     // Match / pattern matching
     // -------------------------------------------------------------------------
 
+    /// Returns true if all arms are tag-dispatch (`Is(TypeCheck)`) with no guards,
+    /// and the scrutinee is a tagged union/TypeVar — the precondition for LLVM `switch`.
+    fn can_use_tag_switch(arms: &[TypedMatchArm], scrut_ty: &Type) -> bool {
+        if !Self::is_union_type(scrut_ty) {
+            return false;
+        }
+        arms.iter().all(|arm| {
+            if arm.guard.is_some() {
+                return false;
+            }
+            matches!(&arm.pattern,
+                TypedMatchPattern::Is(TypedPattern::TypeCheck(_, _)) |
+                TypedMatchPattern::Else
+            )
+        })
+    }
+
+    /// Compile a match where every arm is an `is Type` tag check using a single LLVM `switch`.
+    /// Returns the result value; caller must be positioned after the merge block.
+    fn compile_match_switch(
+        &mut self,
+        scrut_val: BasicValueEnum<'ctx>,
+        arms: &[TypedMatchArm],
+        result_type: &Type,
+        fn_ctx: &mut FnCtx<'ctx, '_>,
+    ) -> BasicValueEnum<'ctx> {
+        let i8_ty = self.context.i8_type();
+        let result_llvm_ty = self.llvm_type(result_type);
+        let merge_block = self.context.append_basic_block(fn_ctx.llvm_fn, "sw_merge");
+        let mut incoming: Vec<(BasicValueEnum<'ctx>, inkwell::basic_block::BasicBlock<'ctx>)> = Vec::new();
+
+        // Get the tag from the tagged-value pointer.
+        let tag = self.builder
+            .build_call(self.rt_get_tag, &[scrut_val.into()], "sw_tag")
+            .unwrap()
+            .try_as_basic_value()
+            .unwrap_basic()
+            .into_int_value();
+
+        // Locate else arm (if any) — becomes the switch default.
+        let else_arm = arms.iter().find(|a| matches!(a.pattern, TypedMatchPattern::Else));
+
+        // Build the default block (else arm or panic).
+        let default_block = self.context.append_basic_block(fn_ctx.llvm_fn, "sw_default");
+
+        // Collect (tag_value, arm_body_block) pairs.
+        let mut cases: Vec<(u8, inkwell::basic_block::BasicBlock<'ctx>, &TypedMatchArm)> = Vec::new();
+        for arm in arms.iter() {
+            if let TypedMatchPattern::Is(TypedPattern::TypeCheck(ty, _)) = &arm.pattern {
+                let arm_block = self.context.append_basic_block(fn_ctx.llvm_fn, "sw_arm");
+                cases.push((Self::type_tag(ty), arm_block, arm));
+            }
+        }
+
+        // Build switch instruction: collect (tag_constant, block) pairs and pass as slice.
+        let case_pairs: Vec<(inkwell::values::IntValue<'ctx>, inkwell::basic_block::BasicBlock<'ctx>)> = cases
+            .iter()
+            .map(|(tag_val, arm_block, _)| (i8_ty.const_int(*tag_val as u64, false), *arm_block))
+            .collect();
+        self.builder
+            .build_switch(tag, default_block, &case_pairs)
+            .unwrap();
+
+        // Compile each case arm body.
+        for (_, arm_block, arm) in &cases {
+            self.builder.position_at_end(*arm_block);
+            let body_val = self.compile_expr(&arm.body, fn_ctx);
+            let arm_end = self.builder.get_insert_block().unwrap();
+            if arm_end.get_terminator().is_none() {
+                self.builder.build_unconditional_branch(merge_block).unwrap();
+                incoming.push((body_val, arm_end));
+            }
+        }
+
+        // Compile the default block.
+        self.builder.position_at_end(default_block);
+        if let Some(arm) = else_arm {
+            let body_val = self.compile_expr(&arm.body, fn_ctx);
+            let end = self.builder.get_insert_block().unwrap();
+            if end.get_terminator().is_none() {
+                self.builder.build_unconditional_branch(merge_block).unwrap();
+                incoming.push((body_val, end));
+            }
+        } else {
+            let panic_msg = self.compile_string_lit("match: no arm matched");
+            let zero = self.context.i32_type().const_zero();
+            self.builder.build_call(self.rt_panic, &[panic_msg.into(), zero.into(), zero.into()], "").unwrap();
+            self.builder.build_unreachable().unwrap();
+        }
+
+        // Phi merge.
+        self.builder.position_at_end(merge_block);
+        if incoming.is_empty() {
+            return result_llvm_ty.const_zero();
+        }
+        if incoming.len() == 1 {
+            return incoming[0].0;
+        }
+        let phi = self.builder.build_phi(result_llvm_ty, "sw_result").unwrap();
+        for (val, block) in &incoming {
+            phi.add_incoming(&[(val, *block)]);
+        }
+        phi.as_basic_value()
+    }
+
     fn compile_match(
         &mut self,
         scrutinee: &TypedExpr,
@@ -3685,6 +3732,11 @@ impl<'ctx> Codegen<'ctx> {
     ) -> BasicValueEnum<'ctx> {
         let scrut_val = self.compile_expr(scrutinee, fn_ctx);
         let scrut_ty = scrutinee.ty();
+
+        // Fast path: all `is Type` arms with no guards → emit a single LLVM switch.
+        if Self::can_use_tag_switch(arms, &scrut_ty) {
+            return self.compile_match_switch(scrut_val, arms, result_type, fn_ctx);
+        }
 
         let merge_block = self.context.append_basic_block(fn_ctx.llvm_fn, "match_merge");
         let result_llvm_ty = self.llvm_type(result_type);
@@ -3821,7 +3873,7 @@ impl<'ctx> Codegen<'ctx> {
                 let result = self.compile_eq(effective_val, lit_val, &effective_ty, false);
                 result.into_int_value()
             }
-            TypedPattern::Binding(slot, ty, _) => {
+            TypedPattern::Binding(slot, _ty, _) => {
                 // Bind the scrutinee to a new slot and return true.
                 // For union scrutinees, store as-is (TypeVar typed slot).
                 fn_ctx.slots.insert(*slot, SlotStorage::Value(scrut_val));

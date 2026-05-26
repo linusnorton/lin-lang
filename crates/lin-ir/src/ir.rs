@@ -1,0 +1,258 @@
+//! Flat 3-address IR for Lin, between TypedExpr and LLVM codegen.
+//!
+//! Design principles:
+//! - No nested expressions: every sub-expression result is named as a Temp.
+//! - No phi nodes: merge-points use explicit Copy instructions to pre-allocated temps.
+//! - RC operations are explicit: Retain/Release instructions for strings, arrays, objects.
+//! - Liveness analysis and RC elision operate on this representation before LLVM codegen.
+
+use std::collections::HashMap;
+use lin_check::types::Type;
+use lin_parse::ast::BinOp;
+
+/// Identity for temporaries (SSA values within a function).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Temp(pub u32);
+
+/// Identity for basic blocks within a function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BlockId(pub u32);
+
+/// Identity for functions within a module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FuncId(pub u32);
+
+/// Compile-time constant values.
+#[derive(Debug, Clone)]
+pub enum Const {
+    Int(i64, Type),
+    Float(f64, Type),
+    Bool(bool),
+    Null,
+    /// String literal: pointer to a heap-allocated LinString.
+    Str(String),
+}
+
+/// Known runtime operations that map 1:1 to lin-runtime functions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Intrinsic {
+    Print,
+    ToString,
+    Length,
+    Push,
+    Concat,
+    StringConcat,
+    StringLength,
+    StringEq,
+    StringRelease,
+    ArrayAlloc,
+    ArrayPush,
+    ArrayGet,
+    ArrayLength,
+    ArrayRelease,
+    FlatArrayAlloc(FlatElemKind),
+    FlatArrayPush(FlatElemKind),
+    FlatArrayGet(FlatElemKind),
+    ObjectAlloc,
+    ObjectSet,
+    ObjectGet,
+    ObjectHas,
+    ObjectEq,
+    BoxNull,
+    BoxBool,
+    BoxInt32,
+    BoxInt64,
+    BoxFloat64,
+    BoxStr,
+    BoxObject,
+    BoxArray,
+    BoxFunction,
+    GetTag,
+    UnboxInt32,
+    UnboxInt64,
+    UnboxFloat64,
+    UnboxBool,
+    UnboxPtr,
+    TaggedToString,
+    IntToString,
+    FloatToString,
+    BoolToString,
+    NullToString,
+    Alloc,
+    Panic,
+}
+
+/// Element kinds for unboxed (flat) scalar arrays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FlatElemKind {
+    I32,
+    I64,
+    F32,
+    F64,
+}
+
+impl FlatElemKind {
+    pub fn suffix(self) -> &'static str {
+        match self {
+            FlatElemKind::I32 => "i32",
+            FlatElemKind::I64 => "i64",
+            FlatElemKind::F32 => "f32",
+            FlatElemKind::F64 => "f64",
+        }
+    }
+
+    pub fn from_type(ty: &Type) -> Option<Self> {
+        match ty {
+            Type::Int32 | Type::UInt32 => Some(FlatElemKind::I32),
+            Type::Int64 | Type::UInt64 => Some(FlatElemKind::I64),
+            Type::Float32 => Some(FlatElemKind::F32),
+            Type::Float64 => Some(FlatElemKind::F64),
+            _ => None,
+        }
+    }
+}
+
+/// A single 3-address instruction. Each instruction produces at most one result.
+#[derive(Debug, Clone)]
+pub enum Instruction {
+    /// result = constant
+    Const { dst: Temp, val: Const },
+    /// result = src (copy / rename)
+    Copy { dst: Temp, src: Temp },
+    /// result = unary op applied to operand
+    Unary { dst: Temp, op: UnaryOp, operand: Temp, ty: Type },
+    /// result = lhs op rhs
+    Binary { dst: Temp, op: BinOp, lhs: Temp, rhs: Temp, ty: Type },
+    /// result = coerce(src, from_ty, to_ty)
+    Coerce { dst: Temp, src: Temp, from_ty: Type, to_ty: Type },
+    /// result = callee(args...)
+    Call { dst: Temp, callee: CallTarget, args: Vec<Temp>, ret_ty: Type },
+    /// result = intrinsic(args...)
+    CallIntrinsic { dst: Temp, intrinsic: Intrinsic, args: Vec<Temp>, ret_ty: Type },
+    /// result = closure(func_id, env_temps[...])  — allocates closure struct
+    MakeClosure { dst: Temp, func: FuncId, captures: Vec<Temp>, ret_ty: Type },
+    /// result = { fields... }  — allocates object on heap
+    MakeObject { dst: Temp, fields: Vec<(String, Temp)>, spreads: Vec<Temp>, ty: Type },
+    /// result = [ elements... ]  — allocates array on heap
+    MakeArray { dst: Temp, elements: Vec<Temp>, elem_ty: Type },
+    /// result = object[key]  — safe field access (missing key → null temp)
+    Index { dst: Temp, object: Temp, key: Temp, result_ty: Type },
+    /// result = object.field  — known-shape field access
+    FieldGet { dst: Temp, object: Temp, field: String, result_ty: Type },
+    /// Increment refcount of a heap value (string, array, object, closure env).
+    Retain { val: Temp, ty: Type },
+    /// Decrement refcount; free if zero. Only emitted for owned values.
+    Release { val: Temp, ty: Type },
+    /// result = val is type_tag? (returns bool)
+    IsType { dst: Temp, val: Temp, ty: Type },
+    /// result = val has pattern? (returns bool)
+    HasPattern { dst: Temp, val: Temp, pattern: HasDesc },
+    /// result = box(val, ty) — wrap a scalar as a tagged union value
+    Box { dst: Temp, val: Temp, ty: Type },
+    /// result = unbox(val, ty) — extract scalar from tagged union
+    Unbox { dst: Temp, val: Temp, result_ty: Type },
+    /// Bind a pattern variable: dst = source val.
+    Bind { dst: Temp, src: Temp, ty: Type },
+    /// Panic with a message string.
+    Panic { msg: Temp },
+}
+
+/// Description of what a `has` pattern checks (for pattern-match compilation).
+#[derive(Debug, Clone)]
+pub struct HasDesc {
+    pub required_fields: Vec<String>,
+}
+
+/// Unary operators.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnaryOp {
+    Neg,
+    Not,
+}
+
+/// Where to call for a `Call` instruction.
+#[derive(Debug, Clone)]
+pub enum CallTarget {
+    /// Direct call to a known function.
+    Direct(FuncId),
+    /// Indirect call via a closure value in a temp.
+    Indirect(Temp),
+    /// Call to a globally-named (imported) function.
+    Named(String),
+}
+
+/// Terminator for a basic block. Exactly one per block.
+#[derive(Debug, Clone)]
+pub enum Terminator {
+    /// Function return: return value temp, or None for void (Null).
+    Return(Option<Temp>),
+    /// Unconditional branch.
+    Jump(BlockId),
+    /// Conditional branch: if cond is truthy, jump to then_block, else else_block.
+    CondJump { cond: Temp, then_block: BlockId, else_block: BlockId },
+    /// Switch on integer tag — for match on tagged unions.
+    Switch { val: Temp, cases: Vec<(u8, BlockId)>, default: BlockId },
+    /// Tail-call optimization: re-enter function with new args.
+    TailCall { args: Vec<Temp> },
+    /// Control flow never reaches here (after a Panic, etc.)
+    Unreachable,
+}
+
+/// A single basic block: a list of instructions ending with a terminator.
+#[derive(Debug, Clone)]
+pub struct BasicBlock {
+    pub id: BlockId,
+    /// Optional human-readable label (for debugging / IR dumps).
+    pub label: Option<String>,
+    pub instructions: Vec<Instruction>,
+    pub terminator: Terminator,
+}
+
+/// A compiled Lin function in flat IR form.
+#[derive(Debug, Clone)]
+pub struct LinFunction {
+    pub id: FuncId,
+    pub name: Option<String>,
+    /// Parameter temps (index matches Lin parameter slots).
+    pub params: Vec<(Temp, Type)>,
+    /// Whether this is a closure (first param is an implicit env pointer).
+    pub is_closure: bool,
+    pub ret_ty: Type,
+    pub blocks: Vec<BasicBlock>,
+    /// Type of every temp in this function.
+    pub temp_types: HashMap<Temp, Type>,
+    /// Total number of temps allocated (0..temp_count-1 are valid).
+    pub temp_count: u32,
+    /// Intrinsic slot index → intrinsic name (inherited from TypedModule).
+    pub intrinsic_slots: HashMap<usize, String>,
+}
+
+impl LinFunction {
+    pub fn entry_block(&self) -> &BasicBlock {
+        &self.blocks[0]
+    }
+
+    pub fn block(&self, id: BlockId) -> Option<&BasicBlock> {
+        self.blocks.iter().find(|b| b.id == id)
+    }
+}
+
+/// A full Lin module in flat IR form.
+#[derive(Debug, Clone)]
+pub struct LinModule {
+    pub functions: Vec<LinFunction>,
+    /// Maps Lin slot index → FuncId for top-level named functions.
+    pub global_fn_slots: HashMap<usize, FuncId>,
+    /// Maps slot index → intrinsic name for intrinsic slots.
+    pub intrinsics: HashMap<usize, String>,
+}
+
+impl LinModule {
+    pub fn function(&self, id: FuncId) -> Option<&LinFunction> {
+        self.functions.iter().find(|f| f.id == id)
+    }
+
+    pub fn function_mut(&mut self, id: FuncId) -> Option<&mut LinFunction> {
+        self.functions.iter_mut().find(|f| f.id == id)
+    }
+}

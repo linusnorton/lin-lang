@@ -55,6 +55,18 @@ pub unsafe extern "C" fn lin_array_free(arr: *mut LinArray) {
     dealloc(arr as *mut u8, array_layout());
 }
 
+/// Decrement refcount and free if zero (does not recurse into elements).
+#[no_mangle]
+pub unsafe extern "C" fn lin_array_release(arr: *mut LinArray) {
+    if arr.is_null() {
+        return;
+    }
+    (*arr).refcount -= 1;
+    if (*arr).refcount == 0 {
+        lin_array_free(arr);
+    }
+}
+
 /// Push an element. `elem_ptr` points to the value; `tag` is the type tag.
 #[no_mangle]
 pub unsafe extern "C" fn lin_array_push(arr: *mut LinArray, elem_ptr: *const u8, tag: u8) {
@@ -107,4 +119,251 @@ pub unsafe extern "C" fn lin_array_get(arr: *const LinArray, idx: i64) -> *mut L
 #[no_mangle]
 pub unsafe extern "C" fn lin_array_length(arr: *const LinArray) -> i64 {
     (*arr).len as i64
+}
+
+// -------------------------------------------------------------------------
+// Flat (unboxed) scalar arrays
+// -------------------------------------------------------------------------
+//
+// When the element type is a known scalar (i32, i64, f32, f64) the codegen
+// emits calls to these functions instead of the tagged LinArrayElem variants.
+// Layout: same header as LinArray, but `data` points to raw T-sized elements.
+// We reuse the LinArray struct — the `data` pointer just stores T* cast to
+// *mut LinArrayElem.  A flat i32 array stores 4-byte elements; the tag byte
+// is never written.
+//
+// Flat array: refcount | _pad | len | cap | data(*mut T)
+// The `data` field is typed as *mut LinArrayElem for layout compatibility but
+// treated as *mut T internally — always accessed via the flat functions below.
+
+// --- i32 ---
+
+#[no_mangle]
+pub unsafe extern "C" fn lin_flat_array_alloc_i32(initial_cap: u64) -> *mut LinArray {
+    let cap = initial_cap.max(4);
+    let arr_layout = array_layout();
+    let ptr = alloc(arr_layout) as *mut LinArray;
+    (*ptr).refcount = 1;
+    (*ptr).len = 0;
+    (*ptr).cap = cap;
+    let data_layout = Layout::from_size_align_unchecked(
+        std::mem::size_of::<i32>() * cap as usize,
+        std::mem::align_of::<i32>(),
+    );
+    (*ptr).data = alloc(data_layout) as *mut LinArrayElem;
+    ptr
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lin_flat_array_push_i32(arr: *mut LinArray, val: i32) {
+    let len = (*arr).len;
+    let cap = (*arr).cap;
+    if len == cap {
+        let new_cap = cap * 2;
+        let old_layout = Layout::from_size_align_unchecked(
+            std::mem::size_of::<i32>() * cap as usize,
+            std::mem::align_of::<i32>(),
+        );
+        let new_size = std::mem::size_of::<i32>() * new_cap as usize;
+        (*arr).data = realloc((*arr).data as *mut u8, old_layout, new_size) as *mut LinArrayElem;
+        (*arr).cap = new_cap;
+    }
+    let data = (*arr).data as *mut i32;
+    *data.add(len as usize) = val;
+    (*arr).len = len + 1;
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lin_flat_array_get_i32(arr: *const LinArray, idx: i64) -> i32 {
+    let len = (*arr).len as i64;
+    if idx < 0 || idx >= len {
+        eprintln!("Runtime error: array index {} out of bounds (len {})", idx, len);
+        std::process::exit(1);
+    }
+    let data = (*arr).data as *const i32;
+    *data.add(idx as usize)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lin_flat_array_free_i32(arr: *mut LinArray) {
+    let layout = Layout::from_size_align_unchecked(
+        std::mem::size_of::<i32>() * (*arr).cap as usize,
+        std::mem::align_of::<i32>(),
+    );
+    dealloc((*arr).data as *mut u8, layout);
+    dealloc(arr as *mut u8, array_layout());
+}
+
+// --- i64 ---
+
+#[no_mangle]
+pub unsafe extern "C" fn lin_flat_array_alloc_i64(initial_cap: u64) -> *mut LinArray {
+    let cap = initial_cap.max(4);
+    let arr_layout = array_layout();
+    let ptr = alloc(arr_layout) as *mut LinArray;
+    (*ptr).refcount = 1;
+    (*ptr).len = 0;
+    (*ptr).cap = cap;
+    let data_layout = Layout::from_size_align_unchecked(
+        std::mem::size_of::<i64>() * cap as usize,
+        std::mem::align_of::<i64>(),
+    );
+    (*ptr).data = alloc(data_layout) as *mut LinArrayElem;
+    ptr
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lin_flat_array_push_i64(arr: *mut LinArray, val: i64) {
+    let len = (*arr).len;
+    let cap = (*arr).cap;
+    if len == cap {
+        let new_cap = cap * 2;
+        let old_layout = Layout::from_size_align_unchecked(
+            std::mem::size_of::<i64>() * cap as usize,
+            std::mem::align_of::<i64>(),
+        );
+        let new_size = std::mem::size_of::<i64>() * new_cap as usize;
+        (*arr).data = realloc((*arr).data as *mut u8, old_layout, new_size) as *mut LinArrayElem;
+        (*arr).cap = new_cap;
+    }
+    let data = (*arr).data as *mut i64;
+    *data.add(len as usize) = val;
+    (*arr).len = len + 1;
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lin_flat_array_get_i64(arr: *const LinArray, idx: i64) -> i64 {
+    let len = (*arr).len as i64;
+    if idx < 0 || idx >= len {
+        eprintln!("Runtime error: array index {} out of bounds (len {})", idx, len);
+        std::process::exit(1);
+    }
+    let data = (*arr).data as *const i64;
+    *data.add(idx as usize)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lin_flat_array_free_i64(arr: *mut LinArray) {
+    let layout = Layout::from_size_align_unchecked(
+        std::mem::size_of::<i64>() * (*arr).cap as usize,
+        std::mem::align_of::<i64>(),
+    );
+    dealloc((*arr).data as *mut u8, layout);
+    dealloc(arr as *mut u8, array_layout());
+}
+
+// --- f32 ---
+
+#[no_mangle]
+pub unsafe extern "C" fn lin_flat_array_alloc_f32(initial_cap: u64) -> *mut LinArray {
+    let cap = initial_cap.max(4);
+    let arr_layout = array_layout();
+    let ptr = alloc(arr_layout) as *mut LinArray;
+    (*ptr).refcount = 1;
+    (*ptr).len = 0;
+    (*ptr).cap = cap;
+    let data_layout = Layout::from_size_align_unchecked(
+        std::mem::size_of::<f32>() * cap as usize,
+        std::mem::align_of::<f32>(),
+    );
+    (*ptr).data = alloc(data_layout) as *mut LinArrayElem;
+    ptr
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lin_flat_array_push_f32(arr: *mut LinArray, val: f32) {
+    let len = (*arr).len;
+    let cap = (*arr).cap;
+    if len == cap {
+        let new_cap = cap * 2;
+        let old_layout = Layout::from_size_align_unchecked(
+            std::mem::size_of::<f32>() * cap as usize,
+            std::mem::align_of::<f32>(),
+        );
+        let new_size = std::mem::size_of::<f32>() * new_cap as usize;
+        (*arr).data = realloc((*arr).data as *mut u8, old_layout, new_size) as *mut LinArrayElem;
+        (*arr).cap = new_cap;
+    }
+    let data = (*arr).data as *mut f32;
+    *data.add(len as usize) = val;
+    (*arr).len = len + 1;
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lin_flat_array_get_f32(arr: *const LinArray, idx: i64) -> f32 {
+    let len = (*arr).len as i64;
+    if idx < 0 || idx >= len {
+        eprintln!("Runtime error: array index {} out of bounds (len {})", idx, len);
+        std::process::exit(1);
+    }
+    let data = (*arr).data as *const f32;
+    *data.add(idx as usize)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lin_flat_array_free_f32(arr: *mut LinArray) {
+    let layout = Layout::from_size_align_unchecked(
+        std::mem::size_of::<f32>() * (*arr).cap as usize,
+        std::mem::align_of::<f32>(),
+    );
+    dealloc((*arr).data as *mut u8, layout);
+    dealloc(arr as *mut u8, array_layout());
+}
+
+// --- f64 ---
+
+#[no_mangle]
+pub unsafe extern "C" fn lin_flat_array_alloc_f64(initial_cap: u64) -> *mut LinArray {
+    let cap = initial_cap.max(4);
+    let arr_layout = array_layout();
+    let ptr = alloc(arr_layout) as *mut LinArray;
+    (*ptr).refcount = 1;
+    (*ptr).len = 0;
+    (*ptr).cap = cap;
+    let data_layout = Layout::from_size_align_unchecked(
+        std::mem::size_of::<f64>() * cap as usize,
+        std::mem::align_of::<f64>(),
+    );
+    (*ptr).data = alloc(data_layout) as *mut LinArrayElem;
+    ptr
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lin_flat_array_push_f64(arr: *mut LinArray, val: f64) {
+    let len = (*arr).len;
+    let cap = (*arr).cap;
+    if len == cap {
+        let new_cap = cap * 2;
+        let old_layout = Layout::from_size_align_unchecked(
+            std::mem::size_of::<f64>() * cap as usize,
+            std::mem::align_of::<f64>(),
+        );
+        let new_size = std::mem::size_of::<f64>() * new_cap as usize;
+        (*arr).data = realloc((*arr).data as *mut u8, old_layout, new_size) as *mut LinArrayElem;
+        (*arr).cap = new_cap;
+    }
+    let data = (*arr).data as *mut f64;
+    *data.add(len as usize) = val;
+    (*arr).len = len + 1;
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lin_flat_array_get_f64(arr: *const LinArray, idx: i64) -> f64 {
+    let len = (*arr).len as i64;
+    if idx < 0 || idx >= len {
+        eprintln!("Runtime error: array index {} out of bounds (len {})", idx, len);
+        std::process::exit(1);
+    }
+    let data = (*arr).data as *const f64;
+    *data.add(idx as usize)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lin_flat_array_free_f64(arr: *mut LinArray) {
+    let layout = Layout::from_size_align_unchecked(
+        std::mem::size_of::<f64>() * (*arr).cap as usize,
+        std::mem::align_of::<f64>(),
+    );
+    dealloc((*arr).data as *mut u8, layout);
+    dealloc(arr as *mut u8, array_layout());
 }

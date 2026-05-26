@@ -146,4 +146,15 @@ impl TypeEnv {
         }
         None
     }
+
+    /// Return all visible binding names across all scopes.
+    pub fn all_names(&self) -> Vec<&str> {
+        let mut names = Vec::new();
+        for scope in &self.scopes {
+            for key in scope.bindings.keys() {
+                names.push(key.as_str());
+            }
+        }
+        names
+    }
 }

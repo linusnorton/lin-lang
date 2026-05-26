@@ -99,7 +99,7 @@
           "match": "\\b(if|then|else|match|when)\\b"
         },
         {
-          "name": "keyword.operator.pattern.lin",
+          "name": "keyword.control.lin",
           "match": "\\b(is|has)\\b"
         },
         {

@@ -11,3 +11,5 @@ lin-check = { path = "../lin-check" }
 lin-codegen = { path = "../lin-codegen" }
 lin-runtime = { path = "../lin-runtime" }
 inkwell = { version = "0.9", features = ["llvm22-1-prefer-dynamic"] }
+bincode = { workspace = true }
+sha2 = { workspace = true }

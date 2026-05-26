@@ -70,6 +70,14 @@ fn run_check(path: &str) {
     let mut parser = lin_parse::Parser::new(tokens);
     let module = parser.parse_module();
 
+    // Report parse errors first; if there were any, skip type checking.
+    if !parser.diagnostics.is_empty() {
+        for diag in &parser.diagnostics {
+            diag.render(path, &source);
+        }
+        process::exit(1);
+    }
+
     let mut checker = lin_check::Checker::new();
     match checker.check_module(&module) {
         Ok(_) => {
@@ -77,11 +85,7 @@ fn run_check(path: &str) {
         }
         Err(diagnostics) => {
             for diag in &diagnostics {
-                let (line, col) = diag.span.line_col(&source);
-                eprintln!(
-                    "{}:{}:{}: {:?}: {}",
-                    path, line, col, diag.severity, diag.message
-                );
+                diag.render(path, &source);
             }
             process::exit(1);
         }
@@ -106,11 +110,7 @@ fn run_build(path: &str, output: &str) {
         Err(CompileError::TypeCheck(diagnostics)) => {
             let source = fs::read_to_string(path).unwrap_or_default();
             for diag in &diagnostics {
-                let (line, col) = diag.span.line_col(&source);
-                eprintln!(
-                    "{}:{}:{}: {:?}: {}",
-                    path, line, col, diag.severity, diag.message
-                );
+                diag.render(path, &source);
             }
             process::exit(1);
         }

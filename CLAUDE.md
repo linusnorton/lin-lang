@@ -6,7 +6,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `lin-lang` is the reference implementation of **Lin**, a small expression-based language built around strict JSON data, structural typing, first-argument function application (dot syntax), destructuring, pattern matching, opaque iterator/runtime types, and value-based error handling. The full language design is in `docs/SPECIFICATION.md`.
 
-The current implementation is **v0**: a tree-walking interpreter. There is no type checker — types are parsed and stored in the AST but ignored at runtime (see ADR-001 in `docs/DECISIONS.md`). Compile-time semantics described in the spec (variance, exhaustiveness, narrowing, numeric widening) are not enforced yet.
+The project has two backends:
+
+- **`lin-eval`** — a tree-walking interpreter (`lin run`). The v0 backend; types are parsed and stored in the AST but not enforced at runtime (see ADR-001 in `docs/DECISIONS.md`).
+- **`lin-codegen`** — an LLVM native-code compiler (`lin build`). Goes through a full type-checking pass (`lin-check`), lowers to flat 3-address IR (`lin-ir`), then to LLVM IR via `inkwell`. Links with a small Rust static library (`lin-runtime`) to produce a standalone binary.
 
 ## Build / run / test
 
@@ -14,26 +17,40 @@ The current implementation is **v0**: a tree-walking interpreter. There is no ty
 cargo build --workspace
 cargo test --workspace                          # runs all unit + integration tests
 cargo test -p lin-eval test_hello_world         # run a single test
-cargo run -p lin -- examples/hello.lin          # execute a .lin program
+cargo run -p lin -- examples/hello.lin          # interpret a .lin program (lin run)
+cargo run -p lin -- run examples/hello.lin      # same, explicit subcommand
+cargo run -p lin -- build examples/hello.lin -o hello  # compile to native binary
+cargo run -p lin -- check examples/hello.lin    # type check only
 cargo run -p lin -- -                           # read source from stdin
 ```
+
+Environment variables for `lin build`:
+- `LIN_EMIT_IR=1` — write the LLVM IR (`.ll`) alongside the binary
+- `LIN_NO_OPT=1` — skip LLVM optimisation passes (faster builds, slower output)
 
 There is no CI config or formatter wired up yet. There is no `cargo` available at the system shell at the time of writing — assume the user runs commands themselves.
 
 ## Workspace layout
 
-Cargo workspace with five crates (`crates/`):
+Cargo workspace with ten crates (`crates/`):
 
-- **`lin-common`** — shared `Span`, `Diagnostic`, `Interner`. No dependencies on other crates.
+- **`lin-common`** — shared `Span`, `Diagnostic`, `Interner`, edit-distance helpers. No dependencies on other crates.
 - **`lin-lex`** — lexer with indentation tracking. Produces `Token` stream with synthetic `Indent`/`Dedent`/`Newline` tokens.
-- **`lin-parse`** — parser, surface AST (`Module`, `Stmt`, `Expr`, `Pattern`, `TypeExpr`).
-- **`lin-eval`** — tree-walking interpreter (the v0 backend). Owns `Value`, `Env`, `Interpreter`.
-- **`lin`** — CLI binary. Thin wrapper that constructs an `Interpreter` and calls `run_file`.
+- **`lin-parse`** — parser, surface AST (`Module`, `Stmt`, `Expr`, `Pattern`, `TypeExpr`). Includes parser error recovery and "did you mean" diagnostics.
+- **`lin-check`** — type checker. Consumes the surface AST; produces `TypedModule` (typed IR). Handles bidirectional inference, structural typing, union narrowing, exhaustiveness checking, TypeVar zonking, and numeric widening. Emits `Diagnostic` values with Ariadne-style multi-span rendering.
+- **`lin-ir`** — flat 3-address IR (`LinIR`) sitting between `TypedExpr` and LLVM. Contains: IR data types (`ir.rs`), the `TypedModule → LinModule` lowering pass (`lower.rs`), backwards-dataflow liveness analysis (`liveness.rs`), and the Perceus-inspired RC elision pass (`rc_elide.rs`).
+- **`lin-codegen`** — LLVM backend via `inkwell`. Compiles `TypedModule` directly to LLVM IR today; `lin-ir` is available as an optional pre-pass. Handles functions, closures, objects, arrays, strings, union tagged dispatch, pattern matching, TCO, and unboxed scalar arrays.
+- **`lin-runtime`** — small static library linked into every compiled binary. Provides refcounted strings/arrays/objects, intrinsics (`lin_print`, `lin_string_concat`, etc.), and flat scalar array variants (`lin_flat_array_alloc_i32`, etc.).
+- **`lin-compile`** — orchestrates the full compilation pipeline: source → lex → parse → type check → codegen → link. Includes a module cache (`.lin-cache/<sha256>.typed`) and module signature files (`.lin-cache/<sha256>.sig`) to skip re-checking unchanged imports.
+- **`lin-eval`** — tree-walking interpreter (the `lin run` backend). Owns `Value`, `Env`, `Interpreter`.
+- **`lin`** — CLI binary. Dispatches `run`, `build`, `check` subcommands.
+- **`lin-lsp`** — language server (in progress).
 
-Note: the spec (§28.1) and `docs/TODO.md` reference a `lin-check` crate (desugaring + type checker) and a `lin-stdlib` crate. **Neither exists yet.** Stdlib lives in `stdlib/*.lin` and is loaded via `include_str!` from inside `lin-eval`.
+Stdlib lives in `stdlib/*.lin` and is loaded via `include_str!` in both `lin-eval` and `lin-compile`.
 
-## Pipeline shape
+## Pipeline shapes
 
+**Interpreter (`lin run`)**:
 ```
 source (.lin) → Lexer → Tokens → Parser → AST → Interpreter::eval → Value
 ```
@@ -45,6 +62,20 @@ Everything happens in `lin-eval::Interpreter`:
 3. `run(source)` lexes, parses, then evaluates statements top-to-bottom in `global_env`.
 
 The interpreter is a single ~1400-line file (`crates/lin-eval/src/interpreter.rs`). Most language features live there.
+
+**Compiler (`lin build`)**:
+```
+source (.lin)
+  → Lexer → Tokens → Parser → AST
+  → lin-check: type checker → TypedModule
+  → lin-ir (optional): TypedModule → LinModule (flat 3-address IR) → RC elision pass
+  → lin-codegen: TypedModule → LLVM IR (via inkwell)
+  → LLVM optimisation passes (default: O2)
+  → emit .o object file
+  → cc link with lin-runtime.a → native binary
+```
+
+Imports are resolved recursively before the main module is checked. Each imported module is type-checked once and cached by source hash in `.lin-cache/`. If the cache hit is valid, the `TypedModule` is deserialised instead of re-checked. A separate `ModuleSignature` (`.sig` file) records just the exported name→type map; dependents only need that to verify their own usage, not the full IR.
 
 ## Key design choices to be aware of
 
@@ -75,6 +106,10 @@ The typical path:
 
 There is no desugaring pass — the interpreter consumes the surface AST directly. Things the spec describes as desugarings (`x.f(y)` → `f(x, y)`, destructuring → primitive bindings) are implemented inline in the evaluator.
 
+## Adding a stdlib function
+
+Make sure it is included in the `docs/STDLIB.md` documentation.
+
 ## Where things live by topic
 
 - **Operator precedence** — `parse_or_expr` → `parse_and_expr` → `parse_comparison` → ... in `lin-parse/src/parser.rs`. Mirror the spec §24.2 ladder when changing.
@@ -85,7 +120,8 @@ There is no desugaring pass — the interpreter consumes the surface AST directl
 ## Reading order for a new contributor
 
 1. `docs/SPECIFICATION.md` — what the language is meant to be.
-2. `docs/DECISIONS.md` — every non-obvious implementation choice and why. **Read this before touching the lexer or parser.**
-3. `docs/TODO.md` — milestone plan. Note the gap: §3 specifies type checking, but v0 has none.
-4. `crates/lin-eval/src/interpreter.rs` — the engine.
-5. `examples/*.lin` and `crates/lin-eval/tests/integration.rs` — what currently works.
+2. `docs/STDLIB.md` — specification of the stdlib.
+3. `docs/DECISIONS.md` — every non-obvious implementation choice and why. **Read this before touching the lexer or parser.**
+4. `docs/TODO.md` — milestone plan. Note the gap: §3 specifies type checking, but v0 has none.
+5. `crates/lin-eval/src/interpreter.rs` — the engine.
+6. `examples/*.lin` and `crates/lin-eval/tests/integration.rs` — what currently works.

@@ -188,11 +188,12 @@ print(message)
 
 ```
 crates/
-  lin-common/   shared Span, Diagnostic
+  lin-common/   shared Span, Diagnostic, edit-distance helpers
   lin-lex/      lexer
-  lin-parse/    parser and surface AST
-  lin-check/    type checker, produces TypedIR
-  lin-codegen/  LLVM backend
+  lin-parse/    parser and surface AST (with error recovery)
+  lin-check/    type checker — produces TypedModule (typed IR)
+  lin-ir/       flat 3-address IR, liveness analysis, RC elision pass
+  lin-codegen/  LLVM backend (via inkwell)
   lin-runtime/  runtime library linked into compiled binaries
   lin-compile/  compilation pipeline (lex → parse → check → codegen → link)
   lin-eval/     tree-walking interpreter (lin run)

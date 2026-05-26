@@ -6,19 +6,28 @@ pub struct Parser {
     tokens: Vec<Token>,
     pos: usize,
     pub diagnostics: Vec<Diagnostic>,
+    /// Number of diagnostics at the start of the current statement parse.
+    /// Used to detect whether an error occurred during a statement so we can synchronize.
+    error_count_at_stmt_start: usize,
 }
 
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, pos: 0, diagnostics: Vec::new() }
+        Self { tokens, pos: 0, diagnostics: Vec::new(), error_count_at_stmt_start: 0 }
     }
 
     pub fn parse_module(&mut self) -> Module {
         let mut statements = Vec::new();
         self.skip_newlines();
         while !self.is_at_end() {
+            self.error_count_at_stmt_start = self.diagnostics.len();
             if let Some(stmt) = self.parse_statement() {
                 statements.push(stmt);
+            }
+            // If the statement parse produced a new error, synchronize to the
+            // next statement boundary so subsequent statements still parse cleanly.
+            if self.diagnostics.len() > self.error_count_at_stmt_start {
+                self.synchronize();
             }
             self.skip_newlines();
         }
@@ -257,6 +266,19 @@ impl Parser {
             let op = match self.peek_kind() {
                 TokenKind::EqEq => BinOp::Eq,
                 TokenKind::NotEq => BinOp::NotEq,
+                // Bare `=` in expression context is almost always `==` — suggest the fix.
+                TokenKind::Eq => {
+                    let span = self.current_span();
+                    self.diagnostics.push(
+                        Diagnostic::error(span, "unexpected `=` in expression")
+                            .with_help("did you mean `==` for equality comparison?")
+                    );
+                    self.advance();
+                    self.skip_newlines();
+                    let right = self.parse_comparison_expr();
+                    left = Expr::BinaryOp { left: Box::new(left), op: BinOp::Eq, right: Box::new(right), span };
+                    continue;
+                }
                 _ => break,
             };
             let span = self.current_span();
@@ -496,6 +518,15 @@ impl Parser {
             }
             _ => {
                 let span = self.current_span();
+                let got = self.peek_kind();
+                // Layout tokens (Indent/Dedent/Newline) can appear here during
+                // error recovery; don't treat them as parse errors themselves.
+                if !matches!(got, TokenKind::Indent | TokenKind::Dedent | TokenKind::Newline) {
+                    self.diagnostics.push(Diagnostic::error(
+                        span,
+                        format!("unexpected token {:?}", got),
+                    ));
+                }
                 self.advance();
                 Expr::NullLit(span)
             }
@@ -538,6 +569,18 @@ impl Parser {
                 let expr = self.parse_expr();
                 fields.push(ObjectField::Spread(expr));
             } else {
+                // Detect unquoted identifier keys: { name: ... } instead of { "name": ... }
+                if let TokenKind::Ident(ref ident_name) = self.peek_kind() {
+                    let key_span = self.current_span();
+                    let name = ident_name.clone();
+                    // Check if the next token after the ident is a colon — that's an unquoted key.
+                    if self.check_ahead(TokenKind::Colon, 1) {
+                        self.diagnostics.push(
+                            Diagnostic::error(key_span, format!("object keys must be quoted strings"))
+                                .with_help(format!("use a quoted key: \"{}\"", name))
+                        );
+                    }
+                }
                 let key = self.parse_expr();
                 self.expect(TokenKind::Colon);
                 self.skip_newlines();
@@ -850,7 +893,7 @@ impl Parser {
             self.advance();
         }
         self.skip_newlines();
-        self.expect_keyword(TokenKind::Else);
+        self.expect_with_help(TokenKind::Else, "if expressions must have an else branch — Lin has no unit/void type");
         self.skip_newlines();
         let else_branch = if self.check(TokenKind::Indent) {
             self.parse_block()
@@ -1304,6 +1347,19 @@ impl Parser {
         }
     }
 
+    fn expect_with_help(&mut self, kind: TokenKind, help: &str) {
+        if self.check(kind.clone()) {
+            self.advance();
+        } else {
+            let span = self.current_span();
+            let got = self.peek_kind();
+            self.diagnostics.push(
+                Diagnostic::error(span, format!("expected {:?}, got {:?}", kind, got))
+                    .with_help(help)
+            );
+        }
+    }
+
     fn expect_keyword(&mut self, kind: TokenKind) {
         self.expect(kind);
     }
@@ -1352,5 +1408,30 @@ impl Parser {
 
     fn is_at_end(&self) -> bool {
         self.pos >= self.tokens.len() || self.tokens[self.pos].kind == TokenKind::Eof
+    }
+
+    /// Advance past tokens until we reach a statement boundary:
+    /// a Newline/Dedent at the top level, or EOF.
+    /// This lets parse_module continue reporting errors for later statements.
+    fn synchronize(&mut self) {
+        // Skip until a Newline, Dedent, or EOF that looks like a statement boundary.
+        // Also stop if we see a statement-starting keyword — it means we've recovered.
+        loop {
+            match self.peek_kind() {
+                TokenKind::Eof => break,
+                TokenKind::Newline | TokenKind::Dedent => {
+                    self.advance();
+                    break;
+                }
+                // Stop before statement-starting keywords so the next loop
+                // iteration in parse_module picks them up cleanly.
+                TokenKind::Val
+                | TokenKind::Var
+                | TokenKind::Type
+                | TokenKind::Import
+                | TokenKind::Export => break,
+                _ => { self.advance(); }
+            }
+        }
     }
 }

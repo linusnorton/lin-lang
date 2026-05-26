@@ -5,6 +5,7 @@ members = [
     "crates/lin-parse",
     "crates/lin-eval",
     "crates/lin-check",
+    "crates/lin-ir",
     "crates/lin-codegen",
     "crates/lin-runtime",
     "crates/lin-compile",
@@ -14,4 +15,8 @@ members = [
 resolver = "2"
 
 [workspace.dependencies]
-indexmap = "2"
+indexmap = { version = "2", features = ["serde"] }
+ariadne = "0.6"
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+sha2 = "0.10"
