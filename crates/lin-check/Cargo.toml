@@ -13,3 +13,4 @@ sha2 = { workspace = true }
 
 [dev-dependencies]
 lin-lex = { path = "../lin-lex" }
+insta = { workspace = true }

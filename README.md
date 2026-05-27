@@ -18,7 +18,7 @@ print(greet("world"))
 
 ## Getting Started
 
-**Prerequisites:** Rust toolchain, LLVM 18, a C linker (`cc`).
+**Prerequisites:** Rust toolchain, LLVM 18+ (tested with LLVM 22), a C linker (`cc`).
 
 ```bash
 git clone <repo>
@@ -27,19 +27,6 @@ cargo build --workspace
 ```
 
 ## Running Programs
-
-### Interpret (no compilation)
-
-```bash
-cargo run -p lin -- run examples/hello.lin
-# or: lin run examples/hello.lin
-```
-
-Reads from stdin with `-`:
-
-```bash
-echo 'print("hi")' | cargo run -p lin -- -
-```
 
 ### Compile to a native binary
 
@@ -178,11 +165,96 @@ print(message)
 
 | Module | Exports |
 |---|---|
-| `std/io` | `print` |
+| `std/io` | `print`, `readLine`, `readAll`, `lines` |
 | `std/string` | `trim`, `toUpper`, `toLower`, `split`, `join`, `contains`, `replace`, `startsWith`, `endsWith`, `indexOf`, `charAt`, `repeat` |
 | `std/number` | `parseInt32`, `parseFloat64`, `isInt32`, `toInt32`, `toFloat64` |
 | `std/array` | `map`, `filter`, `reduce`, `for`, `range`, `length`, `push`, `concat` |
 | `std/iter` | `iter`, `range`, iterator combinators |
+| `std/result` | `Result<T, E>` type and helpers |
+| `std/fs` | `readFile`, `writeFile`, `appendFile`, `readLines`, `readJson`, `writeJson`, `exists` |
+| `std/http` | `fetch`, `fetchWith`, `fetchJson`, `postJson` |
+| `std/server` | `serve`, `json`, `text`, `redirect`, `notFound`, `badRequest`, `parseBody`, `pathMatch` |
+
+### Concurrency
+
+```lin
+// Spawn a background task
+val p = async(() =>
+  val result = fetchJson("https://api.example.com/data")
+  result["value"]
+)
+
+// Block until done
+val value = await(p)
+print(toString(value))
+
+// Fork-join: run three tasks in parallel, collect results in order
+val results = parallel(
+  () => computeA(),
+  () => computeB(),
+  () => computeC()
+)
+
+// Thread pool
+val pool = threadPool(4)
+val promises = pool.async([() => task1(), () => task2()])
+val done = await(promises)
+```
+
+Workers handle messages on a dedicated thread:
+
+```lin
+val counter = worker(
+  (msg) =>
+    var n = 0
+    n = n + msg
+    n
+  ,
+  () => null
+)
+counter.message(1)
+val total = counter.request(5)   // blocks until reply
+counter.close()
+```
+
+### HTTP
+
+```lin
+import { fetchJson, postJson } from "std/http"
+
+val data = fetchJson("https://api.example.com/items")
+data.for(item => print(item["name"]))
+
+val response = postJson("https://api.example.com/create", { "name": "Lin" })
+print(toString(response["status"]))
+```
+
+HTTP server:
+
+```lin
+import { serve, json, text, pathMatch } from "std/server"
+
+serve(8080, req =>
+  match pathMatch("/users/:id", req["path"])
+    is Null => text(404, "not found")
+    has { id } => json(200, { "userId": id })
+)
+```
+
+### Foreign Functions (C / Rust interop)
+
+Call functions from compiled C or Rust static libraries. Requires `lin build`.
+
+```lin
+import foreign "libmathlib.a"
+  val sqrt: (Float64) => Float64
+  val add: (Int32, Int32) => Int32
+
+print(toString(sqrt(2.0)))   // 1.4142...
+print(toString(add(3, 4)))   // 7
+```
+
+The C header `crates/lin-runtime/lin.h` defines `LinString` and `LinArray` for passing non-primitive types across the boundary. See `examples/ffi_c.lin` for a complete example.
 
 ## Project Layout
 
@@ -194,13 +266,15 @@ crates/
   lin-check/    type checker — produces TypedModule (typed IR)
   lin-ir/       flat 3-address IR, liveness analysis, RC elision pass
   lin-codegen/  LLVM backend (via inkwell)
-  lin-runtime/  runtime library linked into compiled binaries
+  lin-runtime/  runtime library linked into compiled binaries (+ lin.h FFI header)
   lin-compile/  compilation pipeline (lex → parse → check → codegen → link)
   lin-eval/     tree-walking interpreter (lin run)
   lin/          CLI binary
+  lin-lsp/      language server (in progress)
 stdlib/         standard library source files (.lin)
 examples/       example programs
 docs/           specification and design decisions
+.github/        CI workflow (cargo test + examples)
 ```
 
 ## Development

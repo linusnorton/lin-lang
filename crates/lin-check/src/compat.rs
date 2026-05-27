@@ -1,9 +1,55 @@
+use crate::env::TypeEnv;
 use crate::types::Type;
 
 /// Check if `value_type` is structurally compatible with `target_type`.
 /// This implements the `has`-style compatibility used for function arguments and assignments.
+/// Named types are not unfolded here; use `is_compatible_env` when an env is available.
 pub fn is_compatible(value_type: &Type, target_type: &Type) -> bool {
+    is_compatible_env(value_type, target_type, None, &mut 0)
+}
+
+/// Env-aware compatibility check that can unfold Named types one level.
+pub fn is_compatible_env(
+    value_type: &Type,
+    target_type: &Type,
+    env: Option<&TypeEnv>,
+    depth: &mut usize,
+) -> bool {
+    // Guard against infinite recursion in deeply nested recursive types.
+    if *depth > 32 {
+        return true;
+    }
+
     if value_type == target_type {
+        return true;
+    }
+
+    // Unfold Named types one level before comparing.
+    if let Type::Named(n) = value_type {
+        if let Some(env) = env {
+            if let Some(decl) = env.lookup_type(n) {
+                if decl.params.is_empty() {
+                    *depth += 1;
+                    let result = is_compatible_env(&decl.body.clone(), target_type, Some(env), depth);
+                    *depth -= 1;
+                    return result;
+                }
+            }
+        }
+        // Named without env or with params: treat as compatible (unknown type)
+        return true;
+    }
+    if let Type::Named(n) = target_type {
+        if let Some(env) = env {
+            if let Some(decl) = env.lookup_type(n) {
+                if decl.params.is_empty() {
+                    *depth += 1;
+                    let result = is_compatible_env(value_type, &decl.body.clone(), Some(env), depth);
+                    *depth -= 1;
+                    return result;
+                }
+            }
+        }
         return true;
     }
 
@@ -18,26 +64,26 @@ pub fn is_compatible(value_type: &Type, target_type: &Type) -> bool {
 
         // Union on the value side: every variant must be compatible with target
         (Type::Union(variants), target) => {
-            variants.iter().all(|v| is_compatible(v, target))
+            variants.iter().all(|v| is_compatible_env(v, target, env, depth))
         }
 
         // Union on the target side: value must be compatible with at least one variant
         (value, Type::Union(variants)) => {
-            variants.iter().any(|v| is_compatible(value, v))
+            variants.iter().any(|v| is_compatible_env(value, v, env, depth))
         }
 
         // Array covariance
-        (Type::Array(a), Type::Array(b)) => is_compatible(a, b),
+        (Type::Array(a), Type::Array(b)) => is_compatible_env(a, b, env, depth),
 
         // Fixed array to unbounded array
         (Type::FixedArray(elements), Type::Array(elem_ty)) => {
-            elements.iter().all(|e| is_compatible(e, elem_ty))
+            elements.iter().all(|e| is_compatible_env(e, elem_ty, env, depth))
         }
 
         // Fixed array positional compatibility
         (Type::FixedArray(a), Type::FixedArray(b)) => {
             a.len() == b.len()
-                && a.iter().zip(b.iter()).all(|(av, bv)| is_compatible(av, bv))
+                && a.iter().zip(b.iter()).all(|(av, bv)| is_compatible_env(av, bv, env, depth))
         }
 
         // Object structural compatibility: value has all target fields with compatible types
@@ -45,7 +91,7 @@ pub fn is_compatible(value_type: &Type, target_type: &Type) -> bool {
             target_fields.iter().all(|(key, target_ty)| {
                 value_fields
                     .get(key)
-                    .map(|vt| is_compatible(vt, target_ty))
+                    .map(|vt| is_compatible_env(vt, target_ty, env, depth))
                     .unwrap_or(false)
             })
         }
@@ -68,14 +114,14 @@ pub fn is_compatible(value_type: &Type, target_type: &Type) -> bool {
             let params_ok = vp
                 .iter()
                 .zip(tp.iter())
-                .all(|(v, t)| is_compatible(t, v));
+                .all(|(v, t)| is_compatible_env(t, v, env, depth));
             // Covariant: value return must be compatible with target return
-            let ret_ok = is_compatible(vr, tr);
+            let ret_ok = is_compatible_env(vr, tr, env, depth);
             params_ok && ret_ok
         }
 
         // Iterator covariance
-        (Type::Iterator(a), Type::Iterator(b)) => is_compatible(a, b),
+        (Type::Iterator(a), Type::Iterator(b)) => is_compatible_env(a, b, env, depth),
 
         _ => false,
     }
@@ -104,6 +150,8 @@ pub fn is_exact_match(value_type: &Type, target_type: &Type) -> bool {
                     .zip(b.iter())
                     .all(|(av, bv)| is_exact_match(av, bv))
         }
+        // Named types: treat as compatible for exact match (can't expand without env)
+        (Type::Named(a), Type::Named(b)) => a == b,
         _ => false,
     }
 }

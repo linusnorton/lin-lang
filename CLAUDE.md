@@ -28,7 +28,7 @@ Environment variables for `lin build`:
 - `LIN_EMIT_IR=1` — write the LLVM IR (`.ll`) alongside the binary
 - `LIN_NO_OPT=1` — skip LLVM optimisation passes (faster builds, slower output)
 
-There is no CI config or formatter wired up yet. There is no `cargo` available at the system shell at the time of writing — assume the user runs commands themselves.
+CI runs on GitHub Actions (`.github/workflows/ci.yml`): `cargo build`, `cargo test --workspace`, and all non-network `examples/*.lin` on every push. There is no formatter wired up yet. There is no `cargo` available at the system shell at the time of writing — assume the user runs commands themselves.
 
 ## Workspace layout
 
@@ -46,7 +46,7 @@ Cargo workspace with ten crates (`crates/`):
 - **`lin`** — CLI binary. Dispatches `run`, `build`, `check` subcommands.
 - **`lin-lsp`** — language server (in progress).
 
-Stdlib lives in `stdlib/*.lin` and is loaded via `include_str!` in both `lin-eval` and `lin-compile`.
+Stdlib lives in `stdlib/*.lin` and is loaded via `include_str!` in both `lin-eval` and `lin-compile`. Current stdlib modules: `std/io`, `std/string`, `std/number`, `std/array`, `std/iter`, `std/result`, `std/fs`, `std/http`, `std/server`.
 
 ## Pipeline shapes
 
@@ -93,6 +93,9 @@ These are non-obvious and easy to break. Full rationale lives in `docs/DECISIONS
 - **Stdlib split: `for` and `iter` are Rust intrinsics, everything else is .lin.** `range`, `iterOf`, `map`, `filter`, `reduce` live in `stdlib/{iter,array}.lin` and are preloaded as globals (ADR-002). String functions are .lin wrappers around `__stringFoo` Rust intrinsics (ADR-009).
 - **Inline blocks inside parentheses.** Lambdas like `x => val y = x*2; y` passed to `.for(...)` have no INDENT/DEDENT (suppressed by ADR-004). `parse_function_body` detects `val`/`var` as the multi-statement-body signal (ADR-014).
 - **Imports: `std/...` resolves into the embedded stdlib sources; everything else is resolved relative to the importing file's directory with `.lin` appended** (ADR-016). Module init is lazy; cycles within a single init chain are a runtime error.
+- **`async(f)` thunks must not capture `var` bindings** and must not return `Function` or `Iterator` values. Both are compile-time errors in `lin-check`. The checker tracks mutable global slots separately (`mutable_global_slots`) because global vars are not recorded as captures (ADR-034).
+- **`import foreign "path"` registers stubs in the interpreter** that error at call time. The stub arity is derived from the declared type so call-site arity checks pass (ADR-033, ADR-037). Real FFI calls work only via `lin build`.
+- **IO/FS/HTTP/server intrinsics use the call-dispatch pattern** (same as `for`, `async`, `worker`) so they can call interpreter methods with `&mut self`. They are registered as stub natives that are intercepted by name in `call_value` (ADR-030).
 
 ## Adding a language feature
 

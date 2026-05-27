@@ -267,6 +267,13 @@ fn lower_stmt(stmt: &TypedStmt, builder: &mut FuncBuilder, ctx: &mut LowerCtx) {
                 builder.slots.insert(b.slot, t);
             }
         }
+        TypedStmt::ForeignImport { bindings, .. } => {
+            // Foreign bindings are declared external symbols; record placeholder temps.
+            for b in bindings {
+                let t = builder.alloc_temp(b.ty.clone());
+                builder.slots.insert(b.slot, t);
+            }
+        }
         TypedStmt::Destructure {
             obj_slot,
             value,

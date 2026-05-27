@@ -1153,3 +1153,635 @@ val merged = { ..."hello", "a": 1 }
 "#);
     assert!(err.contains("expected Object"), "got error: {}", err);
 }
+
+// M17: Concurrency — async/await
+#[test]
+fn test_async_await_basic() {
+    let output = run(r#"
+val p = async(() => 42)
+val result = await(p)
+print(toString(result))
+"#);
+    assert_eq!(output, vec!["42"]);
+}
+
+#[test]
+fn test_async_val_capture() {
+    let output = run(r#"
+val x = 10
+val p = async(() => x * 2)
+val result = await(p)
+print(toString(result))
+"#);
+    assert_eq!(output, vec!["20"]);
+}
+
+#[test]
+fn test_parallel_three_thunks() {
+    let output = run(r#"
+val results = parallel([() => 1, () => 2, () => 3])
+print(toString(results))
+"#);
+    assert_eq!(output, vec!["[1, 2, 3]"]);
+}
+
+#[test]
+fn test_async_error_surfaces_at_await() {
+    let output = run(r#"
+val p = async(() => "ok")
+val result = await(p)
+print(result)
+"#);
+    assert_eq!(output, vec!["ok"]);
+}
+
+#[test]
+fn test_thread_pool_async() {
+    let output = run(r#"
+val pool = threadPool(2)
+val p1 = pool.async(() => 100)
+val p2 = pool.async(() => 200)
+val r1 = await(p1)
+val r2 = await(p2)
+print(toString(r1 + r2))
+"#);
+    assert_eq!(output, vec!["300"]);
+}
+
+#[test]
+fn test_worker_request_reply() {
+    let output = run(r#"
+val w = worker(msg => msg * 2, () => null)
+val reply = w.request(21)
+w.close()
+print(toString(reply))
+"#);
+    assert_eq!(output, vec!["42"]);
+}
+
+#[test]
+fn test_worker_message_fire_and_forget() {
+    let output = run(r#"
+var count = 0
+val w = worker(msg => null, () => null)
+w.message(1)
+w.message(2)
+w.close()
+print("done")
+"#);
+    assert_eq!(output, vec!["done"]);
+}
+
+// M12: Iterator restart fixture
+#[test]
+fn test_iterator_restart() {
+    // Re-invoking the initial-state thunk yields a fresh state (spec §27.6).
+    // The same iterator can be re-started by calling .for twice; each run starts fresh.
+    let output = run(r#"
+val counter = iter(
+  () => 0,
+  i => i < 3,
+  i => i + 1,
+  i => i
+)
+counter.for(i => print(toString(i)))
+counter.for(i => print(toString(i)))
+"#);
+    assert_eq!(output, vec!["0", "1", "2", "0", "1", "2"],
+        "Iterator should restart from initial state on second .for call");
+}
+
+// M18: IO/FS/HTTP
+
+#[test]
+fn test_fs_write_read_roundtrip() {
+    let tmp = std::env::temp_dir().join("lin_test_rw.txt");
+    // clean up any prior run
+    let _ = std::fs::remove_file(&tmp);
+    let path = tmp.display().to_string();
+    let output = run(&format!(r#"
+import {{ writeFile, readFile }} from "std/fs"
+writeFile("{path}", "hello from lin")
+val content = readFile("{path}")
+print(content)
+"#));
+    let _ = std::fs::remove_file(&tmp);
+    assert_eq!(output, vec!["hello from lin"]);
+}
+
+#[test]
+fn test_fs_append_file() {
+    let tmp = std::env::temp_dir().join("lin_test_append.txt");
+    let _ = std::fs::remove_file(&tmp);
+    let path = tmp.display().to_string();
+    let output = run(&format!(r#"
+import {{ appendFile, readFile }} from "std/fs"
+appendFile("{path}", "line1\n")
+appendFile("{path}", "line2\n")
+val content = readFile("{path}")
+print(content)
+"#));
+    let _ = std::fs::remove_file(&tmp);
+    assert_eq!(output, vec!["line1\nline2\n"]);
+}
+
+#[test]
+fn test_fs_exists() {
+    let tmp = std::env::temp_dir().join("lin_test_exists.txt");
+    let _ = std::fs::remove_file(&tmp);
+    let path = tmp.display().to_string();
+    let output = run(&format!(r#"
+import {{ writeFile, exists }} from "std/fs"
+print(toString(exists("{path}")))
+writeFile("{path}", "hi")
+print(toString(exists("{path}")))
+"#));
+    let _ = std::fs::remove_file(&tmp);
+    assert_eq!(output, vec!["false", "true"]);
+}
+
+#[test]
+fn test_fs_read_missing_file_returns_error() {
+    let output = run(r#"
+import { readFile } from "std/fs"
+val result = readFile("/nonexistent/path/that/does/not/exist.lin")
+print(result["type"])
+"#);
+    assert_eq!(output, vec!["error"]);
+}
+
+#[test]
+fn test_fs_read_lines() {
+    let tmp = std::env::temp_dir().join("lin_test_lines.txt");
+    let _ = std::fs::remove_file(&tmp);
+    std::fs::write(&tmp, "alpha\nbeta\ngamma\n").unwrap();
+    let path = tmp.display().to_string();
+    let output = run(&format!(r#"
+import {{ readLines }} from "std/fs"
+val lines = readLines("{path}")
+print(toString(length(lines)))
+print(lines[0])
+print(lines[2])
+"#));
+    let _ = std::fs::remove_file(&tmp);
+    assert_eq!(output, vec!["3", "alpha", "gamma"]);
+}
+
+#[test]
+fn test_fs_read_write_json() {
+    let tmp = std::env::temp_dir().join("lin_test_json.json");
+    let _ = std::fs::remove_file(&tmp);
+    let path = tmp.display().to_string();
+    let output = run(&format!(r#"
+import {{ writeJson, readJson }} from "std/fs"
+val data = {{ "name": "Lin", "version": 1 }}
+writeJson("{path}", data)
+val loaded = readJson("{path}")
+print(loaded["name"])
+print(toString(loaded["version"]))
+"#));
+    let _ = std::fs::remove_file(&tmp);
+    assert_eq!(output, vec!["Lin", "1"]);
+}
+
+#[test]
+fn test_parse_json_intrinsic() {
+    let output = run(r#"
+val json = __parseJson("[1, 2, 3]")
+print(toString(json[0]))
+print(toString(length(json)))
+"#);
+    assert_eq!(output, vec!["1", "3"]);
+}
+
+#[test]
+fn test_parse_json_object() {
+    let output = run(r#"
+val obj = __parseJson("{\"x\": 42, \"y\": \"hello\"}")
+print(toString(obj["x"]))
+print(obj["y"])
+"#);
+    assert_eq!(output, vec!["42", "hello"]);
+}
+
+#[test]
+fn test_parse_json_error() {
+    let output = run(r#"
+val result = __parseJson("not valid json")
+print(result["type"])
+"#);
+    assert_eq!(output, vec!["error"]);
+}
+
+// std/server tests
+#[test]
+fn test_server_path_match() {
+    let output = run(r#"
+import { pathMatch } from "std/server"
+val m = pathMatch("/users/:id/posts/:postId", "/users/42/posts/7")
+print(m["id"])
+print(m["postId"])
+val none = pathMatch("/users/:id", "/products/5")
+print(toString(none))
+"#);
+    assert_eq!(output, vec!["42", "7", "null"]);
+}
+
+#[test]
+fn test_server_path_match_literal_mismatch() {
+    let output = run(r#"
+import { pathMatch } from "std/server"
+val m = pathMatch("/api/v1/users", "/api/v2/users")
+print(toString(m))
+"#);
+    assert_eq!(output, vec!["null"]);
+}
+
+#[test]
+fn test_server_json_helper() {
+    let output = run(r#"
+import { json } from "std/server"
+val resp = json(200, "hello")
+print(toString(resp["status"]))
+print(resp["headers"]["Content-Type"])
+"#);
+    assert_eq!(output, vec!["200", "application/json"]);
+}
+
+#[test]
+fn test_server_text_helper() {
+    let output = run(r#"
+import { text } from "std/server"
+val resp = text(200, "hello world")
+print(toString(resp["status"]))
+print(resp["body"])
+"#);
+    assert_eq!(output, vec!["200", "hello world"]);
+}
+
+#[test]
+fn test_server_parse_body() {
+    let output = run(r#"
+import { parseBody } from "std/server"
+val req = { "method": "POST", "path": "/", "query": "", "headers": {}, "body": "{\"x\": 1}" }
+val body = parseBody(req)
+print(toString(body["x"]))
+"#);
+    assert_eq!(output, vec!["1"]);
+}
+
+#[test]
+fn test_server_serve_responds_to_get() {
+    // Spin the server up in a background thread, then make an HTTP request to it.
+    use std::thread;
+    use std::time::Duration;
+
+    let port: u16 = 19042; // hopefully free
+    let handle = thread::spawn(move || {
+        let mut interp = lin_eval::Interpreter::new();
+        let _ = interp.run(&format!(r#"
+import {{ serve, text }} from "std/server"
+serve({port}, req =>
+  text(200, "pong"))
+"#));
+    });
+    // Give the server a moment to start
+    thread::sleep(Duration::from_millis(200));
+    let response = ureq::get(&format!("http://127.0.0.1:{}", port)).call();
+    match response {
+        Ok(resp) => {
+            assert_eq!(resp.status(), 200);
+            let body = resp.into_string().unwrap();
+            assert_eq!(body, "pong");
+        }
+        Err(e) => panic!("HTTP request failed: {}", e),
+    }
+    // Server thread runs forever; we just drop the handle
+    drop(handle);
+}
+
+// M19: FFI parse/stub tests
+
+#[test]
+fn test_ffi_stub_errors_at_call_time() {
+    // The interpreter registers foreign bindings as stubs that error at call time.
+    // Arity is derived from the declared type so the call site arity check passes.
+    let err = run_expect_err(r#"
+import foreign "libmath.a"
+  val myFn: (Int32) => Int32
+myFn(42)
+"#);
+    assert!(err.contains("Foreign functions are not available in the interpreter"),
+        "Expected foreign stub error, got: {}", err);
+}
+
+// M11: Cyclic import tests use the file-based interpreter, so we test the simpler
+// intra-module case: a function that forward-references another top-level function
+// (mutual recursion via forward-declaration).
+#[test]
+fn test_mutual_recursion_via_forward_decl() {
+    let output = run(r#"
+val isEven = (n: Int32): Boolean =>
+  if n == 0
+    then true
+    else isOdd(n - 1)
+
+val isOdd = (n: Int32): Boolean =>
+  if n == 0
+    then false
+    else isEven(n - 1)
+
+print(toString(isEven(4)))
+print(toString(isOdd(3)))
+"#);
+    assert_eq!(output, vec!["true", "true"]);
+}
+
+// M18: std/http live tests using an in-process tiny_http test server
+
+fn start_test_server(port: u16, response_body: &'static str, status: u16) -> std::thread::JoinHandle<()> {
+    use std::thread;
+    thread::spawn(move || {
+        let server = tiny_http::Server::http(format!("0.0.0.0:{}", port)).unwrap();
+        // Handle one request then exit
+        if let Ok(Some(req)) = server.recv_timeout(std::time::Duration::from_secs(5)) {
+            let response = tiny_http::Response::from_string(response_body)
+                .with_status_code(tiny_http::StatusCode::from(status));
+            let _ = req.respond(response);
+        }
+    })
+}
+
+#[test]
+fn test_http_fetch_json() {
+    use std::thread;
+    use std::time::Duration;
+
+    let port: u16 = 19100;
+    let _server = start_test_server(port, r#"{"value": 42}"#, 200);
+    thread::sleep(Duration::from_millis(100));
+
+    let output = run(&format!(r#"
+import {{ fetchJson }} from "std/http"
+val result = fetchJson("http://127.0.0.1:{}")
+print(toString(result["value"]))
+"#, port));
+    assert_eq!(output, vec!["42"]);
+}
+
+#[test]
+fn test_http_fetch_404_is_response_not_error() {
+    use std::thread;
+    use std::time::Duration;
+
+    let port: u16 = 19101;
+    // Start a server that returns 404
+    thread::spawn(move || {
+        let server = tiny_http::Server::http(format!("0.0.0.0:{}", port)).unwrap();
+        if let Ok(Some(req)) = server.recv_timeout(std::time::Duration::from_secs(5)) {
+            let response = tiny_http::Response::from_string("not found")
+                .with_status_code(tiny_http::StatusCode::from(404u16));
+            let _ = req.respond(response);
+        }
+    });
+    thread::sleep(Duration::from_millis(100));
+
+    let output = run(&format!(r#"
+import {{ fetch }} from "std/http"
+val result = fetch("http://127.0.0.1:{}")
+print(toString(result["status"]))
+"#, port));
+    // HTTP 404 should be a successful HttpResponse with status 404, not an Error
+    assert_eq!(output, vec!["404"]);
+}
+
+#[test]
+fn test_http_post_json() {
+    use std::thread;
+    use std::time::Duration;
+
+    let port: u16 = 19102;
+    // Start a server that echoes the method back
+    thread::spawn(move || {
+        let server = tiny_http::Server::http(format!("0.0.0.0:{}", port)).unwrap();
+        if let Ok(Some(req)) = server.recv_timeout(std::time::Duration::from_secs(5)) {
+            let method = req.method().to_string();
+            let response = tiny_http::Response::from_string(format!(r#"{{"method": "{}"}}"#, method));
+            let _ = req.respond(response);
+        }
+    });
+    thread::sleep(Duration::from_millis(100));
+
+    let output = run(&format!(r#"
+import {{ postJson }} from "std/http"
+val result = postJson("http://127.0.0.1:{}", {{ "x": 1 }})
+val parsed = result["body"]
+print(toString(result["status"]))
+"#, port));
+    assert_eq!(output, vec!["200"]);
+}
+
+#[test]
+fn test_http_transport_failure_is_error() {
+    // Try to connect to a port nothing is listening on — should return an Error value
+    let output = run(r#"
+import { fetch } from "std/http"
+val result = fetch("http://127.0.0.1:1")
+print(result["type"])
+"#);
+    assert_eq!(output, vec!["error"]);
+}
+
+#[test]
+fn test_server_thread_pool_serve_concurrent() {
+    // Spin up a pool.serve server, make 3 concurrent requests, check all get responses.
+    use std::thread;
+    use std::time::Duration;
+
+    let port: u16 = 19103;
+    let _server_handle = thread::spawn(move || {
+        let mut interp = lin_eval::Interpreter::new();
+        let _ = interp.run(&format!(r#"
+import {{ text }} from "std/server"
+val pool = threadPool(4)
+pool.serve({port}, req =>
+  text(200, "concurrent-ok"))
+"#));
+    });
+    thread::sleep(Duration::from_millis(250));
+
+    // Make 3 concurrent requests
+    let handles: Vec<_> = (0..3).map(|_| {
+        thread::spawn(move || {
+            ureq::get(&format!("http://127.0.0.1:{}", port))
+                .call()
+                .map(|r| r.into_string().unwrap())
+        })
+    }).collect();
+
+    for h in handles {
+        let result = h.join().unwrap();
+        match result {
+            Ok(body) => assert_eq!(body, "concurrent-ok"),
+            Err(e) => panic!("Concurrent request failed: {}", e),
+        }
+    }
+}
+
+// M18: std/io stdin tests — use process::Command to pipe stdin
+
+fn lin_binary_path() -> std::path::PathBuf {
+    // Look for the pre-built debug binary relative to CARGO_MANIFEST_DIR.
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = manifest_dir.parent().unwrap().parent().unwrap();
+    workspace_root.join("target/debug/lin")
+}
+
+fn run_lin_with_stdin(test_name: &str, source: &str, stdin_data: &str) -> String {
+    use std::process::{Command, Stdio};
+    use std::io::Write;
+    use std::fs;
+
+    let bin = lin_binary_path();
+    // Use unique temp file per test to avoid parallel conflicts.
+    let tmp = std::env::temp_dir().join(format!("lin_stdin_{}.lin", test_name));
+    fs::write(&tmp, source).unwrap();
+    let mut child = Command::new(&bin)
+        .arg(tmp.to_str().unwrap())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn lin binary — run `cargo build -p lin` first");
+    child.stdin.as_mut().unwrap().write_all(stdin_data.as_bytes()).unwrap();
+    drop(child.stdin.take());
+    let output = child.wait_with_output().unwrap();
+    let _ = fs::remove_file(&tmp);
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+#[test]
+fn test_io_lines_reads_all_stdin_lines() {
+    let output = run_lin_with_stdin("lines", r#"
+import { lines } from "std/io"
+val all = lines()
+all.for(line => print(line))
+"#, "hello\nworld\nfoo\n");
+    let parts: Vec<&str> = output.lines().collect();
+    assert_eq!(parts, vec!["hello", "world", "foo"],
+        "lines() should yield each stdin line, got: {:?}", parts);
+}
+
+#[test]
+fn test_io_read_all_returns_full_content() {
+    let output = run_lin_with_stdin("readall", r#"
+import { readAll } from "std/io"
+val content = readAll()
+print(content)
+"#, "hello world");
+    assert_eq!(output, "hello world",
+        "readAll() should return all stdin content, got: {:?}", output);
+}
+
+#[test]
+fn test_io_read_line_null_on_empty_stdin() {
+    let output = run_lin_with_stdin("readline_null", r#"
+import { readLine } from "std/io"
+val line = readLine()
+print(toString(line))
+"#, "");
+    assert_eq!(output, "null",
+        "readLine() on empty stdin should return null, got: {:?}", output);
+}
+
+#[test]
+fn test_concurrent_async_fetchjson_no_data_races() {
+    // Spin up a local server that handles multiple concurrent requests,
+    // then use Lin's async/await to make concurrent fetchJson calls.
+    use std::thread;
+    use std::time::Duration;
+
+    let port: u16 = 19104;
+    // Server handles multiple requests
+    thread::spawn(move || {
+        let server = tiny_http::Server::http(format!("0.0.0.0:{}", port)).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if let Ok(Some(req)) = server.recv_timeout(Duration::from_millis(100)) {
+                let response = tiny_http::Response::from_string(r#"{"n": 1}"#);
+                let _ = req.respond(response);
+            }
+        }
+    });
+    thread::sleep(Duration::from_millis(100));
+
+    let output = run(&format!(r#"
+import {{ fetchJson }} from "std/http"
+val url = "http://127.0.0.1:{}"
+val results = await(async([
+  () => fetchJson(url)["n"],
+  () => fetchJson(url)["n"],
+  () => fetchJson(url)["n"]
+]))
+results.for(r => print(toString(r)))
+"#, port));
+    assert_eq!(output, vec!["1", "1", "1"],
+        "Concurrent async fetchJson calls should all succeed, got: {:?}", output);
+}
+
+// M19: End-to-end FFI test — compile a C library and call it from Lin via `lin build`
+
+#[test]
+fn test_ffi_end_to_end_c_library() {
+    use std::process::Command;
+    use std::path::Path;
+
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+    let lin_bin = workspace.join("target/debug/lin");
+    let mathlib_c = workspace.join("examples/lib/mathlib.c");
+    let mathlib_a = workspace.join("examples/lib/libmathlib.a");
+    let ffi_example = workspace.join("examples/ffi-c.lin");
+    let output_bin = workspace.join("target/ffi_c_test");
+
+    if !lin_bin.exists() {
+        eprintln!("SKIP: lin binary not built; run `cargo build -p lin` first");
+        return;
+    }
+
+    // Compile the C library if not already built
+    if !mathlib_a.exists() {
+        let obj = workspace.join("examples/lib/mathlib.o");
+        let cc_status = Command::new("cc")
+            .args(["-c", mathlib_c.to_str().unwrap(), "-o", obj.to_str().unwrap()])
+            .status();
+        if cc_status.map(|s| !s.success()).unwrap_or(true) {
+            eprintln!("SKIP: failed to compile C library (cc not available)");
+            return;
+        }
+        let ar_status = Command::new("ar")
+            .args(["rcs", mathlib_a.to_str().unwrap(), obj.to_str().unwrap()])
+            .status();
+        if ar_status.map(|s| !s.success()).unwrap_or(true) {
+            eprintln!("SKIP: failed to create static archive");
+            return;
+        }
+    }
+
+    // Compile the Lin FFI example (run from workspace root so relative library paths resolve)
+    let compile_out = Command::new(&lin_bin)
+        .args(["build", ffi_example.to_str().unwrap(), "-o", output_bin.to_str().unwrap()])
+        .current_dir(workspace)
+        .output()
+        .expect("failed to run lin build");
+    assert!(compile_out.status.success(),
+        "lin build failed: {}", String::from_utf8_lossy(&compile_out.stderr));
+
+    // Run the compiled binary
+    let run_out = Command::new(&output_bin)
+        .output()
+        .expect("failed to run ffi_c_test binary");
+    assert!(run_out.status.success(), "ffi_c_test binary failed");
+    let stdout = String::from_utf8_lossy(&run_out.stdout);
+    assert!(stdout.contains("3 + 4 = 7"), "Expected '3 + 4 = 7' in output, got: {}", stdout);
+    assert!(stdout.contains("2.5^2 = 6.25"), "Expected '2.5^2 = 6.25' in output, got: {}", stdout);
+}

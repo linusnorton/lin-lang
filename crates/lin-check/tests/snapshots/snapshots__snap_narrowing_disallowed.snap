@@ -1,0 +1,7 @@
+---
+source: crates/lin-check/tests/snapshots.rs
+expression: errors
+---
+[
+    "Expected type Int32, got Float64",
+]

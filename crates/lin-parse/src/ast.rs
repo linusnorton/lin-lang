@@ -34,7 +34,19 @@ pub enum Stmt {
         path: String,
         span: Span,
     },
+    ForeignImport {
+        path: String,
+        bindings: Vec<ForeignBinding>,
+        span: Span,
+    },
     Expr(Expr),
+}
+
+#[derive(Debug, Clone)]
+pub struct ForeignBinding {
+    pub name: String,
+    pub type_ann: TypeExpr,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone)]

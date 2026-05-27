@@ -1,0 +1,7 @@
+---
+source: crates/lin-check/tests/snapshots.rs
+expression: errors
+---
+[
+    "Unknown type 'NonExistentType'",
+]

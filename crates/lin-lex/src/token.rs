@@ -34,6 +34,7 @@ pub enum TokenKind {
     Import,
     From,
     As,
+    Foreign,
 
     // Operators
     Plus,

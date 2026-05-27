@@ -1,0 +1,13 @@
+export val readFile = (path) => __fsReadFile(path)
+
+export val writeFile = (path, content) => __fsWriteFile(path, content)
+
+export val appendFile = (path, content) => __fsAppendFile(path, content)
+
+export val readLines = (path) => __fsReadLines(path)
+
+export val readJson = (path) => __fsReadJson(path)
+
+export val writeJson = (path, value) => __fsWriteJson(path, value)
+
+export val exists = (path) => __fsExists(path)

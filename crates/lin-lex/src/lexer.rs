@@ -447,6 +447,7 @@ impl Lexer {
             "import" => TokenKind::Import,
             "from" => TokenKind::From,
             "as" => TokenKind::As,
+            "foreign" => TokenKind::Foreign,
             "true" => TokenKind::True,
             "false" => TokenKind::False,
             "null" => TokenKind::Null,

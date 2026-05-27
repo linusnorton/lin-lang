@@ -1,1 +1,7 @@
 export val print = print
+
+export val readLine = () => __ioReadLine()
+
+export val readAll = () => __ioReadAll()
+
+export val lines = () => __ioLines()

@@ -27,6 +27,9 @@ pub enum Type {
     Iterator(Box<Type>),
     TypeVar(u32),
     Never,
+    /// A named type alias reference (used for recursive types that cannot be eagerly expanded).
+    /// Equality and compatibility unfold one level via the type environment.
+    Named(String),
 }
 
 impl Type {
@@ -164,6 +167,7 @@ impl fmt::Display for Type {
             Type::Iterator(inner) => write!(f, "Iterator<{}>", inner),
             Type::TypeVar(id) => write!(f, "?T{}", id),
             Type::Never => write!(f, "Never"),
+            Type::Named(name) => write!(f, "{}", name),
         }
     }
 }

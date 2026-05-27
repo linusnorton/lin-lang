@@ -1,10 +1,110 @@
 use std::rc::Rc;
 use std::cell::RefCell;
 use std::fmt;
+use std::sync::{Arc, Mutex};
 use indexmap::IndexMap;
 
 use crate::env::Env;
 use lin_parse::ast::{Expr, Param};
+
+/// State of a Promise<T>.
+pub enum PromiseState {
+    Pending,
+    Resolved(JsonValue),
+    Failed(String),
+}
+
+/// JSON-compatible value that can be safely sent across thread boundaries.
+/// Lin's spec requires async thunk return types to be JSON-compatible.
+#[derive(Clone, Debug)]
+pub enum JsonValue {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    String(String),
+    Array(Vec<JsonValue>),
+    Object(Vec<(String, JsonValue)>),
+    Error(String),
+}
+
+impl JsonValue {
+    pub fn to_value(&self) -> Value {
+        match self {
+            JsonValue::Null => Value::Null,
+            JsonValue::Bool(b) => Value::Bool(*b),
+            JsonValue::Int(i) => Value::Int(*i),
+            JsonValue::Float(f) => Value::Float(*f),
+            JsonValue::String(s) => Value::String(Rc::new(s.clone())),
+            JsonValue::Array(items) => {
+                let vals: Vec<Value> = items.iter().map(|v| v.to_value()).collect();
+                Value::Array(Rc::new(RefCell::new(vals)))
+            }
+            JsonValue::Object(fields) => {
+                let mut map = IndexMap::new();
+                for (k, v) in fields {
+                    map.insert(k.clone(), v.to_value());
+                }
+                Value::Object(Rc::new(RefCell::new(map)))
+            }
+            JsonValue::Error(msg) => {
+                let mut map = IndexMap::new();
+                map.insert("type".to_string(), Value::String(Rc::new("error".to_string())));
+                map.insert("message".to_string(), Value::String(Rc::new(msg.clone())));
+                Value::Object(Rc::new(RefCell::new(map)))
+            }
+        }
+    }
+}
+
+impl Value {
+    /// Convert to a JSON-safe value for thread boundaries. Returns Err if non-serializable.
+    pub fn to_json_value(&self) -> Result<JsonValue, String> {
+        match self {
+            Value::Null => Ok(JsonValue::Null),
+            Value::Bool(b) => Ok(JsonValue::Bool(*b)),
+            Value::Int(i) => Ok(JsonValue::Int(*i)),
+            Value::Float(f) => Ok(JsonValue::Float(*f)),
+            Value::String(s) => Ok(JsonValue::String(s.as_ref().clone())),
+            Value::Array(a) => {
+                let items: Result<Vec<JsonValue>, String> = a.borrow().iter()
+                    .map(|v| v.to_json_value())
+                    .collect();
+                Ok(JsonValue::Array(items?))
+            }
+            Value::Object(o) => {
+                let fields: Result<Vec<(String, JsonValue)>, String> = o.borrow().iter()
+                    .map(|(k, v)| v.to_json_value().map(|jv| (k.clone(), jv)))
+                    .collect();
+                Ok(JsonValue::Object(fields?))
+            }
+            Value::Function(_) | Value::Partial(_) | Value::NativeFunction(_) => {
+                Err("Functions cannot be passed across thread boundaries".to_string())
+            }
+            Value::Iterator(_) => {
+                Err("Iterators cannot be passed across thread boundaries".to_string())
+            }
+            Value::Promise(_) | Value::ThreadPool(_) | Value::Worker(_) => {
+                Err("Concurrency primitives cannot be passed across thread boundaries".to_string())
+            }
+        }
+    }
+}
+
+/// A thread pool — opaque wrapper around a fixed-size rayon-style manual pool.
+pub struct ThreadPoolState {
+    pub sender: std::sync::mpsc::Sender<Box<dyn FnOnce() + Send + 'static>>,
+}
+
+pub struct WorkerState {
+    pub sender: std::sync::mpsc::SyncSender<WorkerMsg>,
+    pub closed: std::sync::atomic::AtomicBool,
+}
+
+pub enum WorkerMsg {
+    Message(JsonValue, Option<std::sync::mpsc::SyncSender<JsonValue>>),
+    Shutdown,
+}
 
 #[derive(Clone)]
 pub enum Value {
@@ -19,6 +119,12 @@ pub enum Value {
     Partial(Rc<PartialApp>),
     Iterator(Rc<RefCell<IteratorValue>>),
     NativeFunction(Rc<NativeFunction>),
+    /// A future value produced by `async`.
+    Promise(Arc<Mutex<PromiseState>>),
+    /// A fixed-size thread pool produced by `threadPool(n)`.
+    ThreadPool(Arc<ThreadPoolState>),
+    /// A stateful worker thread produced by `worker(onMsg, onShutdown)`.
+    Worker(Arc<WorkerState>),
 }
 
 impl fmt::Debug for Value {
@@ -35,6 +141,9 @@ impl fmt::Debug for Value {
             Value::Partial(_) => write!(f, "<partial>"),
             Value::Iterator(_) => write!(f, "<iterator>"),
             Value::NativeFunction(nf) => write!(f, "<native:{}>", nf.name),
+            Value::Promise(_) => write!(f, "<promise>"),
+            Value::ThreadPool(_) => write!(f, "<threadpool>"),
+            Value::Worker(_) => write!(f, "<worker>"),
         }
     }
 }
@@ -67,6 +176,9 @@ impl Value {
             Value::Partial(_) => "<partial>".to_string(),
             Value::Iterator(_) => "<iterator>".to_string(),
             Value::NativeFunction(nf) => format!("<native:{}>", nf.name),
+            Value::Promise(_) => "<promise>".to_string(),
+            Value::ThreadPool(_) => "<threadpool>".to_string(),
+            Value::Worker(_) => "<worker>".to_string(),
         }
     }
 
@@ -130,6 +242,9 @@ impl Value {
             Value::Partial(_) => "Function",
             Value::Iterator(_) => "Iterator",
             Value::NativeFunction(_) => "Function",
+            Value::Promise(_) => "Promise",
+            Value::ThreadPool(_) => "ThreadPool",
+            Value::Worker(_) => "Worker",
         }
     }
 }
@@ -174,6 +289,36 @@ impl Clone for IteratorValue {
             state: self.state.clone(),
             started: self.started,
         }
+    }
+}
+
+/// A wrapper for a deep-cloned `Value` that is safe to send across thread boundaries.
+/// SAFETY: The value must have been deep-cloned so that no `Rc` is shared with
+/// any other thread. Lin's spec guarantees this by forbidding `var` capture in
+/// async thunks — all captured values are immutable and deep-copied at lambda creation.
+pub struct SendValue(pub Value);
+// SAFETY: Lin guarantees the inner Value has no shared Rc references
+// when created by deep-cloning an immutable val capture.
+unsafe impl Send for SendValue {}
+
+/// A deep-cloned `Function` wrapped in a raw pointer to bypass Rc's !Send.
+/// SAFETY: Function closures passed to async must not capture var bindings.
+/// All captures are deep-cloned (Rc refcount = 1, no shared aliasing across threads).
+pub struct SendFunction(pub *mut Function);
+unsafe impl Send for SendFunction {}
+
+impl SendFunction {
+    pub fn new(f: Rc<Function>) -> Self {
+        // Leak the Rc to get a raw pointer we own. We'll reconstruct the Rc in the thread.
+        SendFunction(Rc::into_raw(f) as *mut Function)
+    }
+
+    /// Reconstruct the Rc<Function> from the raw pointer. Only call once.
+    ///
+    /// SAFETY: Caller must ensure this is called exactly once and no other Rc
+    /// references to the same allocation exist.
+    pub unsafe fn into_rc(self) -> Rc<Function> {
+        Rc::from_raw(self.0 as *const Function)
     }
 }
 

@@ -100,8 +100,20 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
     let obj_path = opts.output_path.with_extension("o");
     cg.emit_object_file(&obj_path).map_err(CompileError::Codegen)?;
 
-    // 7. Link with runtime
-    link(&obj_path, &opts.output_path)?;
+    // 7. Collect foreign library paths and validate they exist
+    let foreign_libs = cg.foreign_lib_paths.clone();
+    for lib in &foreign_libs {
+        let lib_path = Path::new(lib);
+        if !lib_path.exists() {
+            return Err(CompileError::Link(format!(
+                "Foreign library '{}' not found; cannot link",
+                lib
+            )));
+        }
+    }
+
+    // 8. Link with runtime and any foreign libraries
+    link(&obj_path, &opts.output_path, &foreign_libs)?;
 
     // Clean up the .o file.
     let _ = std::fs::remove_file(&obj_path);
@@ -255,9 +267,8 @@ fn pre_resolve_imports_from_ast(
     Ok(())
 }
 
-fn link(obj_path: &Path, output_path: &Path) -> Result<(), CompileError> {
+fn link(obj_path: &Path, output_path: &Path, foreign_libs: &[String]) -> Result<(), CompileError> {
     // Find the lin-runtime static library.
-    // When running from a cargo build, it should be in the same target directory.
     let runtime_lib = find_runtime_lib();
 
     let mut cmd = Command::new("cc");
@@ -268,9 +279,28 @@ fn link(obj_path: &Path, output_path: &Path) -> Result<(), CompileError> {
     if let Some(lib) = &runtime_lib {
         cmd.arg(lib);
     } else {
-        // Try to find it relative to the cargo output directory.
-        // Fall back to assuming it's installed system-wide (future: pkg-config).
         eprintln!("Warning: lin-runtime library not found, linking may fail");
+    }
+
+    // Add foreign library paths.
+    for lib in foreign_libs {
+        let lib_path = Path::new(lib);
+        if lib.ends_with(".a") || lib.ends_with(".o") {
+            // Static archive or object: pass as positional argument
+            cmd.arg(lib_path);
+        } else if lib.ends_with(".so") || lib.ends_with(".dylib") {
+            // Shared library: extract stem and add -L + -l flags
+            let parent = lib_path.parent().unwrap_or(Path::new("."));
+            let stem = lib_path.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or(lib);
+            let lib_name = stem.strip_prefix("lib").unwrap_or(stem);
+            cmd.arg(format!("-L{}", parent.display()))
+               .arg(format!("-l{}", lib_name));
+        } else {
+            // Unknown — pass as-is
+            cmd.arg(lib_path);
+        }
     }
 
     // Link system libraries needed by lin-runtime (libc via cc).

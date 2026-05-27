@@ -104,6 +104,8 @@ pub struct Codegen<'ctx> {
     closure_count: usize,
     // Map from (module_path, export_name) -> FunctionValue for compiled imports
     imported_fns: HashMap<(String, String), FunctionValue<'ctx>>,
+    /// Paths to foreign libraries collected from ForeignImport statements (for the linker).
+    pub foreign_lib_paths: Vec<String>,
 }
 
 impl<'ctx> Codegen<'ctx> {
@@ -286,6 +288,7 @@ impl<'ctx> Codegen<'ctx> {
             global_fn_slots: HashMap::new(),
             closure_count: 0,
             imported_fns: HashMap::new(),
+            foreign_lib_paths: Vec::new(),
         }
     }
 
@@ -504,6 +507,10 @@ impl<'ctx> Codegen<'ctx> {
                 // Unresolved type var — use opaque pointer (Json/"any" type at runtime)
                 self.context.ptr_type(AddressSpace::default()).into()
             }
+            Type::Named(_) => {
+                // Named recursive type reference — use opaque pointer (heap-allocated object)
+                self.context.ptr_type(AddressSpace::default()).into()
+            }
         }
     }
 
@@ -513,7 +520,7 @@ impl<'ctx> Codegen<'ctx> {
 
     /// True if `ty` is a union or TypeVar (i.e., needs tagged representation).
     fn is_union_type(ty: &Type) -> bool {
-        matches!(ty, Type::Union(_) | Type::TypeVar(_))
+        matches!(ty, Type::Union(_) | Type::TypeVar(_) | Type::Named(_))
     }
 
     /// True if the expression produces a freshly heap-allocated value that the caller owns.
@@ -939,6 +946,31 @@ impl<'ctx> Codegen<'ctx> {
                         }
                     }
                 }
+            }
+            TypedStmt::ForeignImport { path, bindings, .. } => {
+                // Declare each foreign symbol as an LLVM external function and store
+                // a pointer to it in the binding slot. The actual symbol is resolved
+                // at link time by passing the library path to the linker.
+                for binding in &*bindings {
+                    if !binding.valid { continue; }
+                    if let Type::Function { params, ret } = &binding.ty {
+                        let param_types: Vec<inkwell::types::BasicMetadataTypeEnum> = params.iter()
+                            .map(|p| self.llvm_type(p).into())
+                            .collect();
+                        let llvm_ret = self.llvm_type(ret);
+                        let fn_type = llvm_ret.fn_type(&param_types, false);
+                        let llvm_fn = self.module.add_function(
+                            &binding.name,
+                            fn_type,
+                            Some(inkwell::module::Linkage::External),
+                        );
+                        let fn_ptr = llvm_fn.as_global_value().as_pointer_value();
+                        fn_ctx.slots.insert(binding.slot, SlotStorage::Value(fn_ptr.into()));
+                        self.global_fn_slots.insert(binding.slot, llvm_fn);
+                    }
+                }
+                // Store the library path for the linker to pick up.
+                self.foreign_lib_paths.push(path.clone());
             }
             TypedStmt::Expr(expr) => {
                 self.compile_expr(expr, fn_ctx);

@@ -32,6 +32,12 @@ pub enum TypedStmt {
         bindings: Vec<ImportSlot>,
         span: Span,
     },
+    /// FFI: extern functions imported from a compiled library.
+    ForeignImport {
+        path: String,
+        bindings: Vec<ForeignSlot>,
+        span: Span,
+    },
     /// Object destructuring: evaluate value, store in obj_slot, then extract fields.
     Destructure {
         obj_slot: usize,
@@ -49,6 +55,15 @@ pub struct ImportSlot {
     pub name: String,
     pub slot: usize,
     pub ty: Type,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ForeignSlot {
+    pub name: String,
+    pub slot: usize,
+    pub ty: Type,
+    /// True if this is a legal FFI type (see spec §34.3).
+    pub valid: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

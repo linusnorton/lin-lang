@@ -48,7 +48,14 @@ impl Parser {
             TokenKind::Val => Some(self.parse_val(false)),
             TokenKind::Var => Some(self.parse_var(false)),
             TokenKind::Type => Some(self.parse_type_decl(false)),
-            TokenKind::Import => Some(self.parse_import()),
+            TokenKind::Import => {
+                // Peek ahead to check for `import foreign`
+                if self.peek_ahead_is_foreign() {
+                    Some(self.parse_foreign_import())
+                } else {
+                    Some(self.parse_import())
+                }
+            }
             _ => {
                 let expr = self.parse_expr();
                 Some(Stmt::Expr(expr))
@@ -149,6 +156,45 @@ impl Parser {
         self.expect_keyword(TokenKind::From);
         let path = self.expect_string();
         Stmt::Import { bindings, path, span }
+    }
+
+    fn peek_ahead_is_foreign(&self) -> bool {
+        // Check if the token after 'import' is 'foreign'
+        if self.pos + 1 < self.tokens.len() {
+            matches!(self.tokens[self.pos + 1].kind, TokenKind::Foreign)
+        } else {
+            false
+        }
+    }
+
+    fn parse_foreign_import(&mut self) -> Stmt {
+        let span = self.current_span();
+        self.advance(); // skip 'import'
+        self.advance(); // skip 'foreign'
+        let path = self.expect_string();
+        // Parse indented block of `val name: Type` declarations
+        self.skip_newlines();
+        let mut bindings = Vec::new();
+        if self.check(TokenKind::Indent) {
+            self.advance(); // consume Indent
+            loop {
+                self.skip_newlines();
+                if self.check(TokenKind::Dedent) || self.is_at_end() {
+                    break;
+                }
+                let binding_span = self.current_span();
+                self.expect_keyword(TokenKind::Val);
+                let name = self.expect_ident();
+                self.expect(TokenKind::Colon);
+                let type_ann = self.parse_type_expr();
+                bindings.push(ForeignBinding { name, type_ann, span: binding_span });
+                self.skip_newlines();
+            }
+            if self.check(TokenKind::Dedent) {
+                self.advance(); // consume Dedent
+            }
+        }
+        Stmt::ForeignImport { path, bindings, span }
     }
 
     fn parse_expr(&mut self) -> Expr {

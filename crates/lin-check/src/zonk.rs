@@ -64,6 +64,11 @@ fn zonk_stmt(stmt: &mut TypedStmt, subs: &HashMap<u32, Type>) {
                 b.ty = zonk_type(&b.ty, subs);
             }
         }
+        TypedStmt::ForeignImport { bindings, .. } => {
+            for b in bindings {
+                b.ty = zonk_type(&b.ty, subs);
+            }
+        }
         TypedStmt::Destructure { value, obj_ty, fields, .. } => {
             *obj_ty = zonk_type(obj_ty, subs);
             zonk_expr(value, subs);

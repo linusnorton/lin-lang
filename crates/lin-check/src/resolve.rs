@@ -4,31 +4,39 @@ use crate::env::TypeEnv;
 use crate::types::Type;
 
 pub fn resolve_type(type_expr: &TypeExpr, env: &TypeEnv) -> Result<Type, String> {
+    resolve_type_inner(type_expr, env, &mut std::collections::HashSet::new())
+}
+
+fn resolve_type_inner(
+    type_expr: &TypeExpr,
+    env: &TypeEnv,
+    visiting: &mut std::collections::HashSet<String>,
+) -> Result<Type, String> {
     match type_expr {
-        TypeExpr::Named(name, _span) => resolve_named(name, env),
+        TypeExpr::Named(name, _span) => resolve_named_cycle(name, env, visiting),
         TypeExpr::Generic(name, args, _span) => {
             let resolved_args: Result<Vec<Type>, String> =
-                args.iter().map(|a| resolve_type(a, env)).collect();
-            resolve_generic(name, &resolved_args?, env)
+                args.iter().map(|a| resolve_type_inner(a, env, visiting)).collect();
+            resolve_generic(name, &resolved_args?, env, visiting)
         }
         TypeExpr::Array(inner, _span) => {
-            let inner_ty = resolve_type(inner, env)?;
+            let inner_ty = resolve_type_inner(inner, env, visiting)?;
             Ok(Type::Array(Box::new(inner_ty)))
         }
         TypeExpr::FixedArray(types, _span) => {
             let resolved: Result<Vec<Type>, String> =
-                types.iter().map(|t| resolve_type(t, env)).collect();
+                types.iter().map(|t| resolve_type_inner(t, env, visiting)).collect();
             Ok(Type::FixedArray(resolved?))
         }
         TypeExpr::Union(types, _span) => {
             let resolved: Result<Vec<Type>, String> =
-                types.iter().map(|t| resolve_type(t, env)).collect();
+                types.iter().map(|t| resolve_type_inner(t, env, visiting)).collect();
             Ok(Type::flatten_union(resolved?))
         }
         TypeExpr::Function(params, ret, _span) => {
             let param_types: Result<Vec<Type>, String> =
-                params.iter().map(|p| resolve_type(p, env)).collect();
-            let ret_type = resolve_type(ret, env)?;
+                params.iter().map(|p| resolve_type_inner(p, env, visiting)).collect();
+            let ret_type = resolve_type_inner(ret, env, visiting)?;
             Ok(Type::Function {
                 params: param_types?,
                 ret: Box::new(ret_type),
@@ -37,20 +45,24 @@ pub fn resolve_type(type_expr: &TypeExpr, env: &TypeEnv) -> Result<Type, String>
         TypeExpr::Object(fields, _span) => {
             let mut resolved = IndexMap::new();
             for (key, type_expr) in fields {
-                let ty = resolve_type(type_expr, env)?;
+                let ty = resolve_type_inner(type_expr, env, visiting)?;
                 resolved.insert(key.clone(), ty);
             }
             Ok(Type::Object(resolved))
         }
         TypeExpr::TaggedUnion(variants, _span) => {
             let resolved: Result<Vec<Type>, String> =
-                variants.iter().map(|t| resolve_type(t, env)).collect();
+                variants.iter().map(|t| resolve_type_inner(t, env, visiting)).collect();
             Ok(Type::flatten_union(resolved?))
         }
     }
 }
 
-fn resolve_named(name: &str, env: &TypeEnv) -> Result<Type, String> {
+fn resolve_named_cycle(
+    name: &str,
+    env: &TypeEnv,
+    visiting: &mut std::collections::HashSet<String>,
+) -> Result<Type, String> {
     match name {
         "Null" => Ok(Type::Null),
         "Boolean" => Ok(Type::Bool),
@@ -67,9 +79,16 @@ fn resolve_named(name: &str, env: &TypeEnv) -> Result<Type, String> {
         "String" => Ok(Type::Str),
         "Json" => Ok(json_type()),
         _ => {
+            // Cycle detected: return Named(name) as an opaque reference instead of expanding.
+            if visiting.contains(name) {
+                return Ok(Type::Named(name.to_string()));
+            }
             if let Some(decl) = env.lookup_type(name) {
                 if decl.params.is_empty() {
-                    Ok(decl.body.clone())
+                    visiting.insert(name.to_string());
+                    let expanded = expand_named_body(&decl.body.clone(), env, visiting)?;
+                    visiting.remove(name);
+                    Ok(expanded)
                 } else {
                     Err(format!(
                         "Type '{}' requires {} type argument(s)",
@@ -84,7 +103,45 @@ fn resolve_named(name: &str, env: &TypeEnv) -> Result<Type, String> {
     }
 }
 
-fn resolve_generic(name: &str, args: &[Type], env: &TypeEnv) -> Result<Type, String> {
+/// Re-expand Named(x) references inside an already-resolved type body.
+/// This is needed when the body was stored before its recursive references
+/// were expanded (because they pointed back at the currently-being-defined type).
+fn expand_named_body(
+    ty: &Type,
+    env: &TypeEnv,
+    visiting: &mut std::collections::HashSet<String>,
+) -> Result<Type, String> {
+    match ty {
+        Type::Named(n) => resolve_named_cycle(n, env, visiting),
+        Type::Array(inner) => Ok(Type::Array(Box::new(expand_named_body(inner, env, visiting)?))),
+        Type::FixedArray(ts) => Ok(Type::FixedArray(
+            ts.iter().map(|t| expand_named_body(t, env, visiting)).collect::<Result<_, _>>()?
+        )),
+        Type::Union(ts) => Ok(Type::Union(
+            ts.iter().map(|t| expand_named_body(t, env, visiting)).collect::<Result<_, _>>()?
+        )),
+        Type::Object(fields) => {
+            let mut out = IndexMap::new();
+            for (k, v) in fields {
+                out.insert(k.clone(), expand_named_body(v, env, visiting)?);
+            }
+            Ok(Type::Object(out))
+        }
+        Type::Function { params, ret } => Ok(Type::Function {
+            params: params.iter().map(|p| expand_named_body(p, env, visiting)).collect::<Result<_, _>>()?,
+            ret: Box::new(expand_named_body(ret, env, visiting)?),
+        }),
+        Type::Iterator(inner) => Ok(Type::Iterator(Box::new(expand_named_body(inner, env, visiting)?))),
+        other => Ok(other.clone()),
+    }
+}
+
+fn resolve_generic(
+    name: &str,
+    args: &[Type],
+    env: &TypeEnv,
+    visiting: &mut std::collections::HashSet<String>,
+) -> Result<Type, String> {
     match name {
         "Iterator" => {
             if args.len() != 1 {
@@ -102,7 +159,10 @@ fn resolve_generic(name: &str, args: &[Type], env: &TypeEnv) -> Result<Type, Str
                         args.len()
                     ));
                 }
-                Ok(substitute(&decl.body, &decl.params, args))
+                let body = decl.body.clone();
+                let params = decl.params.clone();
+                let substituted = substitute(&body, &params, args, env, visiting)?;
+                Ok(substituted)
             } else {
                 Err(format!("Unknown generic type '{}'", name))
             }
@@ -110,38 +170,49 @@ fn resolve_generic(name: &str, args: &[Type], env: &TypeEnv) -> Result<Type, Str
     }
 }
 
-fn substitute(ty: &Type, params: &[String], args: &[Type]) -> Type {
+
+fn substitute(
+    ty: &Type,
+    params: &[String],
+    args: &[Type],
+    env: &TypeEnv,
+    visiting: &mut std::collections::HashSet<String>,
+) -> Result<Type, String> {
     match ty {
-        Type::Object(fields) => {
-            let substituted = fields
-                .iter()
-                .map(|(k, v)| (k.clone(), substitute(v, params, args)))
-                .collect();
-            Type::Object(substituted)
+        Type::Named(n) => {
+            // If the name is one of the generic params, substitute it.
+            if let Some(pos) = params.iter().position(|p| p == n) {
+                return Ok(args[pos].clone());
+            }
+            // Otherwise expand it as a regular named type.
+            resolve_named_cycle(n, env, visiting)
         }
-        Type::Array(inner) => Type::Array(Box::new(substitute(inner, params, args))),
+        Type::Object(fields) => {
+            let substituted: Result<IndexMap<String, Type>, String> = fields
+                .iter()
+                .map(|(k, v)| substitute(v, params, args, env, visiting).map(|t| (k.clone(), t)))
+                .collect();
+            Ok(Type::Object(substituted?))
+        }
+        Type::Array(inner) => Ok(Type::Array(Box::new(substitute(inner, params, args, env, visiting)?))),
         Type::FixedArray(types) => {
-            Type::FixedArray(types.iter().map(|t| substitute(t, params, args)).collect())
+            Ok(Type::FixedArray(types.iter().map(|t| substitute(t, params, args, env, visiting)).collect::<Result<_, _>>()?))
         }
         Type::Union(types) => {
-            Type::Union(types.iter().map(|t| substitute(t, params, args)).collect())
+            Ok(Type::Union(types.iter().map(|t| substitute(t, params, args, env, visiting)).collect::<Result<_, _>>()?))
         }
         Type::Function {
             params: fn_params,
             ret,
-        } => Type::Function {
+        } => Ok(Type::Function {
             params: fn_params
                 .iter()
-                .map(|t| substitute(t, params, args))
-                .collect(),
-            ret: Box::new(substitute(ret, params, args)),
-        },
-        Type::Iterator(inner) => Type::Iterator(Box::new(substitute(inner, params, args))),
-        _ => {
-            // Check if this is a type parameter reference by name
-            // This works because we store type params as Named types before resolution
-            ty.clone()
-        }
+                .map(|t| substitute(t, params, args, env, visiting))
+                .collect::<Result<_, _>>()?,
+            ret: Box::new(substitute(ret, params, args, env, visiting)?),
+        }),
+        Type::Iterator(inner) => Ok(Type::Iterator(Box::new(substitute(inner, params, args, env, visiting)?))),
+        _ => Ok(ty.clone()),
     }
 }
 

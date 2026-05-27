@@ -20,3 +20,6 @@ ariadne = "0.6"
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
 sha2 = "0.10"
+insta = { version = "1", features = ["ron"] }
+ureq = { version = "2", features = ["json"] }
+tiny_http = "0.12"

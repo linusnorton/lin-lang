@@ -199,3 +199,97 @@
 **Rationale**: General iterators need function-pointer dispatch. For the common `range(...).for(i => ...)` pattern, generating a direct counted loop is equivalent to a C `for` loop with no overhead. Array iteration avoids boxing by loading `LinArrayElem.payload` directly. `TypeVar` substitution was added to `infer_call` and `infer_dot_call` to propagate the element type into the body lambda's parameter when the `for` intrinsic's parameter types use `TypeVar`.
 
 **Consequence**: `range(0, n).for(i => ...)` and `arr.for(x => ...)` compile to native loops. The `iter` intrinsic is supported but `map`/`filter`/`reduce` are not yet compiled (runtime panic). Bidirectional type checking was extended (`check_expr` now guides function argument inference using expected parameter types from the call site).
+
+## ADR-027: Concurrency via OS threads in the tree-walking interpreter
+
+**Decision**: `async(thunk)` spawns a real OS thread (`std::thread::spawn`) with a fresh `Interpreter::new()` instance. The thunk's `Rc<Function>` is converted to a raw pointer via `Rc::into_raw` (wrapped in `SendFunction(*mut Function)` with `unsafe impl Send`) to bypass `Rc`'s `!Send` bound. Results are communicated back via `Arc<Mutex<PromiseState>>`. `await` uses a spin-wait loop with `thread::yield_now()` until the promise resolves.
+
+**Rationale**: A true async executor (tokio, async-std) would require cooperative `async/await` syntax throughout the interpreter, which conflicts with the simple tree-walking evaluation model. OS threads are heavyweight but correct: each thread gets its own interpreter state, so there is no shared mutable interpreter data between concurrent thunks. The `SendFunction` raw-pointer trick is safe because Lin's spec forbids `var` capture in async thunks (all captured values are immutable `val` bindings, deep-copied at lambda creation).
+
+**Consequence**: `async` thunks run on true OS threads. `await` blocks the caller thread (not a coroutine yield). The `JsonValue` bridge enum serializes results at thread boundaries since `Value` contains `Rc<...>` fields that cannot cross thread boundaries. `ThreadPool` uses `mpsc::channel` with a fixed set of worker threads. `Worker` uses `mpsc::sync_channel` for backpressure.
+
+## ADR-028: `SendFunction` raw-pointer safety invariant
+
+**Decision**: `SendFunction(pub *mut Function)` stores the result of `Rc::into_raw(func)`. The receiving thread calls `unsafe { Rc::from_raw(ptr) }` exactly once to reconstruct the `Rc<Function>`. No other `Rc` clone of the same allocation may exist after `SendFunction::new()` is called.
+
+**Rationale**: `Rc<T>` is `!Send` because clone/drop modify a non-atomic reference count. By consuming the `Rc` into a raw pointer (decrements no refcount, transfers ownership), and reconstructing it on exactly one other thread (where no other clones exist), we avoid all data races on the refcount. The raw pointer itself (a plain address) satisfies `Send`.
+
+**Consequence**: Callers of `SendFunction::new` must ensure no clones of the passed `Rc<Function>` survive in the sending thread after `new()` returns. In practice, the thunk function is always obtained from a `Value::Function(rc)` match arm, and the `Value` is not retained afterward, satisfying this invariant.
+
+## ADR-029: JSON bridge type for cross-thread value transfer
+
+**Decision**: `JsonValue` is a `Clone + Debug` enum (no `Rc`, no `RefCell`) that mirrors Lin's data types: `Null`, `Bool`, `Int`, `Float`, `String`, `Array`, `Object`, `Error`. `Value::to_json_value()` converts at the thread boundary (returning `Err` for non-serializable types like `Function`). `JsonValue::to_value()` converts back in the receiving thread.
+
+**Rationale**: `Value` contains `Rc<RefCell<...>>` for arrays and objects, which cannot be sent across threads. Instead of adding `Arc` alternatives, a separate bridge type that is fully `Clone + Send` provides a clean serialization point. This also enforces Lin's spec requirement (§32.4) that async thunk return types must be JSON-compatible.
+
+**Consequence**: Closures, iterators, promises, workers, and thread pools cannot be returned from async thunks (they fail `to_json_value()` with an error). Deep copies are made at the thread boundary. For large objects this is O(size) but is unavoidable given the `Rc`-based value representation.
+
+## ADR-030: IO/FS/HTTP implemented as native intrinsics with interpreter dispatch
+
+**Decision**: IO (`__ioReadLine`, `__ioReadAll`, `__ioLines`), filesystem (`__fsReadFile`, `__fsWriteFile`, `__fsAppendFile`, `__fsReadLines`, `__fsExists`, `__fsReadJson`, `__fsWriteJson`), HTTP client (`__httpFetch`, `__httpFetchWith`), JSON parsing (`__parseJson`), and HTTP server (`__serverServe`, `__serverServeWithPool`, `__serverPathMatch`) are all implemented as Rust native functions registered in `register_intrinsics`. Functions that return interpreter-managed values (`__ioLines`, `__fsReadLines`, `__serverServe`, `__serverServeWithPool`) are registered as stub stubs and dispatched through `call_value`'s special-name dispatch, following the same pattern as the concurrency builtins.
+
+**Rationale**: The `NativeFn` type is `fn(&[Value]) -> Result<Value, String>` — a bare function pointer with no captures. IO operations that need complex state (file handles, stdin), the thread pool reference (for pool serve), or interpreter method calls (for calling the handler) cannot be expressed as a `NativeFn`. The call_value dispatch table (a `match name.as_str()` inside `NativeFunction` handling) provides a clean escape hatch for these cases, consistent with how `print`, `for`, `iter`, and the concurrency builtins work.
+
+**Consequence**: All IO/FS/HTTP is synchronous on the calling thread (no internal async). Programs can run IO in background threads via `async`/`threadPool`. The HTTP server blocks forever on the calling thread; typical usage is `async(() => serve(8080, handler))`. `tiny_http` was chosen as the server crate for its simplicity and zero-dependency feel (no tokio runtime needed).
+
+## ADR-031: `std/io`, `std/fs`, `std/http`, `std/server` as thin Lin wrappers
+
+**Decision**: Each IO module is a `.lin` file (`stdlib/io.lin`, `stdlib/fs.lin`, `stdlib/http.lin`, `stdlib/server.lin`) that re-exports `__*` intrinsics with clean names and provides Lin-level helpers (`fetchJson`, `postJson`, `json`, `text`, `parseBody`, etc.). They are registered via `include_str!` in `register_stdlib_sources` and loaded on demand when the user imports `std/io`, etc.
+
+**Rationale**: Following the existing pattern (ADR-009): keep the Rust intrinsics small and focused; provide the user-facing API in Lin. This means helpers like `fetchJson` (fetch + parseJson) and `pathMatch` routing can be written in Lin without touching Rust. The stdlib files are compiled once per interpreter session and cached by the module loader.
+
+**Consequence**: Users get `import { readFile, writeFile } from "std/fs"` etc. The intrinsics are not exported but are accessible as globals (registered in global env), so advanced users can call `__fsReadFile(path)` directly.
+
+## ADR-032: FFI syntax as `import foreign "<path>"` with indented type block
+
+**Decision**: Foreign function imports use `import foreign "<path>"` followed by an indented block of `val name: Type` declarations. The `foreign` keyword is added to the lexer. The parser reuses the existing indented-block machinery. The AST node is `Stmt::ForeignImport { path, bindings: Vec<ForeignBinding> }`. Each `ForeignBinding` carries the name, type annotation, and span.
+
+**Rationale**: Reusing `import` as the outer keyword makes foreign imports visually consistent with regular imports. The `foreign` keyword distinguishes them syntactically without introducing a separate statement form. The indented block mirrors function body parsing (ADR-014) and keeps all bindings visually grouped under the library path.
+
+**Consequence**: `import foreign "libmath.a"\n  val sqrt: (Float64) => Float64` parses correctly. The token `foreign` is now a reserved keyword and cannot be used as an identifier.
+
+## ADR-033: FFI interpreter stubs; full FFI requires the compiler
+
+**Decision**: In the tree-walking interpreter, each foreign binding is registered as a zero-arity `NativeFunction` stub that returns `Err("Foreign functions are not available in the interpreter; use \`lin build\` to compile")`. The codegen path emits real LLVM `declare` directives and stores the library paths in `Codegen::foreign_lib_paths` for the linker.
+
+**Rationale**: The interpreter cannot load `.a` or `.so` files at runtime without libffi or dlopen, which would add significant complexity. Since the primary value of FFI is in compiled binaries (for performance-critical C interop), stubs in the interpreter are sufficient for development testing. The interpreter stub gives a clear error message rather than a cryptic segfault.
+
+**Consequence**: `lin run` programs with `import foreign` can be loaded and type-checked but foreign functions will panic if called. `lin build` programs can call C functions correctly after linking. End-to-end FFI tests require the full `lin build` pipeline.
+
+## ADR-034: `async` var-capture check via global slot tracking
+
+**Decision**: The type checker rejects `async(f)` and `pool.async(f)` calls where the thunk `f` directly references any mutable `var` binding (either captured from a non-global outer scope, or referencing a global `var` from within the thunk body).
+
+Implementation:
+- `Checker` gains a `mutable_global_slots: HashMap<usize, String>` field, populated whenever a `Stmt::Var` is processed at global scope (when `function_scope_depths` is empty).
+- `first_mutable_capture(expr, mutable_globals)` checks a `TypedExpr::Function` for: (a) any `Capture` where `is_mutable == true`; (b) any `LocalGet` in the body that references a slot in `mutable_global_slots`. Body scanning does not recurse into nested `Function` nodes (inner lambdas have their own capture check when their own `async` call is analysed).
+- In `infer_call`, after building `typed_args`, if `func == Ident("async")`, every thunk argument is checked. Same check on the thunk args of `infer_dot_call` when `method == "async"`.
+- The check also registers the concurrency builtins (`async`, `await`, `parallel`, `race`, `timeout`, `retry`, `threadPool`, `worker`) as intrinsics in `register_intrinsics()` using `TypeVar`-based signatures, so they resolve instead of producing "Undefined variable" errors.
+
+**Rationale**: Sharing mutable state across OS threads without synchronisation leads to data races. Lin's `var` is captured by `Rc<RefCell<Value>>` in the interpreter and by pointer in the compiler — neither is `Send`. The spec (§32.2) requires a compile-time error. Global vars are not recorded as "captures" (they're accessed directly via `LocalGet` with slot from global env), so a two-pronged check is needed.
+
+**Consequence**: `async(() => counter = counter + 1)` where `counter` is a `var` produces a compile-time error with a help message suggesting snapshot capture. `async(() => message)` where `message` is a `val` is allowed.
+
+## ADR-035: Match arm narrowing via scope-shadowing
+
+**Decision**: In `check_match_arm`, when the pattern is `Is(TypeCheck(narrowed_ty))` and the scrutinee is a simple `Ident(name)`, the checker defines a new binding `name: narrowed_ty` in the arm's scope. This shadows the outer binding for the duration of the arm body, giving the narrowed type to all references to the scrutinee within that arm.
+
+**Rationale**: Using scope-shadowing instead of mutating the original binding avoids any state-management burden when leaving the arm scope: `pop_scope()` automatically removes the shadow. It also correctly handles nested scopes and captures within the arm body.
+
+**Consequence**: `match x is Int32 => x + 1` correctly type-checks because `x` inside the arm body resolves to the arm-scope `x: Int32`, not the outer `x: Int32 | String`.
+
+## ADR-036: `async(array)` overload in interpreter
+
+**Decision**: `builtin_async` detects `Value::Array` as its input and spawns one thread per element, returning an array of `Promise` values. This mirrors the type-level overload already modelled in the checker (`async` accepts `Function | Function[]`).
+
+**Rationale**: `await(async([thunk1, thunk2, ...]))` is the natural idiom for fork-join concurrency. Without the array overload, users would need to call `async(thunk)` individually and collect results manually. The overload also enables the `test_concurrent_async_fetchjson_no_data_races` test.
+
+**Consequence**: `async([() => fetch(url1), () => fetch(url2)])` spawns two threads and returns two promises in order. `await` on the resulting array blocks until all complete.
+
+## ADR-037: FFI stub arity derived from declared type
+
+**Decision**: When the interpreter registers an `import foreign` binding as a stub, it reads the declared `TypeExpr::Function(params, ...)` to determine the arity, instead of hardcoding `arity: 0`. This allows call-site arity checks to pass during interpreter execution, so the stub's error message is reached instead of "Too many arguments".
+
+**Rationale**: The interpreter stub is meant to give a clear diagnostic when FFI functions are called. If the arity doesn't match the declared signature, the interpreter would error before reaching the stub's message, creating confusing diagnostics.
+
+**Consequence**: `import foreign "lib.a"\n  val add: (Int32, Int32) => Int32\nadd(1, 2)` now correctly produces "Foreign functions are not available in the interpreter" rather than "Too many arguments".

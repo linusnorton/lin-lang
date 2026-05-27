@@ -1,0 +1,7 @@
+---
+source: crates/lin-check/tests/snapshots.rs
+expression: errors
+---
+[
+    "Function body has type Int32, declared return type is String",
+]

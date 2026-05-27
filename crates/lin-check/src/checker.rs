@@ -4,7 +4,7 @@ use lin_parse::ast::{
     BinOp, Expr, MatchArm, MatchPattern, Module, ObjectField, Param, Pattern, Stmt, StringPart,
 };
 
-use crate::compat::is_compatible;
+use crate::compat::is_compatible_env;
 use crate::env::TypeEnv;
 use crate::resolve::resolve_type;
 use crate::typed_ir::*;
@@ -70,6 +70,8 @@ pub struct Checker {
     /// Global accumulator of TypeVar solutions discovered during inference.
     /// Populated by every call to collect_type_subs. Used by the zonking pass.
     solved_type_vars: std::collections::HashMap<u32, Type>,
+    /// Slots of mutable global (`var`) bindings. Used by the async var-capture check.
+    mutable_global_slots: std::collections::HashMap<usize, String>,
 }
 
 impl Checker {
@@ -86,11 +88,16 @@ impl Checker {
             span_type_map: Vec::new(),
             import_types: std::collections::HashMap::new(),
             solved_type_vars: std::collections::HashMap::new(),
+            mutable_global_slots: std::collections::HashMap::new(),
         }
     }
 
     pub fn check_module(&mut self, module: &Module) -> Result<TypedModule, Vec<Diagnostic>> {
         self.register_intrinsics();
+
+        // Pre-scan: forward-declare all top-level type aliases as Named placeholders
+        // so that recursive types (type Tree = { ..., children: Tree[] }) can be resolved.
+        self.forward_declare_types(module);
 
         // Pre-scan: forward-declare all top-level val bindings whose RHS is a
         // function literal so mutual recursion works (mirrors ADR-015).
@@ -121,6 +128,10 @@ impl Checker {
 
     pub fn diagnostics(&self) -> &[Diagnostic] {
         &self.diagnostics
+    }
+
+    fn types_compatible(&self, value: &Type, target: &Type) -> bool {
+        is_compatible_env(value, target, Some(&self.env), &mut 0)
     }
 
     fn check_stmt(&mut self, stmt: &Stmt) -> Result<TypedStmt, Diagnostic> {
@@ -237,6 +248,10 @@ impl Checker {
 
                 let ty = expected.unwrap_or_else(|| typed_value.ty());
                 let slot = self.env.define(name.clone(), ty.clone(), true);
+                // Track mutable globals for the async var-capture check.
+                if self.function_scope_depths.is_empty() {
+                    self.mutable_global_slots.insert(slot, name.clone());
+                }
 
                 Ok(TypedStmt::Var {
                     slot,
@@ -252,6 +267,8 @@ impl Checker {
                 span,
                 ..
             } => {
+                // The placeholder was registered in forward_declare_types.
+                // Now resolve the actual body; self-references stay as Named(name) (cycle guard).
                 let resolved = resolve_type(body, &self.env)
                     .map_err(|e| Diagnostic::error(*span, e))?;
                 self.env
@@ -285,6 +302,27 @@ impl Checker {
                     span: *span,
                 })
             }
+            Stmt::ForeignImport { path, bindings, span } => {
+                let mut foreign_slots = Vec::new();
+                for binding in bindings {
+                    let ty = resolve_type(&binding.type_ann, &self.env)
+                        .map_err(|e| Diagnostic::error(binding.span, e))?;
+                    let valid = is_legal_ffi_type(&ty);
+                    if !valid {
+                        self.diagnostics.push(Diagnostic::error(
+                            binding.span,
+                            format!("Foreign binding '{}' has illegal FFI type '{}'; only numeric primitives, Boolean, Null (return only), and String (argument only) are allowed (spec §34.3)", binding.name, ty),
+                        ));
+                    }
+                    let slot = self.env.define(binding.name.clone(), ty.clone(), false);
+                    foreign_slots.push(ForeignSlot { name: binding.name.clone(), slot, ty, valid });
+                }
+                Ok(TypedStmt::ForeignImport {
+                    path: path.clone(),
+                    bindings: foreign_slots,
+                    span: *span,
+                })
+            }
             Stmt::Expr(expr) => {
                 let typed = self.infer_expr(expr)?;
                 Ok(TypedStmt::Expr(typed))
@@ -302,7 +340,7 @@ impl Checker {
         let inferred = self.infer_expr(expr)?;
         let actual_ty = inferred.ty();
 
-        if !is_compatible(&actual_ty, expected) {
+        if !self.types_compatible(&actual_ty, expected) {
             return Err(Diagnostic::error(
                 expr.span(),
                 format!("Expected type {}, got {}", expected, actual_ty),
@@ -450,9 +488,9 @@ impl Checker {
         let typed_else = self.infer_expr(else_branch)?;
         let then_ty = typed_then.ty();
         let else_ty = typed_else.ty();
-        let result_type = if is_compatible(&then_ty, &else_ty) {
+        let result_type = if self.types_compatible(&then_ty, &else_ty) {
             else_ty
-        } else if is_compatible(&else_ty, &then_ty) {
+        } else if self.types_compatible(&else_ty, &then_ty) {
             then_ty
         } else {
             Type::flatten_union(vec![then_ty, else_ty])
@@ -469,10 +507,16 @@ impl Checker {
     fn infer_match(&mut self, scrutinee: &Expr, arms: &[MatchArm], span: Span) -> Result<TypedExpr, Diagnostic> {
         let typed_scrutinee = self.infer_expr(scrutinee)?;
         let scrutinee_ty = typed_scrutinee.ty();
+        // Extract the scrutinee variable name for narrowing, if it's a simple identifier.
+        let scrutinee_name = if let Expr::Ident(name, _) = scrutinee {
+            Some(name.as_str())
+        } else {
+            None
+        };
         let mut typed_arms = Vec::new();
         let mut arm_types = Vec::new();
         for arm in arms {
-            let typed_arm = self.check_match_arm(arm, &scrutinee_ty)?;
+            let typed_arm = self.check_match_arm(arm, &scrutinee_ty, scrutinee_name)?;
             arm_types.push(typed_arm.body.ty());
             typed_arms.push(typed_arm);
         }
@@ -707,7 +751,7 @@ impl Checker {
                     typed_args.iter().zip(concrete_params.iter()).enumerate()
                 {
                     let arg_ty = arg.ty();
-                    if !is_compatible(&arg_ty, param_ty) {
+                    if !self.types_compatible(&arg_ty, param_ty) {
                         return Err(Diagnostic::error(
                             args[i].span(),
                             format!(
@@ -751,6 +795,40 @@ impl Checker {
                 }
             }
         };
+
+        // var-capture check and transferability check for `async(f)` / `async(fs)`.
+        if let Expr::Ident(name, _) = func {
+            if name == "async" {
+                let globals = self.mutable_global_slots.clone();
+                for arg in &typed_args {
+                    if let Some(var_name) = first_mutable_capture(arg, &globals) {
+                        self.diagnostics.push(Diagnostic::error(
+                            span,
+                            format!(
+                                "async thunk captures mutable variable '{}' — sharing mutable state across threads is not allowed",
+                                var_name
+                            ),
+                        ).with_help("capture an immutable copy: `val snap = {}; async(() => snap)`".to_string()));
+                    }
+                    // Transferability: thunk return type must not be Function/Iterator/etc.
+                    let ret_ty = match arg.ty() {
+                        Type::Function { ret, .. } => Some(*ret),
+                        _ => None,
+                    };
+                    if let Some(ret) = ret_ty {
+                        if is_definitely_non_transferable(&ret) {
+                            self.diagnostics.push(Diagnostic::error(
+                                span,
+                                format!(
+                                    "async thunk returns non-transferable type '{}' — async results must be JSON-compatible values",
+                                    ret
+                                ),
+                            ).with_help("return a JSON-serializable value (String, Boolean, Null, numeric, array, or object)".to_string()));
+                        }
+                    }
+                }
+            }
+        }
 
         let is_tail = self.is_tail_call(func);
 
@@ -835,6 +913,22 @@ impl Checker {
                     concrete_ret
                 };
 
+                // var-capture check for pool.async(f) / pool.async(fs).
+                if method == "async" {
+                    let globals = self.mutable_global_slots.clone();
+                    for arg in &all_args[1..] {
+                        if let Some(var_name) = first_mutable_capture(arg, &globals) {
+                            self.diagnostics.push(Diagnostic::error(
+                                span,
+                                format!(
+                                    "async thunk captures mutable variable '{}' — sharing mutable state across threads is not allowed",
+                                    var_name
+                                ),
+                            ).with_help("capture an immutable copy: `val snap = {}; pool.async(() => snap)`".to_string()));
+                        }
+                    }
+                }
+
                 let info = self.env.lookup(method).unwrap();
                 let func_expr = TypedExpr::LocalGet { slot: info.slot, ty: method_ty, span };
                 return Ok(TypedExpr::Call {
@@ -852,6 +946,21 @@ impl Checker {
         if let Some(arg_exprs) = args {
             for arg in arg_exprs {
                 all_args.push(self.infer_expr(arg)?);
+            }
+        }
+        // var-capture check for pool.async(f) / pool.async(fs) (fallback path).
+        if method == "async" {
+            let globals = self.mutable_global_slots.clone();
+            for arg in &all_args[1..] {
+                if let Some(var_name) = first_mutable_capture(arg, &globals) {
+                    self.diagnostics.push(Diagnostic::error(
+                        span,
+                        format!(
+                            "async thunk captures mutable variable '{}' — sharing mutable state across threads is not allowed",
+                            var_name
+                        ),
+                    ).with_help("capture an immutable copy: `val snap = {}; pool.async(() => snap)`".to_string()));
+                }
             }
         }
         if let Some(ty) = self.env.effective_type(method) {
@@ -938,7 +1047,7 @@ impl Checker {
 
         let ret_type = if let Some(ref rt) = return_type {
             let declared = resolve_type(rt, &self.env).map_err(|e| Diagnostic::error(span, e))?;
-            if !is_compatible(&body_ty, &declared) {
+            if !self.types_compatible(&body_ty, &declared) {
                 return Err(Diagnostic::error(
                     span,
                     format!(
@@ -1017,7 +1126,7 @@ impl Checker {
 
         let ret_type = if let Some(ref rt) = return_type {
             let declared = resolve_type(rt, &self.env).map_err(|e| Diagnostic::error(span, e))?;
-            if !is_compatible(&body_ty, &declared) {
+            if !self.types_compatible(&body_ty, &declared) {
                 return Err(Diagnostic::error(span, format!(
                     "Function body has type {}, declared return type is {}", body_ty, declared
                 )));
@@ -1041,12 +1150,18 @@ impl Checker {
         &mut self,
         arm: &lin_parse::ast::MatchArm,
         scrutinee_ty: &Type,
+        scrutinee_name: Option<&str>,
     ) -> Result<TypedMatchArm, Diagnostic> {
         self.env.push_scope();
 
         let typed_pattern = match &arm.pattern {
             MatchPattern::Is(pat) => {
-                TypedMatchPattern::Is(self.check_pattern(pat, scrutinee_ty)?)
+                let tp = self.check_pattern(pat, scrutinee_ty)?;
+                // Narrow the scrutinee variable within this arm's scope.
+                if let (Some(name), TypedPattern::TypeCheck(ref narrowed_ty, _)) = (scrutinee_name, &tp) {
+                    self.env.define(name.to_string(), narrowed_ty.clone(), false);
+                }
+                TypedMatchPattern::Is(tp)
             }
             MatchPattern::Has(pat) => {
                 TypedMatchPattern::Has(self.check_pattern(pat, scrutinee_ty)?)
@@ -1273,6 +1388,25 @@ impl Checker {
 
     /// Forward-declare top-level `val name = (...) => ...` functions so that
     /// they can call each other (mutual recursion, ADR-015 equivalent).
+    /// Pre-register all top-level type aliases as Named(name) placeholders.
+    /// This allows recursive types to be resolved: when `type Tree = { ..., children: Tree[] }`
+    /// is resolved, the occurrence of `Tree` in the body will be already in the env.
+    fn forward_declare_types(&mut self, module: &Module) {
+        for stmt in &module.statements {
+            if let Stmt::TypeDecl { name, params, .. } = stmt {
+                // Register a placeholder body of Named(name) for now; the real body
+                // will be resolved and replaced when check_stmt processes TypeDecl.
+                // Using Named(name) as the placeholder means self-references in the body
+                // will be detected by the cycle guard in resolve.rs and left as Named(name).
+                self.env.define_type(
+                    name.clone(),
+                    params.clone(),
+                    Type::Named(name.clone()),
+                );
+            }
+        }
+    }
+
     fn forward_declare_functions(&mut self, module: &Module) {
         for stmt in &module.statements {
             if let Stmt::Val { pattern, value, .. } = stmt {
@@ -1515,6 +1649,200 @@ impl Checker {
         self.define_intrinsic("__toInt32",     Type::Function { params: vec![Type::Float64], ret: Box::new(Type::Int32) });
         self.define_intrinsic("__toFloat64",   Type::Function { params: vec![Type::Int32], ret: Box::new(Type::Float64) });
         self.define_intrinsic("__isInt32",     Type::Function { params: vec![Type::Str], ret: Box::new(Type::Bool) });
+
+        // Concurrency intrinsics (spec §32)
+        // async: (() => T) => Promise<T>  (TypeVar-based, overloaded: also accepts T[])
+        let promise_t = Type::TypeVar(9100);
+        self.define_intrinsic("async", Type::Function {
+            params: vec![Type::Union(vec![
+                Type::Function { params: vec![], ret: Box::new(promise_t.clone()) },
+                Type::Array(Box::new(Type::Function { params: vec![], ret: Box::new(promise_t.clone()) })),
+            ])],
+            ret: Box::new(Type::TypeVar(9100)),
+        });
+        // await: accepts a promise or array of promises
+        self.define_intrinsic("await", Type::Function {
+            params: vec![Type::TypeVar(9101)],
+            ret: Box::new(Type::TypeVar(9101)),
+        });
+        // parallel: variadic — modelled as ((() => T)[]) => T[]
+        self.define_intrinsic("parallel", Type::Function {
+            params: vec![Type::Array(Box::new(Type::Function {
+                params: vec![],
+                ret: Box::new(Type::TypeVar(9102)),
+            }))],
+            ret: Box::new(Type::Array(Box::new(Type::TypeVar(9102)))),
+        });
+        // race: Promise[] => Promise
+        self.define_intrinsic("race", Type::Function {
+            params: vec![Type::Array(Box::new(Type::TypeVar(9103)))],
+            ret: Box::new(Type::TypeVar(9103)),
+        });
+        // timeout: (Promise, Int32) => Promise
+        self.define_intrinsic("timeout", Type::Function {
+            params: vec![Type::TypeVar(9104), Type::Int32],
+            ret: Box::new(Type::TypeVar(9104)),
+        });
+        // retry: (() => T, Int32) => Promise<T>
+        self.define_intrinsic("retry", Type::Function {
+            params: vec![
+                Type::Function { params: vec![], ret: Box::new(Type::TypeVar(9105)) },
+                Type::Int32,
+            ],
+            ret: Box::new(Type::TypeVar(9105)),
+        });
+        // threadPool: (Int32) => ThreadPool
+        self.define_intrinsic("threadPool", Type::Function {
+            params: vec![Type::Int32],
+            ret: Box::new(Type::TypeVar(9106)),
+        });
+        // worker: ((Msg) => Reply, () => Null) => Worker
+        self.define_intrinsic("worker", Type::Function {
+            params: vec![
+                Type::Function { params: vec![Type::TypeVar(9107)], ret: Box::new(Type::TypeVar(9108)) },
+                Type::Function { params: vec![], ret: Box::new(Type::Null) },
+            ],
+            ret: Box::new(Type::TypeVar(9109)),
+        });
+        // IO/fs/http/server intrinsics
+        self.define_intrinsic("__ioReadLine",    Type::Function { params: vec![], ret: Box::new(Type::Union(vec![Type::Str, Type::Null])) });
+        self.define_intrinsic("__ioReadAll",     Type::Function { params: vec![], ret: Box::new(Type::Str) });
+        self.define_intrinsic("__ioLines",       Type::Function { params: vec![], ret: Box::new(Type::Array(Box::new(Type::Str))) });
+        self.define_intrinsic("__fsReadFile",    Type::Function { params: vec![Type::Str], ret: Box::new(Type::Union(vec![Type::Str, Type::TypeVar(u32::MAX)])) });
+        self.define_intrinsic("__fsWriteFile",   Type::Function { params: vec![Type::Str, Type::Str], ret: Box::new(Type::Null) });
+        self.define_intrinsic("__fsAppendFile",  Type::Function { params: vec![Type::Str, Type::Str], ret: Box::new(Type::Null) });
+        self.define_intrinsic("__fsReadLines",   Type::Function { params: vec![Type::Str], ret: Box::new(Type::Array(Box::new(Type::Str))) });
+        self.define_intrinsic("__fsReadJson",    Type::Function { params: vec![Type::Str], ret: Box::new(Type::TypeVar(u32::MAX)) });
+        self.define_intrinsic("__fsWriteJson",   Type::Function { params: vec![Type::Str, Type::TypeVar(u32::MAX)], ret: Box::new(Type::Null) });
+        self.define_intrinsic("__fsExists",      Type::Function { params: vec![Type::Str], ret: Box::new(Type::Bool) });
+        self.define_intrinsic("__parseJson",     Type::Function { params: vec![Type::Str], ret: Box::new(Type::TypeVar(u32::MAX)) });
+        self.define_intrinsic("__httpFetch",     Type::Function { params: vec![Type::Str], ret: Box::new(Type::TypeVar(u32::MAX)) });
+        self.define_intrinsic("__httpFetchWith", Type::Function { params: vec![Type::Str, Type::TypeVar(u32::MAX)], ret: Box::new(Type::TypeVar(u32::MAX)) });
+        self.define_intrinsic("__serverServe",           Type::Function { params: vec![Type::Int32, Type::TypeVar(u32::MAX)], ret: Box::new(Type::Null) });
+        self.define_intrinsic("__serverServeWithPool",   Type::Function { params: vec![Type::Int32, Type::TypeVar(u32::MAX), Type::TypeVar(u32::MAX)], ret: Box::new(Type::Null) });
+        self.define_intrinsic("__serverPathMatch",       Type::Function { params: vec![Type::Str, Type::Str], ret: Box::new(Type::TypeVar(u32::MAX)) });
+    }
+}
+
+/// Returns true if `ty` is definitely non-transferable across thread boundaries.
+/// Non-transferable: Function, Iterator, Never.
+/// TypeVar (unknown), Promise/Worker/ThreadPool (TypeVar-resolved), are not flagged —
+/// we only reject types we can statically prove are non-transferable (spec §32.3).
+fn is_definitely_non_transferable(ty: &Type) -> bool {
+    match ty {
+        Type::Function { .. } | Type::Iterator(_) | Type::Never => true,
+        Type::Array(inner) => is_definitely_non_transferable(inner),
+        Type::Union(ts) => ts.iter().any(is_definitely_non_transferable),
+        _ => false,
+    }
+}
+
+/// Returns true if `ty` is a legal FFI value type per spec §34.3.
+/// Legal: Int8–Int64, UInt8–UInt64, Float32, Float64, Boolean, Null, String.
+fn is_legal_ffi_value_type(ty: &Type) -> bool {
+    matches!(ty,
+        Type::Int8 | Type::Int16 | Type::Int32 | Type::Int64
+        | Type::UInt8 | Type::UInt16 | Type::UInt32 | Type::UInt64
+        | Type::Float32 | Type::Float64
+        | Type::Bool | Type::Null | Type::Str
+    )
+}
+
+/// Returns true if `ty` is a legal FFI binding type per spec §34.3.
+/// The binding must be a function type whose params and return are legal value types.
+fn is_legal_ffi_type(ty: &Type) -> bool {
+    match ty {
+        Type::Function { params, ret } => {
+            params.iter().all(is_legal_ffi_value_type) && is_legal_ffi_value_type(ret)
+        }
+        _ => false,
+    }
+}
+
+/// Returns the name of the first mutable capture (or global var reference) found in a
+/// directly-nested `TypedExpr::Function`, or `None` if there are none.
+/// Does NOT recurse into inner functions.
+fn first_mutable_capture(
+    expr: &TypedExpr,
+    mutable_globals: &std::collections::HashMap<usize, String>,
+) -> Option<String> {
+    match expr {
+        TypedExpr::Function { captures, body, .. } => {
+            // Check explicit captures (non-global vars captured from outer scope).
+            if let Some(c) = captures.iter().find(|c| c.is_mutable) {
+                return Some(c.name.clone());
+            }
+            // Check if the body references any mutable global slot.
+            first_mutable_global_in_body(body, mutable_globals)
+        }
+        TypedExpr::MakeArray { elements, .. } => {
+            elements.iter().find_map(|e| first_mutable_capture(e, mutable_globals))
+        }
+        _ => None,
+    }
+}
+
+/// Walk a `TypedExpr` body looking for a `LocalGet` that references a mutable global slot.
+/// Stops at nested function boundaries (does not recurse into `TypedExpr::Function`).
+fn first_mutable_global_in_body(
+    expr: &TypedExpr,
+    mutable_globals: &std::collections::HashMap<usize, String>,
+) -> Option<String> {
+    match expr {
+        TypedExpr::LocalGet { slot, .. } => mutable_globals.get(slot).cloned(),
+        TypedExpr::LocalSet { slot, value, .. } => {
+            mutable_globals.get(slot).cloned()
+                .or_else(|| first_mutable_global_in_body(value, mutable_globals))
+        }
+        TypedExpr::Function { .. } => None, // don't recurse into nested functions
+        TypedExpr::BinaryOp { left, right, .. } => {
+            first_mutable_global_in_body(left, mutable_globals)
+                .or_else(|| first_mutable_global_in_body(right, mutable_globals))
+        }
+        TypedExpr::Call { func, args, .. } => {
+            first_mutable_global_in_body(func, mutable_globals)
+                .or_else(|| args.iter().find_map(|a| first_mutable_global_in_body(a, mutable_globals)))
+        }
+        TypedExpr::If { cond, then_br, else_br, .. } => {
+            first_mutable_global_in_body(cond, mutable_globals)
+                .or_else(|| first_mutable_global_in_body(then_br, mutable_globals))
+                .or_else(|| first_mutable_global_in_body(else_br, mutable_globals))
+        }
+        TypedExpr::Block { stmts, expr, .. } => {
+            stmts.iter().find_map(|s| match s {
+                TypedStmt::Val { value, .. } | TypedStmt::Var { value, .. } => {
+                    first_mutable_global_in_body(value, mutable_globals)
+                }
+                TypedStmt::Expr(e) => first_mutable_global_in_body(e, mutable_globals),
+                _ => None,
+            }).or_else(|| first_mutable_global_in_body(expr, mutable_globals))
+        }
+        TypedExpr::MakeObject { fields, spreads, .. } => {
+            fields.iter().find_map(|(_, v)| first_mutable_global_in_body(v, mutable_globals))
+                .or_else(|| spreads.iter().find_map(|s| first_mutable_global_in_body(s, mutable_globals)))
+        }
+        TypedExpr::MakeArray { elements, .. } => {
+            elements.iter().find_map(|e| first_mutable_global_in_body(e, mutable_globals))
+        }
+        TypedExpr::Index { object, key, .. } => {
+            first_mutable_global_in_body(object, mutable_globals)
+                .or_else(|| first_mutable_global_in_body(key, mutable_globals))
+        }
+        TypedExpr::FieldGet { object, .. } => first_mutable_global_in_body(object, mutable_globals),
+        TypedExpr::Match { scrutinee, arms, .. } => {
+            first_mutable_global_in_body(scrutinee, mutable_globals)
+                .or_else(|| arms.iter().find_map(|a| {
+                    a.guard.as_ref().and_then(|g| first_mutable_global_in_body(g, mutable_globals))
+                        .or_else(|| first_mutable_global_in_body(&a.body, mutable_globals))
+                }))
+        }
+        TypedExpr::StringInterp { parts, .. } => {
+            parts.iter().find_map(|p| match p {
+                TypedStringPart::Expr(e) => first_mutable_global_in_body(e, mutable_globals),
+                _ => None,
+            })
+        }
+        _ => None,
     }
 }
 

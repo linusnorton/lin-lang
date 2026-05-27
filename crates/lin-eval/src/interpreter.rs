@@ -1,6 +1,7 @@
 use std::rc::Rc;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use indexmap::IndexMap;
 
 use lin_lex::Lexer;
@@ -53,6 +54,9 @@ impl Interpreter {
         self.stdlib_sources.insert("std/array".to_string(), include_str!("../../../stdlib/array.lin"));
         self.stdlib_sources.insert("std/iter".to_string(), include_str!("../../../stdlib/iter.lin"));
         self.stdlib_sources.insert("std/result".to_string(), include_str!("../../../stdlib/result.lin"));
+        self.stdlib_sources.insert("std/fs".to_string(), include_str!("../../../stdlib/fs.lin"));
+        self.stdlib_sources.insert("std/http".to_string(), include_str!("../../../stdlib/http.lin"));
+        self.stdlib_sources.insert("std/server".to_string(), include_str!("../../../stdlib/server.lin"));
     }
 
     fn preload_stdlib(&mut self) {
@@ -361,6 +365,310 @@ impl Interpreter {
                 _ => Err("__toFloat64: unsupported type".to_string()),
             }
         });
+
+        // Concurrency intrinsics — the actual implementation is in call_value dispatch above.
+        // We register them as 1-arg stubs so they are callable; the real dispatch intercepts them.
+        self.define_native("async", 1, |_| Ok(Value::Null));
+        self.define_native("await", 1, |_| Ok(Value::Null));
+        self.define_native("parallel", 1, |_| Ok(Value::Null));
+        self.define_native("race", 1, |_| Ok(Value::Null));
+        self.define_native("timeout", 2, |_| Ok(Value::Null));
+        self.define_native("retry", 2, |_| Ok(Value::Null));
+        self.define_native("threadPool", 1, |_| Ok(Value::Null));
+        self.define_native("worker", 2, |_| Ok(Value::Null));
+
+        // IO intrinsics
+        self.define_native("__ioReadLine", 0, |_| {
+            use std::io::BufRead;
+            let stdin = std::io::stdin();
+            let mut line = String::new();
+            match stdin.lock().read_line(&mut line) {
+                Ok(0) => Ok(Value::Null), // EOF
+                Ok(_) => {
+                    if line.ends_with('\n') { line.pop(); }
+                    if line.ends_with('\r') { line.pop(); }
+                    Ok(Value::String(Rc::new(line)))
+                }
+                Err(e) => Err(format!("__ioReadLine: {}", e)),
+            }
+        });
+
+        self.define_native("__ioReadAll", 0, |_| {
+            use std::io::Read;
+            let mut content = String::new();
+            std::io::stdin().read_to_string(&mut content)
+                .map_err(|e| format!("__ioReadAll: {}", e))?;
+            Ok(Value::String(Rc::new(content)))
+        });
+
+        // Filesystem intrinsics
+        self.define_native("__fsReadFile", 1, |args| {
+            match &args[0] {
+                Value::String(path) => {
+                    match std::fs::read_to_string(path.as_str()) {
+                        Ok(content) => Ok(Value::String(Rc::new(content))),
+                        Err(e) => {
+                            let mut map = indexmap::IndexMap::new();
+                            map.insert("type".to_string(), Value::String(Rc::new("error".to_string())));
+                            map.insert("message".to_string(), Value::String(Rc::new(e.to_string())));
+                            Ok(Value::Object(Rc::new(RefCell::new(map))))
+                        }
+                    }
+                }
+                _ => Err("__fsReadFile: expected String path".to_string()),
+            }
+        });
+
+        self.define_native("__fsWriteFile", 2, |args| {
+            match (&args[0], &args[1]) {
+                (Value::String(path), Value::String(content)) => {
+                    match std::fs::write(path.as_str(), content.as_str()) {
+                        Ok(_) => Ok(Value::Null),
+                        Err(e) => {
+                            let mut map = indexmap::IndexMap::new();
+                            map.insert("type".to_string(), Value::String(Rc::new("error".to_string())));
+                            map.insert("message".to_string(), Value::String(Rc::new(e.to_string())));
+                            Ok(Value::Object(Rc::new(RefCell::new(map))))
+                        }
+                    }
+                }
+                _ => Err("__fsWriteFile: expected (String, String)".to_string()),
+            }
+        });
+
+        self.define_native("__fsAppendFile", 2, |args| {
+            use std::io::Write;
+            match (&args[0], &args[1]) {
+                (Value::String(path), Value::String(content)) => {
+                    use std::fs::OpenOptions;
+                    match OpenOptions::new().append(true).create(true).open(path.as_str()) {
+                        Ok(mut file) => {
+                            match file.write_all(content.as_bytes()) {
+                                Ok(_) => Ok(Value::Null),
+                                Err(e) => {
+                                    let mut map = indexmap::IndexMap::new();
+                                    map.insert("type".to_string(), Value::String(Rc::new("error".to_string())));
+                                    map.insert("message".to_string(), Value::String(Rc::new(e.to_string())));
+                                    Ok(Value::Object(Rc::new(RefCell::new(map))))
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let mut map = indexmap::IndexMap::new();
+                            map.insert("type".to_string(), Value::String(Rc::new("error".to_string())));
+                            map.insert("message".to_string(), Value::String(Rc::new(e.to_string())));
+                            Ok(Value::Object(Rc::new(RefCell::new(map))))
+                        }
+                    }
+                }
+                _ => Err("__fsAppendFile: expected (String, String)".to_string()),
+            }
+        });
+
+        self.define_native("__fsExists", 1, |args| {
+            match &args[0] {
+                Value::String(path) => Ok(Value::Bool(std::path::Path::new(path.as_str()).exists())),
+                _ => Err("__fsExists: expected String path".to_string()),
+            }
+        });
+
+        self.define_native("__fsReadJson", 1, |args| {
+            match &args[0] {
+                Value::String(path) => {
+                    match std::fs::read_to_string(path.as_str()) {
+                        Err(e) => {
+                            let mut map = indexmap::IndexMap::new();
+                            map.insert("type".to_string(), Value::String(Rc::new("error".to_string())));
+                            map.insert("message".to_string(), Value::String(Rc::new(e.to_string())));
+                            Ok(Value::Object(Rc::new(RefCell::new(map))))
+                        }
+                        Ok(content) => {
+                            match parse_json_to_value(&content) {
+                                Ok(v) => Ok(v),
+                                Err(e) => {
+                                    let mut map = indexmap::IndexMap::new();
+                                    map.insert("type".to_string(), Value::String(Rc::new("error".to_string())));
+                                    map.insert("message".to_string(), Value::String(Rc::new(e)));
+                                    Ok(Value::Object(Rc::new(RefCell::new(map))))
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => Err("__fsReadJson: expected String path".to_string()),
+            }
+        });
+
+        self.define_native("__fsWriteJson", 2, |args| {
+            match &args[0] {
+                Value::String(path) => {
+                    let json_str = value_to_json_string(&args[1]);
+                    match std::fs::write(path.as_str(), json_str) {
+                        Ok(_) => Ok(Value::Null),
+                        Err(e) => {
+                            let mut map = indexmap::IndexMap::new();
+                            map.insert("type".to_string(), Value::String(Rc::new("error".to_string())));
+                            map.insert("message".to_string(), Value::String(Rc::new(e.to_string())));
+                            Ok(Value::Object(Rc::new(RefCell::new(map))))
+                        }
+                    }
+                }
+                _ => Err("__fsWriteJson: expected (String, Json)".to_string()),
+            }
+        });
+
+        self.define_native("__parseJson", 1, |args| {
+            match &args[0] {
+                Value::String(s) => {
+                    match parse_json_to_value(s.as_str()) {
+                        Ok(v) => Ok(v),
+                        Err(e) => {
+                            let mut map = indexmap::IndexMap::new();
+                            map.insert("type".to_string(), Value::String(Rc::new("error".to_string())));
+                            map.insert("message".to_string(), Value::String(Rc::new(e)));
+                            Ok(Value::Object(Rc::new(RefCell::new(map))))
+                        }
+                    }
+                }
+                _ => Err("__parseJson: expected String".to_string()),
+            }
+        });
+
+        // __ioLines and __fsReadLines need interpreter dispatch (they return lazy iterators)
+        self.define_native("__ioLines", 0, |_| Ok(Value::Null));
+        self.define_native("__fsReadLines", 1, |_| Ok(Value::Null));
+
+        // Server intrinsics — dispatched via call_value
+        self.define_native("__serverServe", 2, |_| Ok(Value::Null));
+        self.define_native("__serverServeWithPool", 3, |_| Ok(Value::Null));
+        self.define_native("__serverPathMatch", 2, |args| {
+            match (&args[0], &args[1]) {
+                (Value::String(pattern), Value::String(path)) => {
+                    let pat_parts: Vec<&str> = pattern.split('/').collect();
+                    let path_parts: Vec<&str> = path.split('/').collect();
+                    if pat_parts.len() != path_parts.len() {
+                        return Ok(Value::Null);
+                    }
+                    let mut captures = indexmap::IndexMap::new();
+                    for (pp, pv) in pat_parts.iter().zip(path_parts.iter()) {
+                        if let Some(name) = pp.strip_prefix(':') {
+                            captures.insert(name.to_string(), Value::String(Rc::new(pv.to_string())));
+                        } else if pp != pv {
+                            return Ok(Value::Null);
+                        }
+                    }
+                    Ok(Value::Object(Rc::new(RefCell::new(captures))))
+                }
+                _ => Err("__serverPathMatch: expected (String, String)".to_string()),
+            }
+        });
+
+        // HTTP intrinsics
+        self.define_native("__httpFetch", 1, |args| {
+            match &args[0] {
+                Value::String(url) => {
+                    match ureq::get(url.as_str()).call() {
+                        Ok(response) => {
+                            let status = response.status() as i64;
+                            let headers_map = indexmap::IndexMap::new();
+                            let body = response.into_string()
+                                .unwrap_or_default();
+                            let mut map = indexmap::IndexMap::new();
+                            map.insert("status".to_string(), Value::Int(status));
+                            map.insert("headers".to_string(), Value::Object(Rc::new(RefCell::new(headers_map))));
+                            map.insert("body".to_string(), Value::String(Rc::new(body)));
+                            Ok(Value::Object(Rc::new(RefCell::new(map))))
+                        }
+                        Err(ureq::Error::Status(code, response)) => {
+                            let body = response.into_string().unwrap_or_default();
+                            let mut map = indexmap::IndexMap::new();
+                            map.insert("status".to_string(), Value::Int(code as i64));
+                            map.insert("headers".to_string(), Value::Object(Rc::new(RefCell::new(indexmap::IndexMap::new()))));
+                            map.insert("body".to_string(), Value::String(Rc::new(body)));
+                            Ok(Value::Object(Rc::new(RefCell::new(map))))
+                        }
+                        Err(e) => {
+                            let mut map = indexmap::IndexMap::new();
+                            map.insert("type".to_string(), Value::String(Rc::new("error".to_string())));
+                            map.insert("message".to_string(), Value::String(Rc::new(e.to_string())));
+                            Ok(Value::Object(Rc::new(RefCell::new(map))))
+                        }
+                    }
+                }
+                _ => Err("__httpFetch: expected String url".to_string()),
+            }
+        });
+
+        self.define_native("__httpFetchWith", 2, |args| {
+            match &args[0] {
+                Value::String(url) => {
+                    let opts = &args[1];
+                    let method = match opts {
+                        Value::Object(o) => {
+                            o.borrow().get("method")
+                                .and_then(|v| if let Value::String(s) = v { Some(s.as_str().to_uppercase()) } else { None })
+                                .unwrap_or_else(|| "GET".to_string())
+                        }
+                        _ => "GET".to_string(),
+                    };
+                    let body_str = match opts {
+                        Value::Object(o) => {
+                            o.borrow().get("body")
+                                .and_then(|v| if let Value::String(s) = v { Some(s.as_ref().clone()) } else { None })
+                        }
+                        _ => None,
+                    };
+                    let req = ureq::request(method.as_str(), url.as_str());
+                    // Add headers from opts["headers"] if present
+                    let req = if let Value::Object(o) = opts {
+                        if let Some(Value::Object(hdrs)) = o.borrow().get("headers").cloned() {
+                            let mut r = req;
+                            for (k, v) in hdrs.borrow().iter() {
+                                if let Value::String(vs) = v {
+                                    r = r.set(k.as_str(), vs.as_str());
+                                }
+                            }
+                            r
+                        } else {
+                            req
+                        }
+                    } else {
+                        req
+                    };
+                    let result = if let Some(body) = body_str {
+                        req.send_string(body.as_str())
+                    } else {
+                        req.call()
+                    };
+                    match result {
+                        Ok(response) => {
+                            let status = response.status() as i64;
+                            let body = response.into_string().unwrap_or_default();
+                            let mut map = indexmap::IndexMap::new();
+                            map.insert("status".to_string(), Value::Int(status));
+                            map.insert("headers".to_string(), Value::Object(Rc::new(RefCell::new(indexmap::IndexMap::new()))));
+                            map.insert("body".to_string(), Value::String(Rc::new(body)));
+                            Ok(Value::Object(Rc::new(RefCell::new(map))))
+                        }
+                        Err(ureq::Error::Status(code, response)) => {
+                            let body = response.into_string().unwrap_or_default();
+                            let mut map = indexmap::IndexMap::new();
+                            map.insert("status".to_string(), Value::Int(code as i64));
+                            map.insert("headers".to_string(), Value::Object(Rc::new(RefCell::new(indexmap::IndexMap::new()))));
+                            map.insert("body".to_string(), Value::String(Rc::new(body)));
+                            Ok(Value::Object(Rc::new(RefCell::new(map))))
+                        }
+                        Err(e) => {
+                            let mut map = indexmap::IndexMap::new();
+                            map.insert("type".to_string(), Value::String(Rc::new("error".to_string())));
+                            map.insert("message".to_string(), Value::String(Rc::new(e.to_string())));
+                            Ok(Value::Object(Rc::new(RefCell::new(map))))
+                        }
+                    }
+                }
+                _ => Err("__httpFetchWith: expected String url".to_string()),
+            }
+        });
     }
 
     fn error_at(&self, span: lin_common::Span, msg: &str) -> String {
@@ -450,6 +758,28 @@ impl Interpreter {
             Stmt::Import { bindings, path, .. } => {
                 self.eval_import(bindings, path)
             }
+            Stmt::ForeignImport { bindings, .. } => {
+                // Register each foreign binding as a stub function that errors at call time.
+                // Real FFI calls require the LLVM compiler pipeline.
+                fn foreign_stub(_: &[Value]) -> Result<Value, String> {
+                    Err("Foreign functions are not available in the interpreter; use `lin build` to compile".to_string())
+                }
+                for binding in bindings {
+                    // Derive arity from the declared function type so call-site arity checks pass.
+                    let arity = if let lin_parse::ast::TypeExpr::Function(params, _, _) = &binding.type_ann {
+                        params.len()
+                    } else { 0 };
+                    self.global_env.define(
+                        binding.name.clone(),
+                        Value::NativeFunction(Rc::new(NativeFunction {
+                            name: binding.name.clone(),
+                            arity,
+                            func: foreign_stub,
+                        })),
+                    );
+                }
+                Ok(Value::Null)
+            }
             Stmt::Expr(expr) => self.eval_expr_in_global(expr),
         }
     }
@@ -481,6 +811,7 @@ impl Interpreter {
                 Ok(val)
             }
             Stmt::TypeDecl { .. } => Ok(Value::Null),
+            Stmt::ForeignImport { .. } => Ok(Value::Null), // stubs registered in global scope
             Stmt::Import { bindings, path, .. } => {
                 let exports = self.load_module(path)?;
                 for binding in bindings {
@@ -592,6 +923,21 @@ impl Interpreter {
                     }
                 }
                 Stmt::TypeDecl { .. } => {}
+                Stmt::ForeignImport { bindings, .. } => {
+                    fn foreign_stub(_: &[Value]) -> Result<Value, String> {
+                        Err("Foreign functions are not available in the interpreter; use `lin build` to compile".to_string())
+                    }
+                    for binding in bindings {
+                        let arity = if let lin_parse::ast::TypeExpr::Function(params, _, _) = &binding.type_ann {
+                            params.len()
+                        } else { 0 };
+                        module_env.define(binding.name.clone(), Value::NativeFunction(Rc::new(NativeFunction {
+                            name: binding.name.clone(),
+                            arity,
+                            func: foreign_stub,
+                        })));
+                    }
+                }
                 Stmt::Expr(expr) => {
                     self.eval_expr_in_env(expr, &mut module_env)?;
                 }
@@ -666,6 +1012,68 @@ impl Interpreter {
 
             Expr::DotCall { receiver, method, args, span } => {
                 let recv = self.eval_expr_in_env(receiver, env)?;
+
+                // Method dispatch on concurrency primitives
+                match (&recv, method.as_str()) {
+                    (Value::ThreadPool(pool), "async") => {
+                        let extra_args: Vec<Value> = if let Some(a) = args {
+                            a.iter().map(|e| self.eval_expr_in_env(e, env)).collect::<Result<_, _>>()?
+                        } else { vec![] };
+                        return self.pool_async(&pool.clone(), &extra_args)
+                            .map_err(|e| self.error_at(*span, &e));
+                    }
+                    (Value::Worker(w), "message") => {
+                        let extra_args: Vec<Value> = if let Some(a) = args {
+                            a.iter().map(|e| self.eval_expr_in_env(e, env)).collect::<Result<_, _>>()?
+                        } else { vec![] };
+                        if extra_args.len() != 1 {
+                            return Err(self.error_at(*span, "worker.message expects 1 argument"));
+                        }
+                        return self.worker_message(&w.clone(), &extra_args[0])
+                            .map_err(|e| self.error_at(*span, &e));
+                    }
+                    (Value::Worker(w), "request") => {
+                        let extra_args: Vec<Value> = if let Some(a) = args {
+                            a.iter().map(|e| self.eval_expr_in_env(e, env)).collect::<Result<_, _>>()?
+                        } else { vec![] };
+                        if extra_args.len() != 1 {
+                            return Err(self.error_at(*span, "worker.request expects 1 argument"));
+                        }
+                        return self.worker_request(&w.clone(), &extra_args[0])
+                            .map_err(|e| self.error_at(*span, &e));
+                    }
+                    (Value::Worker(w), "close") => {
+                        return self.worker_close(&w.clone())
+                            .map_err(|e| self.error_at(*span, &e));
+                    }
+                    (Value::Promise(p), "map") => {
+                        let extra_args: Vec<Value> = if let Some(a) = args {
+                            a.iter().map(|e| self.eval_expr_in_env(e, env)).collect::<Result<_, _>>()?
+                        } else { vec![] };
+                        if extra_args.len() != 1 {
+                            return Err(self.error_at(*span, "promise.map expects 1 argument"));
+                        }
+                        return self.promise_map(&p.clone(), &extra_args[0])
+                            .map_err(|e| self.error_at(*span, &e));
+                    }
+                    (Value::ThreadPool(pool), "serve") => {
+                        let extra_args: Vec<Value> = if let Some(a) = args {
+                            a.iter().map(|e| self.eval_expr_in_env(e, env)).collect::<Result<_, _>>()?
+                        } else { vec![] };
+                        if extra_args.len() != 2 {
+                            return Err(self.error_at(*span, "pool.serve expects (port, handler)"));
+                        }
+                        let port = match &extra_args[0] {
+                            Value::Int(p) => *p as u16,
+                            _ => return Err(self.error_at(*span, "pool.serve: port must be Int")),
+                        };
+                        let handler = extra_args[1].clone();
+                        let pool_clone = pool.clone();
+                        return self.builtin_server_serve_with_pool(port, &Value::ThreadPool(pool_clone), &handler)
+                            .map_err(|e| self.error_at(*span, &e));
+                    }
+                    _ => {}
+                }
 
                 // Special case: handle TupleArgs receiver
                 let first_args = match &recv {
@@ -990,6 +1398,57 @@ impl Interpreter {
                     "iter" => {
                         return self.builtin_iter(&args[0], &args[1], &args[2], &args[3]);
                     }
+                    "async" => {
+                        return self.builtin_async(&args[0]);
+                    }
+                    "await" => {
+                        return self.builtin_await(&args[0]);
+                    }
+                    "parallel" => {
+                        return self.builtin_parallel(&args[0]);
+                    }
+                    "race" => {
+                        return self.builtin_race(&args[0]);
+                    }
+                    "timeout" => {
+                        return self.builtin_timeout(&args[0], &args[1]);
+                    }
+                    "retry" => {
+                        return self.builtin_retry(&args[0], &args[1]);
+                    }
+                    "threadPool" => {
+                        return self.builtin_thread_pool(&args[0]);
+                    }
+                    "worker" => {
+                        return self.builtin_worker(&args[0], &args[1]);
+                    }
+                    "__ioLines" => {
+                        return self.builtin_io_lines();
+                    }
+                    "__fsReadLines" => {
+                        let path = match &args[0] {
+                            Value::String(s) => s.as_ref().clone(),
+                            _ => return Err("__fsReadLines: expected String path".to_string()),
+                        };
+                        return self.builtin_fs_read_lines(&path);
+                    }
+                    "__serverServe" => {
+                        let port = match &args[0] {
+                            Value::Int(p) => *p as u16,
+                            _ => return Err("__serverServe: port must be Int".to_string()),
+                        };
+                        let handler = args[1].clone();
+                        return self.builtin_server_serve(port, &handler);
+                    }
+                    "__serverServeWithPool" => {
+                        let port = match &args[0] {
+                            Value::Int(p) => *p as u16,
+                            _ => return Err("__serverServeWithPool: port must be Int".to_string()),
+                        };
+                        let pool = args[1].clone();
+                        let handler = args[2].clone();
+                        return self.builtin_server_serve_with_pool(port, &pool, &handler);
+                    }
                     _ => {}
                 }
 
@@ -1007,6 +1466,9 @@ impl Interpreter {
                 } else {
                     Err("Iterator call expects 1 argument (callback)".to_string())
                 }
+            }
+            Value::Promise(_) | Value::ThreadPool(_) | Value::Worker(_) => {
+                Err(format!("Cannot call {} directly; use await/message/request methods", func.type_name()))
             }
             _ => Err(format!("Cannot call value of type {}", func.type_name())),
         }
@@ -1407,4 +1869,588 @@ impl Interpreter {
             Pattern::TypeName(_, _) | Pattern::Literal(_) => Ok(()),
         }
     }
+
+    // ---- Concurrency built-ins ----
+
+    /// Spawn one OS thread to evaluate a zero-argument closure.
+    /// Returns a Promise that resolves to the result (or an error object).
+    fn builtin_async(&mut self, thunk: &Value) -> Result<Value, String> {
+        // Overloaded form: async([thunk1, thunk2, ...]) => Promise[]
+        if let Value::Array(arr) = thunk {
+            let funcs: Vec<Value> = arr.borrow().clone();
+            let mut promises = Vec::new();
+            for f in funcs {
+                promises.push(self.builtin_async(&f)?);
+            }
+            return Ok(Value::Array(Rc::new(RefCell::new(promises))));
+        }
+        let func = match thunk {
+            Value::Function(f) => f.clone(),
+            Value::NativeFunction(_) | Value::Partial(_) => {
+                return Err("async: argument must be a zero-argument function literal".to_string());
+            }
+            _ => return Err(format!("async: expected function, got {}", thunk.type_name())),
+        };
+        if func.arity != 0 {
+            return Err(format!("async: thunk must take 0 arguments, got {}", func.arity));
+        }
+        let promise = Arc::new(Mutex::new(PromiseState::Pending));
+        let promise_clone = promise.clone();
+        let sendable = SendFunction::new(func);
+        std::thread::spawn(move || {
+            let func = unsafe { sendable.into_rc() };
+            let mut interp = Interpreter::new();
+            let result = interp.call_function(&func, vec![]);
+            let state = match result {
+                Ok(val) => match val.to_json_value() {
+                    Ok(jv) => PromiseState::Resolved(jv),
+                    Err(e) => PromiseState::Failed(format!("async: result not JSON-compatible: {}", e)),
+                },
+                Err(e) => PromiseState::Failed(e),
+            };
+            *promise_clone.lock().unwrap() = state;
+        });
+        Ok(Value::Promise(promise))
+    }
+
+    /// Block until a Promise resolves; return its value or an error object.
+    fn builtin_await(&mut self, promise_val: &Value) -> Result<Value, String> {
+        match promise_val {
+            Value::Promise(p) => {
+                // Spin-wait (simple; for a production impl, use condvar)
+                loop {
+                    let state = p.lock().unwrap();
+                    match &*state {
+                        PromiseState::Pending => {
+                            drop(state);
+                            std::thread::yield_now();
+                        }
+                        PromiseState::Resolved(jv) => return Ok(jv.clone().to_value()),
+                        PromiseState::Failed(msg) => {
+                            let mut obj = IndexMap::new();
+                            obj.insert("type".to_string(), Value::String(Rc::new("error".to_string())));
+                            obj.insert("message".to_string(), Value::String(Rc::new(msg.clone())));
+                            return Ok(Value::Object(Rc::new(RefCell::new(obj))));
+                        }
+                    }
+                }
+            }
+            Value::Array(arr) => {
+                // await on an array of promises
+                let promises: Vec<Value> = arr.borrow().clone();
+                let mut results = Vec::new();
+                for p in promises {
+                    results.push(self.builtin_await(&p)?);
+                }
+                Ok(Value::Array(Rc::new(RefCell::new(results))))
+            }
+            _ => Err(format!("await: expected Promise or Promise[], got {}", promise_val.type_name())),
+        }
+    }
+
+    /// Run an array of thunks in parallel; return array of results in input order.
+    fn builtin_parallel(&mut self, thunks: &Value) -> Result<Value, String> {
+        match thunks {
+            Value::Array(arr) => {
+                let funcs: Vec<Value> = arr.borrow().clone();
+                // spawn all
+                let mut promises = Vec::new();
+                for f in funcs {
+                    promises.push(self.builtin_async(&f)?);
+                }
+                // await all
+                let mut results = Vec::new();
+                for p in promises {
+                    results.push(self.builtin_await(&p)?);
+                }
+                Ok(Value::Array(Rc::new(RefCell::new(results))))
+            }
+            _ => Err(format!("parallel: expected Array of thunks, got {}", thunks.type_name())),
+        }
+    }
+
+    /// Resolve with the first promise to complete.
+    fn builtin_race(&mut self, promises: &Value) -> Result<Value, String> {
+        match promises {
+            Value::Array(arr) => {
+                let ps: Vec<Value> = arr.borrow().clone();
+                loop {
+                    for p in &ps {
+                        if let Value::Promise(arc) = p {
+                            let state = arc.lock().unwrap();
+                            match &*state {
+                                PromiseState::Resolved(jv) => return Ok(jv.clone().to_value()),
+                                PromiseState::Failed(msg) => {
+                                    let mut obj = IndexMap::new();
+                                    obj.insert("type".to_string(), Value::String(Rc::new("error".to_string())));
+                                    obj.insert("message".to_string(), Value::String(Rc::new(msg.clone())));
+                                    return Ok(Value::Object(Rc::new(RefCell::new(obj))));
+                                }
+                                PromiseState::Pending => {}
+                            }
+                        }
+                    }
+                    std::thread::yield_now();
+                }
+            }
+            _ => Err(format!("race: expected Array of promises, got {}", promises.type_name())),
+        }
+    }
+
+    /// Resolve promise or return null if it doesn't complete within `ms` milliseconds.
+    fn builtin_timeout(&mut self, promise_val: &Value, ms_val: &Value) -> Result<Value, String> {
+        let ms = match ms_val {
+            Value::Int(n) => *n as u64,
+            _ => return Err("timeout: second argument must be Int32".to_string()),
+        };
+        let p = match promise_val {
+            Value::Promise(p) => p.clone(),
+            _ => return Err(format!("timeout: expected Promise, got {}", promise_val.type_name())),
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+        loop {
+            let state = p.lock().unwrap();
+            match &*state {
+                PromiseState::Resolved(jv) => return Ok(jv.clone().to_value()),
+                PromiseState::Failed(msg) => {
+                    let mut obj = IndexMap::new();
+                    obj.insert("type".to_string(), Value::String(Rc::new("error".to_string())));
+                    obj.insert("message".to_string(), Value::String(Rc::new(msg.clone())));
+                    return Ok(Value::Object(Rc::new(RefCell::new(obj))));
+                }
+                PromiseState::Pending => {
+                    drop(state);
+                    if std::time::Instant::now() >= deadline {
+                        return Ok(Value::Null);
+                    }
+                    std::thread::yield_now();
+                }
+            }
+        }
+    }
+
+    /// Retry a thunk up to n times; return first non-error result.
+    fn builtin_retry(&mut self, thunk: &Value, n_val: &Value) -> Result<Value, String> {
+        let n = match n_val {
+            Value::Int(n) => *n,
+            _ => return Err("retry: second argument must be Int32".to_string()),
+        };
+        let mut last_err = Value::Null;
+        for _ in 0..n {
+            let p = self.builtin_async(thunk)?;
+            let result = self.builtin_await(&p)?;
+            match &result {
+                Value::Object(o) => {
+                    let o = o.borrow();
+                    if o.get("type").map(|v| v.to_display_string()) == Some("error".to_string()) {
+                        last_err = result.clone();
+                        continue;
+                    }
+                    return Ok(Value::Promise({
+                        let resolved = Arc::new(Mutex::new(PromiseState::Resolved(
+                            result.to_json_value().unwrap_or(JsonValue::Null)
+                        )));
+                        resolved
+                    }));
+                }
+                _ => {
+                    return Ok(Value::Promise({
+                        let resolved = Arc::new(Mutex::new(PromiseState::Resolved(
+                            result.to_json_value().unwrap_or(JsonValue::Null)
+                        )));
+                        resolved
+                    }));
+                }
+            }
+        }
+        // All attempts failed — wrap last error in a promise
+        let p = Arc::new(Mutex::new(PromiseState::Failed(
+            last_err.to_display_string()
+        )));
+        Ok(Value::Promise(p))
+    }
+
+    /// Create a thread pool of n worker threads.
+    fn builtin_thread_pool(&mut self, n_val: &Value) -> Result<Value, String> {
+        let n = match n_val {
+            Value::Int(n) => *n as usize,
+            _ => return Err("threadPool: argument must be Int32".to_string()),
+        };
+        let (tx, rx) = std::sync::mpsc::channel::<Box<dyn FnOnce() + Send + 'static>>();
+        let rx = Arc::new(Mutex::new(rx));
+        for _ in 0..n {
+            let rx = rx.clone();
+            std::thread::spawn(move || loop {
+                let task = {
+                    let lock = rx.lock().unwrap();
+                    lock.recv()
+                };
+                match task {
+                    Ok(f) => f(),
+                    Err(_) => break, // channel closed
+                }
+            });
+        }
+        Ok(Value::ThreadPool(Arc::new(ThreadPoolState { sender: tx })))
+    }
+
+    /// Dispatch a thunk to a thread pool.
+    fn pool_async(&mut self, pool: &Arc<ThreadPoolState>, args: &[Value]) -> Result<Value, String> {
+        let thunk = args.first().ok_or("pool.async: requires 1 argument")?;
+        let func = match thunk {
+            Value::Function(f) => f.clone(),
+            _ => return Err(format!("pool.async: expected function, got {}", thunk.type_name())),
+        };
+        if func.arity != 0 {
+            return Err("pool.async: thunk must take 0 arguments".to_string());
+        }
+        let promise = Arc::new(Mutex::new(PromiseState::Pending));
+        let promise_clone = promise.clone();
+        let sendable = SendFunction::new(func);
+        pool.sender.send(Box::new(move || {
+            let func = unsafe { sendable.into_rc() };
+            let mut interp = Interpreter::new();
+            let result = interp.call_function(&func, vec![]);
+            let state = match result {
+                Ok(val) => match val.to_json_value() {
+                    Ok(jv) => PromiseState::Resolved(jv),
+                    Err(e) => PromiseState::Failed(e),
+                },
+                Err(e) => PromiseState::Failed(e),
+            };
+            *promise_clone.lock().unwrap() = state;
+        })).map_err(|_| "pool.async: thread pool is shut down".to_string())?;
+        Ok(Value::Promise(promise))
+    }
+
+    /// Create a stateful worker thread.
+    fn builtin_worker(&mut self, on_msg: &Value, on_shutdown: &Value) -> Result<Value, String> {
+        let handler = match on_msg {
+            Value::Function(f) => f.clone(),
+            _ => return Err(format!("worker: onMessage must be a function, got {}", on_msg.type_name())),
+        };
+        let shutdown_fn = match on_shutdown {
+            Value::Function(f) => f.clone(),
+            Value::NativeFunction(_) => {
+                // Accept native functions for onShutdown
+                let _f = on_shutdown.clone();
+                // Create a synthetic empty function for shutdown
+                handler.clone() // placeholder; we handle this below
+            }
+            Value::Null => handler.clone(), // no-op shutdown
+            _ => return Err(format!("worker: onShutdown must be a function, got {}", on_shutdown.type_name())),
+        };
+        let (tx, rx) = std::sync::mpsc::sync_channel::<WorkerMsg>(64);
+        let sendable_handler = SendFunction::new(handler);
+        let sendable_shutdown = SendFunction::new(shutdown_fn);
+        std::thread::spawn(move || {
+            let handler = unsafe { sendable_handler.into_rc() };
+            let shutdown_fn = unsafe { sendable_shutdown.into_rc() };
+            let mut interp = Interpreter::new();
+            loop {
+                match rx.recv() {
+                    Ok(WorkerMsg::Message(msg, reply_tx)) => {
+                        let msg_val = msg.to_value();
+                        let result = interp.call_function(&handler, vec![msg_val]);
+                        if let Some(tx) = reply_tx {
+                            let reply = match result {
+                                Ok(v) => v.to_json_value().unwrap_or(JsonValue::Null),
+                                Err(e) => JsonValue::Error(e),
+                            };
+                            let _ = tx.send(reply);
+                        }
+                    }
+                    Ok(WorkerMsg::Shutdown) | Err(_) => {
+                        let _ = interp.call_function(&shutdown_fn, vec![]);
+                        break;
+                    }
+                }
+            }
+        });
+        Ok(Value::Worker(Arc::new(WorkerState {
+            sender: tx,
+            closed: std::sync::atomic::AtomicBool::new(false),
+        })))
+    }
+
+    /// Send a message to a worker (fire and forget).
+    fn worker_message(&mut self, worker: &Arc<WorkerState>, msg: &Value) -> Result<Value, String> {
+        if worker.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("worker.message: worker is closed".to_string());
+        }
+        let jv = msg.to_json_value().map_err(|e| format!("worker.message: {}", e))?;
+        worker.sender.send(WorkerMsg::Message(jv, None))
+            .map_err(|_| "worker.message: worker thread is gone".to_string())?;
+        Ok(Value::Null)
+    }
+
+    /// Send a message to a worker and wait for a reply.
+    fn worker_request(&mut self, worker: &Arc<WorkerState>, msg: &Value) -> Result<Value, String> {
+        if worker.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("worker.request: worker is closed".to_string());
+        }
+        let jv = msg.to_json_value().map_err(|e| format!("worker.request: {}", e))?;
+        let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+        worker.sender.send(WorkerMsg::Message(jv, Some(reply_tx)))
+            .map_err(|_| "worker.request: worker thread is gone".to_string())?;
+        let reply = reply_rx.recv()
+            .map_err(|_| "worker.request: worker thread disconnected".to_string())?;
+        Ok(reply.to_value())
+    }
+
+    /// Close a worker (drain + shutdown).
+    fn worker_close(&mut self, worker: &Arc<WorkerState>) -> Result<Value, String> {
+        worker.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = worker.sender.send(WorkerMsg::Shutdown);
+        Ok(Value::Null)
+    }
+
+    /// Transform a promise's resolved value without blocking.
+    fn promise_map(&mut self, promise: &Arc<Mutex<PromiseState>>, f: &Value) -> Result<Value, String> {
+        let state = promise.lock().unwrap();
+        match &*state {
+            PromiseState::Resolved(jv) => {
+                let val = jv.clone().to_value();
+                drop(state);
+                let result = self.call_value(f, vec![val], &mut Env::new())?;
+                let new_jv = result.to_json_value().unwrap_or(JsonValue::Null);
+                Ok(Value::Promise(Arc::new(Mutex::new(PromiseState::Resolved(new_jv)))))
+            }
+            PromiseState::Failed(msg) => {
+                Ok(Value::Promise(Arc::new(Mutex::new(PromiseState::Failed(msg.clone())))))
+            }
+            PromiseState::Pending => {
+                // For now, map on a pending promise is not supported in interpreter
+                Err("promise.map on a Pending promise is not supported in the interpreter".to_string())
+            }
+        }
+    }
+
+    /// Start a single-threaded HTTP server that blocks forever.
+    fn builtin_server_serve(&mut self, port: u16, handler: &Value) -> Result<Value, String> {
+        let server = tiny_http::Server::http(format!("0.0.0.0:{}", port))
+            .map_err(|e| format!("__serverServe: cannot bind port {}: {}", port, e))?;
+        loop {
+            match server.recv() {
+                Ok(request) => {
+                    let req_val = tiny_http_request_to_value(&request);
+                    let response_val = self.call_value(handler, vec![req_val], &mut Env::new())
+                        .unwrap_or_else(|e| {
+                            let mut map = indexmap::IndexMap::new();
+                            map.insert("status".to_string(), Value::Int(500));
+                            map.insert("headers".to_string(), Value::Object(Rc::new(RefCell::new(indexmap::IndexMap::new()))));
+                            map.insert("body".to_string(), Value::String(Rc::new(e)));
+                            Value::Object(Rc::new(RefCell::new(map)))
+                        });
+                    let _ = send_http_response(request, &response_val);
+                }
+                Err(e) => return Err(format!("__serverServe: {}", e)),
+            }
+        }
+    }
+
+    /// Start a multi-threaded HTTP server using a thread pool; blocks forever.
+    fn builtin_server_serve_with_pool(&mut self, port: u16, pool: &Value, handler: &Value) -> Result<Value, String> {
+        let pool_arc = match pool {
+            Value::ThreadPool(p) => p.clone(),
+            _ => return Err("__serverServeWithPool: second argument must be a ThreadPool".to_string()),
+        };
+        let handler_func = match handler {
+            Value::Function(f) => f.clone(),
+            _ => return Err("__serverServeWithPool: handler must be a function".to_string()),
+        };
+        let server = tiny_http::Server::http(format!("0.0.0.0:{}", port))
+            .map_err(|e| format!("__serverServeWithPool: cannot bind port {}: {}", port, e))?;
+        for request in server.incoming_requests() {
+            let req_val = tiny_http_request_to_value(&request);
+            let jv = match req_val.to_json_value() {
+                Ok(v) => v,
+                Err(_) => JsonValue::Null,
+            };
+            let sendable = SendFunction::new(handler_func.clone());
+            pool_arc.sender.send(Box::new(move || {
+                let func = unsafe { sendable.into_rc() };
+                let req = jv.to_value();
+                let mut interp = Interpreter::new();
+                let response_val = interp.call_function(&func, vec![req])
+                    .unwrap_or_else(|e| {
+                        let mut map = indexmap::IndexMap::new();
+                        map.insert("status".to_string(), Value::Int(500));
+                        map.insert("headers".to_string(), Value::Object(Rc::new(RefCell::new(indexmap::IndexMap::new()))));
+                        map.insert("body".to_string(), Value::String(Rc::new(e)));
+                        Value::Object(Rc::new(RefCell::new(map)))
+                    });
+                let _ = send_http_response(request, &response_val);
+            })).map_err(|_| "pool.serve: thread pool is shut down")?;
+        }
+        Ok(Value::Null)
+    }
+
+    /// Read all stdin lines eagerly, return as Array<String>.
+    pub fn builtin_io_lines(&mut self) -> Result<Value, String> {
+        use std::io::BufRead;
+        let stdin = std::io::stdin();
+        let mut lines = Vec::new();
+        for line in stdin.lock().lines() {
+            match line {
+                Ok(l) => lines.push(Value::String(Rc::new(l))),
+                Err(e) => return Err(format!("__ioLines: {}", e)),
+            }
+        }
+        Ok(Value::Array(Rc::new(RefCell::new(lines))))
+    }
+
+    /// Create an iterator over lines of a file.
+    pub fn builtin_fs_read_lines(&mut self, path: &str) -> Result<Value, String> {
+        use std::io::BufRead;
+        match std::fs::File::open(path) {
+            Err(e) => {
+                let mut map = indexmap::IndexMap::new();
+                map.insert("type".to_string(), Value::String(Rc::new("error".to_string())));
+                map.insert("message".to_string(), Value::String(Rc::new(e.to_string())));
+                Ok(Value::Object(Rc::new(RefCell::new(map))))
+            }
+            Ok(file) => {
+                use std::io::BufReader;
+                let reader = BufReader::new(file);
+                let lines: Vec<Value> = reader.lines()
+                    .map(|l| Value::String(Rc::new(l.unwrap_or_default())))
+                    .collect();
+                Ok(Value::Array(Rc::new(RefCell::new(lines))))
+            }
+        }
+    }
+}
+
+/// Parse a JSON string into a Lin Value.
+fn parse_json_to_value(s: &str) -> Result<Value, String> {
+    let parsed: serde_json::Value = serde_json::from_str(s)
+        .map_err(|e| format!("JSON parse error: {}", e))?;
+    Ok(serde_json_to_lin_value(&parsed))
+}
+
+fn serde_json_to_lin_value(v: &serde_json::Value) -> Value {
+    match v {
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::Bool(b) => Value::Bool(*b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Value::Int(i)
+            } else if let Some(f) = n.as_f64() {
+                Value::Float(f)
+            } else {
+                Value::Null
+            }
+        }
+        serde_json::Value::String(s) => Value::String(Rc::new(s.clone())),
+        serde_json::Value::Array(arr) => {
+            let items: Vec<Value> = arr.iter().map(serde_json_to_lin_value).collect();
+            Value::Array(Rc::new(RefCell::new(items)))
+        }
+        serde_json::Value::Object(obj) => {
+            let mut map = indexmap::IndexMap::new();
+            for (k, v) in obj {
+                map.insert(k.clone(), serde_json_to_lin_value(v));
+            }
+            Value::Object(Rc::new(RefCell::new(map)))
+        }
+    }
+}
+
+/// Serialize a Lin Value to a compact JSON string.
+fn value_to_json_string(v: &Value) -> String {
+    match v {
+        Value::Null => "null".to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Int(i) => i.to_string(),
+        Value::Float(f) => {
+            if f.is_nan() { "null".to_string() }
+            else if f.is_infinite() { "null".to_string() }
+            else { format!("{}", f) }
+        }
+        Value::String(s) => {
+            serde_json::to_string(s.as_str()).unwrap_or_else(|_| format!("\"{}\"", s))
+        }
+        Value::Array(arr) => {
+            let items: Vec<String> = arr.borrow().iter().map(value_to_json_string).collect();
+            format!("[{}]", items.join(","))
+        }
+        Value::Object(obj) => {
+            let fields: Vec<String> = obj.borrow().iter()
+                .map(|(k, v)| format!("{}:{}", serde_json::to_string(k).unwrap_or_default(), value_to_json_string(v)))
+                .collect();
+            format!("{{{}}}", fields.join(","))
+        }
+        _ => "null".to_string(),
+    }
+}
+
+/// Convert a tiny_http Request into a Lin Value with HttpRequest shape.
+fn tiny_http_request_to_value(req: &tiny_http::Request) -> Value {
+    let method = req.method().to_string();
+    let url = req.url().to_string();
+    let (path, query) = if let Some(idx) = url.find('?') {
+        (url[..idx].to_string(), url[idx+1..].to_string())
+    } else {
+        (url.clone(), String::new())
+    };
+
+    let mut headers_map = indexmap::IndexMap::new();
+    for header in req.headers() {
+        headers_map.insert(
+            header.field.to_string().to_lowercase(),
+            Value::String(Rc::new(header.value.to_string())),
+        );
+    }
+
+    let mut map = indexmap::IndexMap::new();
+    map.insert("method".to_string(), Value::String(Rc::new(method)));
+    map.insert("path".to_string(), Value::String(Rc::new(path)));
+    map.insert("query".to_string(), Value::String(Rc::new(query)));
+    map.insert("headers".to_string(), Value::Object(Rc::new(RefCell::new(headers_map))));
+    map.insert("body".to_string(), Value::String(Rc::new(String::new())));
+    Value::Object(Rc::new(RefCell::new(map)))
+}
+
+/// Write a Lin HttpResponse Value back to a tiny_http Request.
+fn send_http_response(request: tiny_http::Request, response_val: &Value) -> Result<(), String> {
+    let status = match response_val {
+        Value::Object(o) => {
+            match o.borrow().get("status") {
+                Some(Value::Int(s)) => *s as u16,
+                _ => 200,
+            }
+        }
+        _ => 200,
+    };
+    let body = match response_val {
+        Value::Object(o) => {
+            match o.borrow().get("body").cloned() {
+                Some(Value::String(s)) => s.as_ref().clone(),
+                _ => String::new(),
+            }
+        }
+        _ => String::new(),
+    };
+    let content_type = match response_val {
+        Value::Object(o) => {
+            let borrow = o.borrow();
+            if let Some(Value::Object(hdrs)) = borrow.get("headers") {
+                let hdrs_borrow = hdrs.borrow();
+                let ct = hdrs_borrow.get("content-type")
+                    .or_else(|| hdrs_borrow.get("Content-Type"));
+                ct.and_then(|v| if let Value::String(s) = v { Some(s.as_ref().clone()) } else { None })
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }.unwrap_or_else(|| "text/plain; charset=utf-8".to_string());
+
+    let mut http_response = tiny_http::Response::from_string(body);
+    http_response = http_response.with_status_code(status);
+    http_response = http_response.with_header(
+        tiny_http::Header::from_bytes("Content-Type", content_type.as_str()).unwrap()
+    );
+    request.respond(http_response).map_err(|e| e.to_string())
 }
