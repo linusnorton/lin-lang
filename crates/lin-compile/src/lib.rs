@@ -205,6 +205,7 @@ fn check_module_with_imports(
     }
     let mut checker = Checker::new();
     checker.import_types = import_type_map;
+    checker.protect_import_typevars();
     checker.check_module(ast_module)
 }
 
@@ -217,6 +218,9 @@ fn stdlib_source(path: &str) -> Option<&'static str> {
         "std/array"  => Some(include_str!("../../../stdlib/array.lin")),
         "std/iter"   => Some(include_str!("../../../stdlib/iter.lin")),
         "std/result" => Some(include_str!("../../../stdlib/result.lin")),
+        "std/fs"     => Some(include_str!("../../../stdlib/fs.lin")),
+        "std/http"   => Some(include_str!("../../../stdlib/http.lin")),
+        "std/server" => Some(include_str!("../../../stdlib/server.lin")),
         _ => None,
     }
 }

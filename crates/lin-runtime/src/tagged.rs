@@ -33,7 +33,7 @@ pub struct TaggedVal {
     pub payload: u64,
 }
 
-unsafe fn alloc_tagged(tag: u8, payload: u64) -> *mut u8 {
+pub unsafe fn alloc_tagged(tag: u8, payload: u64) -> *mut u8 {
     let layout = Layout::new::<TaggedVal>();
     let ptr = alloc(layout);
     if ptr.is_null() {
@@ -128,6 +128,44 @@ pub unsafe extern "C" fn lin_unbox_bool(p: *const u8) -> u8 {
 #[no_mangle]
 pub unsafe extern "C" fn lin_unbox_ptr(p: *const u8) -> *mut u8 {
     (*(p as *const TaggedVal)).payload as *mut u8
+}
+
+/// Deep equality for two TaggedVal* values. Returns 1 if equal, 0 if not.
+/// Handles null (TAG_NULL), scalars (bool/int/float), strings, objects, and arrays.
+/// Either pointer may be null (treated as TAG_NULL).
+#[no_mangle]
+pub unsafe extern "C" fn lin_tagged_eq(a: *const u8, b: *const u8) -> u8 {
+    let av = a as *const TaggedVal;
+    let bv = b as *const TaggedVal;
+    let at = if av.is_null() { TAG_NULL } else { (*av).tag };
+    let bt = if bv.is_null() { TAG_NULL } else { (*bv).tag };
+    if at != bt { return 0; }
+    if at == TAG_NULL { return 1; }
+    let ap = if av.is_null() { 0u64 } else { (*av).payload };
+    let bp = if bv.is_null() { 0u64 } else { (*bv).payload };
+    match at {
+        TAG_BOOL => (ap == bp) as u8,
+        TAG_INT32 => ((ap as i32) == (bp as i32)) as u8,
+        TAG_INT64 => ((ap as i64) == (bp as i64)) as u8,
+        TAG_FLOAT32 => (f32::from_bits(ap as u32) == f32::from_bits(bp as u32)) as u8,
+        TAG_FLOAT64 => (f64::from_bits(ap) == f64::from_bits(bp)) as u8,
+        TAG_STR => {
+            let as_ptr = ap as *const crate::string::LinString;
+            let bs_ptr = bp as *const crate::string::LinString;
+            crate::string::lin_string_eq(as_ptr, bs_ptr) as u8
+        }
+        TAG_OBJECT => {
+            let ao = ap as *const crate::object::LinObject;
+            let bo = bp as *const crate::object::LinObject;
+            crate::object::lin_object_eq(ao, bo)
+        }
+        TAG_ARRAY => {
+            let aa = ap as *const crate::array::LinArray;
+            let ba = bp as *const crate::array::LinArray;
+            crate::array::lin_array_eq(aa, ba)
+        }
+        _ => (ap == bp) as u8,
+    }
 }
 
 /// Release a TaggedVal*: release the pointed-to heap value (if pointer type), then free the box.

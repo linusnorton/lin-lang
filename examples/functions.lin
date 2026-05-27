@@ -18,7 +18,7 @@ print(toString(calculate(5)))
 
 // Dot application
 val greet = (name: String): String =>
-  "Hello " + name
+  "Hello ${name}"
 
 print("world".greet())
 

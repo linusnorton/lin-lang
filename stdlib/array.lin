@@ -10,7 +10,7 @@ export val filter = (arr: Json, f: Function): Json =>
   )
   result
 
-export val reduce = (arr: Json, init: Json, f: Function): Json =>
+export val reduce = (arr: Json, init: Json, f: (Json, Json) => Json): Json =>
   var acc = init
   arr.for(item => acc = f(acc, item))
   acc

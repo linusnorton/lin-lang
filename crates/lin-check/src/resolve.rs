@@ -78,6 +78,11 @@ fn resolve_named_cycle(
         "Float64" => Ok(Type::Float64),
         "String" => Ok(Type::Str),
         "Json" => Ok(json_type()),
+        // Function is used as an opaque type annotation in some programs
+        "Function" => Ok(Type::Function {
+            params: vec![json_type()],
+            ret: Box::new(json_type()),
+        }),
         _ => {
             // Cycle detected: return Named(name) as an opaque reference instead of expanding.
             if visiting.contains(name) {

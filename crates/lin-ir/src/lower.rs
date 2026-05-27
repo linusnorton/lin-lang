@@ -296,6 +296,35 @@ fn lower_stmt(stmt: &TypedStmt, builder: &mut FuncBuilder, ctx: &mut LowerCtx) {
             }
             let _ = obj_ty;
         }
+        TypedStmt::ArrayDestructure {
+            arr_slot,
+            value,
+            elem_ty,
+            elements,
+            rest,
+            ..
+        } => {
+            let arr_temp = lower_expr(value, builder, ctx);
+            builder.slots.insert(*arr_slot, arr_temp);
+            for (index, binding_slot, field_ty) in elements {
+                let idx_temp = builder.const_temp(Const::Int(*index as i64, Type::Int64));
+                let dst = builder.alloc_temp(field_ty.clone());
+                builder.emit(Instruction::Index {
+                    dst,
+                    object: arr_temp,
+                    key: idx_temp,
+                    result_ty: field_ty.clone(),
+                });
+                builder.slots.insert(*binding_slot, dst);
+            }
+            if let Some((rest_slot, rest_ty)) = rest {
+                // Rest slicing is handled fully in codegen; emit a copy of the source arr as placeholder.
+                let dst = builder.alloc_temp(rest_ty.clone());
+                builder.emit(Instruction::Copy { dst, src: arr_temp });
+                builder.slots.insert(*rest_slot, dst);
+            }
+            let _ = elem_ty;
+        }
         TypedStmt::Expr(expr) => {
             lower_expr(expr, builder, ctx);
         }

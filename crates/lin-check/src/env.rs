@@ -57,6 +57,19 @@ impl TypeEnv {
         self.define_at(name, ty, mutable, None)
     }
 
+    /// Shadow an existing binding with a narrowed type, reusing the same slot.
+    /// Scoped: safe to call after push_scope, undone by pop_scope.
+    pub fn define_narrowed(&mut self, name: String, narrowed_ty: Type, orig_slot: usize) {
+        let info = VarInfo {
+            slot: orig_slot,
+            ty: narrowed_ty,
+            mutable: false,
+            narrowed_ty: None,
+            def_span: None,
+        };
+        self.scopes.last_mut().unwrap().bindings.insert(name, info);
+    }
+
     pub fn define_at(&mut self, name: String, ty: Type, mutable: bool, def_span: Option<Span>) -> usize {
         let slot = self.next_slot;
         self.next_slot += 1;

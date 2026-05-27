@@ -3,9 +3,14 @@
 //! that are linked into every compiled binary.
 
 pub mod array;
+pub mod async_rt;
+pub mod fs;
+pub mod http;
 pub mod io;
+pub mod json;
 pub mod memory;
 pub mod number;
 pub mod object;
+pub mod server;
 pub mod string;
 pub mod tagged;

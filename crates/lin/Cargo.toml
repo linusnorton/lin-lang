@@ -7,6 +7,8 @@ edition = "2021"
 lin-common = { path = "../lin-common" }
 lin-lex = { path = "../lin-lex" }
 lin-parse = { path = "../lin-parse" }
-lin-eval = { path = "../lin-eval" }
 lin-check = { path = "../lin-check" }
 lin-compile = { path = "../lin-compile" }
+
+[dev-dependencies]
+tiny_http = { workspace = true }

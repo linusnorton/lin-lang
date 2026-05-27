@@ -67,6 +67,11 @@ impl Type {
         matches!(self, Type::Float32 | Type::Float64)
     }
 
+    /// Returns true for the dynamic "any" JSON type (TypeVar(u32::MAX)).
+    pub fn is_json(&self) -> bool {
+        matches!(self, Type::TypeVar(u32::MAX))
+    }
+
     pub fn is_signed(&self) -> bool {
         matches!(
             self,

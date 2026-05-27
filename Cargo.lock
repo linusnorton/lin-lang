@@ -590,9 +590,9 @@ dependencies = [
  "lin-check",
  "lin-common",
  "lin-compile",
- "lin-eval",
  "lin-lex",
  "lin-parse",
+ "tiny_http",
 ]
 
 [[package]]
@@ -697,6 +697,10 @@ dependencies = [
 [[package]]
 name = "lin-runtime"
 version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "ureq",
+]
 
 [[package]]
 name = "linux-raw-sys"

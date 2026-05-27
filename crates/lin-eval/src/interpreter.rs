@@ -18,6 +18,7 @@ enum TailResult {
 pub struct Interpreter {
     pub global_env: Env,
     pub output: Vec<String>,
+    pub exit_code: Option<i32>,
     module_cache: HashMap<String, HashMap<String, Value>>,
     stdlib_sources: HashMap<String, &'static str>,
     base_path: Option<std::path::PathBuf>,
@@ -29,6 +30,7 @@ impl Interpreter {
         let mut interp = Self {
             global_env: Env::new(),
             output: Vec::new(),
+            exit_code: None,
             module_cache: HashMap::new(),
             stdlib_sources: HashMap::new(),
             base_path: None,
@@ -57,6 +59,8 @@ impl Interpreter {
         self.stdlib_sources.insert("std/fs".to_string(), include_str!("../../../stdlib/fs.lin"));
         self.stdlib_sources.insert("std/http".to_string(), include_str!("../../../stdlib/http.lin"));
         self.stdlib_sources.insert("std/server".to_string(), include_str!("../../../stdlib/server.lin"));
+        self.stdlib_sources.insert("std/template".to_string(), include_str!("../../../stdlib/template.lin"));
+        self.stdlib_sources.insert("std/test".to_string(), include_str!("../../../stdlib/test.lin"));
     }
 
     fn preload_stdlib(&mut self) {
@@ -533,6 +537,43 @@ impl Interpreter {
                 _ => Err("__parseJson: expected String".to_string()),
             }
         });
+
+        self.define_native("__templateRender", 2, |args| {
+            match (&args[0], &args[1]) {
+                (Value::String(template), Value::Object(data)) => {
+                    let s = template.as_str();
+                    let mut result = String::with_capacity(s.len());
+                    let mut rest = s;
+                    while let Some(start) = rest.find("${") {
+                        result.push_str(&rest[..start]);
+                        rest = &rest[start + 2..];
+                        let end = rest.find('}').ok_or("__templateRender: unclosed '${'".to_string())?;
+                        let path = &rest[..end];
+                        rest = &rest[end + 1..];
+                        // Walk dot-separated path; clone at each step to avoid nested Ref borrows
+                        let segments: Vec<&str> = path.split('.').collect();
+                        let mut cur: Option<Value> = segments.first()
+                            .and_then(|seg| data.borrow().get(*seg).cloned());
+                        for seg in segments.iter().skip(1) {
+                            cur = match cur {
+                                Some(Value::Object(inner)) => inner.borrow().get(*seg).cloned(),
+                                _ => None,
+                            };
+                        }
+                        match cur {
+                            Some(ref v) => result.push_str(&v.to_display_string()),
+                            None => result.push_str("null"),
+                        }
+                    }
+                    result.push_str(rest);
+                    Ok(Value::String(Rc::new(result)))
+                }
+                _ => Err("__templateRender: expected (String, {})".to_string()),
+            }
+        });
+
+        // __exit is dispatched specially in call_value to capture exit_code on self
+        self.define_native("__exit", 1, |_| Ok(Value::Null));
 
         // __ioLines and __fsReadLines need interpreter dispatch (they return lazy iterators)
         self.define_native("__ioLines", 0, |_| Ok(Value::Null));
@@ -1240,8 +1281,8 @@ impl Interpreter {
             (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a + b)),
             (Value::Int(a), Value::Float(b)) => Ok(Value::Float(*a as f64 + b)),
             (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a + *b as f64)),
-            (Value::String(a), Value::String(b)) => {
-                Ok(Value::String(Rc::new(format!("{}{}", a, b))))
+            (Value::String(_), Value::String(_)) => {
+                Err("String concatenation with + is not supported; use interpolation: \"${a}${b}\"".to_string())
             }
             _ => Err(format!("Cannot add {} and {}", left.type_name(), right.type_name())),
         }
@@ -1391,6 +1432,14 @@ impl Interpreter {
                         self.output.push(output.clone());
                         println!("{}", output);
                         return Ok(args[0].clone());
+                    }
+                    "__exit" => {
+                        let code = match &args[0] {
+                            Value::Int(n) => *n as i32,
+                            _ => 1,
+                        };
+                        self.exit_code = Some(code);
+                        return Err(format!("__exit:{}", code));
                     }
                     "for" => {
                         return self.builtin_for(&args[0], &args[1]);

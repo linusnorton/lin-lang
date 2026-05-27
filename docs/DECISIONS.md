@@ -98,11 +98,25 @@
 
 ## ADR-014: Inline block parsing for lambda bodies inside parentheses
 
-**Decision**: `parse_function_body` detects when a function body starts with `val`/`var` (indicating a multi-statement body) and parses an "inline block" — a sequence of statements terminated by `)` rather than DEDENT.
+**Decision**: `parse_function_body` always delegates to `parse_inline_block` when there is no `Indent` token ahead. `parse_inline_block` collects statements until it sees `Newline`, `)`, `]`, `}`, `,`, `Dedent`, or EOF, then returns either the single expression or an `Expr::Block` wrapping all collected statements.
 
-**Rationale**: Inside parentheses, the lexer suppresses all INDENT/DEDENT and Newline tokens (ADR-004). A lambda like `x => val y = x * 2; y` inside `.for(...)` has no indentation markers, so `parse_expr_or_block` cannot detect the block. The inline block parser handles this by treating `val`/`var` as the signal for multi-statement body.
+**Rationale**: Inside parentheses, brackets, or braces, the lexer suppresses all INDENT/DEDENT and Newline tokens (ADR-004), so `parse_expr_or_block` cannot detect a multi-statement body. At top level, Newline tokens are present and `parse_inline_block` breaks on them, making it behave identically to `parse_expr` for the single-expression case. The break conditions `]` and `}` prevent over-consuming array and object literal contents. `Comma` ensures argument-list lambdas (e.g. `iter(() => 0, i => i + 1)`) parse correctly.
 
-**Consequence**: Multi-statement lambdas work correctly inside `.for()`, `.map()`, and other callback-accepting function calls. Single-expression lambdas are unaffected.
+The earlier version used `val`/`var` as the trigger for multi-statement inline bodies. That was too narrow — bare expression side-effects (calls to `print`, `writeFile`, etc.) were silently dropped, leaving only the first expression evaluated.
+
+**Consequence**: Bare side-effect sequences work in both inline and indented lambda bodies:
+
+```txt
+[1, 2, 3].for(x =>
+  print("before")    // executed
+  print(toString(x)) // executed
+)
+
+val myFunc = () =>
+  print("first")     // executed
+  print("second")    // executed
+  42                 // return value
+```
 
 ## ADR-015: Forward references between top-level functions via mutable cells
 

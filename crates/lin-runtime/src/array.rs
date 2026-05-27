@@ -1,12 +1,14 @@
 use std::alloc::{alloc, dealloc, realloc, Layout};
 
 /// Heap-allocated growable array.
-/// Layout: refcount (u32) | len (u64) | cap (u64) | data (*mut LinArrayElem)
-/// Each element is a tagged { tag: u8, pad: [u8;7], payload: u64 } cell.
+/// Layout: refcount (u32) | elem_tag (u8) | _pad3 ([u8;3]) | len (u64) | cap (u64) | data (*mut LinArrayElem)
+/// elem_tag == 0xFF → tagged elements (LinArrayElem 16-byte layout).
+/// elem_tag == TAG_INT32/INT64/FLOAT32/FLOAT64 → flat scalar elements (raw T-sized layout).
 #[repr(C)]
 pub struct LinArray {
     pub refcount: u32,
-    _pad: u32,
+    pub elem_tag: u8,
+    _pad3: [u8; 3],
     pub len: u64,
     pub cap: u64,
     pub data: *mut LinArrayElem,
@@ -41,6 +43,8 @@ pub unsafe extern "C" fn lin_array_alloc(initial_cap: u64) -> *mut LinArray {
     let arr_layout = array_layout();
     let ptr = alloc(arr_layout) as *mut LinArray;
     (*ptr).refcount = 1;
+    (*ptr).elem_tag = 0xFF;
+    (*ptr)._pad3 = [0; 3];
     (*ptr).len = 0;
     (*ptr).cap = cap;
     let elem_layout = array_elem_layout(cap);
@@ -105,6 +109,71 @@ pub unsafe extern "C" fn lin_array_push_tagged(arr: *mut LinArray, tagged: *cons
     (*arr).len = len + 1;
 }
 
+/// Convert a flat i32 array to a tagged LinArray (each element tagged as TAG_INT32).
+/// Used when passing a flat array into a Json-typed context.
+#[no_mangle]
+pub unsafe extern "C" fn lin_flat_to_tagged_i32(flat: *const LinArray) -> *mut LinArray {
+    let len = (*flat).len;
+    let tagged = lin_array_alloc(len.max(4));
+    let src = (*flat).data as *const i32;
+    for i in 0..len as usize {
+        let v = *src.add(i);
+        let slot = (*tagged).data.add(i);
+        (*slot).tag = crate::tagged::TAG_INT32;
+        (*slot).payload = v as i64 as u64;
+    }
+    (*tagged).len = len;
+    tagged
+}
+
+/// Convert a flat i64 array to a tagged LinArray (each element tagged as TAG_INT64).
+#[no_mangle]
+pub unsafe extern "C" fn lin_flat_to_tagged_i64(flat: *const LinArray) -> *mut LinArray {
+    let len = (*flat).len;
+    let tagged = lin_array_alloc(len.max(4));
+    let src = (*flat).data as *const i64;
+    for i in 0..len as usize {
+        let v = *src.add(i);
+        let slot = (*tagged).data.add(i);
+        (*slot).tag = crate::tagged::TAG_INT64;
+        (*slot).payload = v as u64;
+    }
+    (*tagged).len = len;
+    tagged
+}
+
+/// Convert a flat f32 array to a tagged LinArray (each element tagged as TAG_FLOAT32).
+#[no_mangle]
+pub unsafe extern "C" fn lin_flat_to_tagged_f32(flat: *const LinArray) -> *mut LinArray {
+    let len = (*flat).len;
+    let tagged = lin_array_alloc(len.max(4));
+    let src = (*flat).data as *const f32;
+    for i in 0..len as usize {
+        let v = *src.add(i);
+        let slot = (*tagged).data.add(i);
+        (*slot).tag = crate::tagged::TAG_FLOAT32;
+        (*slot).payload = v.to_bits() as u64;
+    }
+    (*tagged).len = len;
+    tagged
+}
+
+/// Convert a flat f64 array to a tagged LinArray (each element tagged as TAG_FLOAT64).
+#[no_mangle]
+pub unsafe extern "C" fn lin_flat_to_tagged_f64(flat: *const LinArray) -> *mut LinArray {
+    let len = (*flat).len;
+    let tagged = lin_array_alloc(len.max(4));
+    let src = (*flat).data as *const f64;
+    for i in 0..len as usize {
+        let v = *src.add(i);
+        let slot = (*tagged).data.add(i);
+        (*slot).tag = crate::tagged::TAG_FLOAT64;
+        (*slot).payload = v.to_bits();
+    }
+    (*tagged).len = len;
+    tagged
+}
+
 /// Get a pointer to the element payload at index. Panics (exits) on OOB.
 #[no_mangle]
 pub unsafe extern "C" fn lin_array_get(arr: *const LinArray, idx: i64) -> *mut LinArrayElem {
@@ -121,6 +190,194 @@ pub unsafe extern "C" fn lin_array_length(arr: *const LinArray) -> i64 {
     (*arr).len as i64
 }
 
+/// Get element at index as a heap-allocated TaggedVal*, handling both flat and tagged arrays.
+/// The caller is responsible for eventual deallocation. Returns null on OOB.
+#[no_mangle]
+pub unsafe extern "C" fn lin_array_get_tagged(arr: *const LinArray, idx: i64) -> *mut crate::tagged::TaggedVal {
+    use crate::tagged::*;
+    if arr.is_null() { return std::ptr::null_mut(); }
+    let len = (*arr).len as i64;
+    if idx < 0 || idx >= len {
+        eprintln!("Runtime error: array index {} out of bounds (len {})", idx, len);
+        std::process::exit(1);
+    }
+    let tv_layout = Layout::from_size_align_unchecked(
+        std::mem::size_of::<TaggedVal>(),
+        std::mem::align_of::<TaggedVal>(),
+    );
+    let tv = alloc(tv_layout) as *mut TaggedVal;
+    let tag = (*arr).elem_tag;
+    match tag {
+        TAG_INT32 => {
+            let v = *((*arr).data as *const i32).add(idx as usize);
+            (*tv).tag = TAG_INT32;
+            (*tv)._pad = [0; 7];
+            (*tv).payload = v as i64 as u64;
+        }
+        TAG_INT64 => {
+            let v = *((*arr).data as *const i64).add(idx as usize);
+            (*tv).tag = TAG_INT64;
+            (*tv)._pad = [0; 7];
+            (*tv).payload = v as u64;
+        }
+        TAG_FLOAT32 => {
+            let v = *((*arr).data as *const f32).add(idx as usize);
+            (*tv).tag = TAG_FLOAT32;
+            (*tv)._pad = [0; 7];
+            (*tv).payload = v.to_bits() as u64;
+        }
+        TAG_FLOAT64 => {
+            let v = *((*arr).data as *const f64).add(idx as usize);
+            (*tv).tag = TAG_FLOAT64;
+            (*tv)._pad = [0; 7];
+            (*tv).payload = v.to_bits();
+        }
+        _ => {
+            // Tagged array: elem is already a LinArrayElem (16 bytes) = TaggedVal layout.
+            let elem = (*arr).data.add(idx as usize);
+            std::ptr::copy_nonoverlapping(elem as *const u8, tv as *mut u8, std::mem::size_of::<TaggedVal>());
+        }
+    }
+    tv
+}
+
+/// Build a tagged LinArray containing elements from arr[start..end] (for rest patterns).
+/// Handles both flat and tagged source arrays.
+#[no_mangle]
+pub unsafe extern "C" fn lin_array_slice_tagged(arr: *const LinArray, start: i64, end: i64) -> *mut LinArray {
+    let len = (*arr).len as i64;
+    let start = start.max(0).min(len);
+    let end = end.max(start).min(len);
+    let count = (end - start) as u64;
+    let out = lin_array_alloc(count.max(4));
+    for i in 0..count as i64 {
+        let tv = lin_array_get_tagged(arr, start + i);
+        // Push into tagged output array
+        let out_len = (*out).len;
+        let out_cap = (*out).cap;
+        if out_len == out_cap {
+            let new_cap = out_cap * 2;
+            let old_layout = array_elem_layout(out_cap);
+            let new_layout = array_elem_layout(new_cap);
+            (*out).data = std::alloc::realloc((*out).data as *mut u8, old_layout, new_layout.size()) as *mut LinArrayElem;
+            (*out).cap = new_cap;
+        }
+        let slot = (*out).data.add(out_len as usize);
+        std::ptr::copy_nonoverlapping(tv as *const u8, slot as *mut u8, std::mem::size_of::<crate::tagged::TaggedVal>());
+        (*out).len = out_len + 1;
+        // Free the heap TaggedVal since we've copied it.
+        dealloc(tv as *mut u8, Layout::from_size_align_unchecked(
+            std::mem::size_of::<crate::tagged::TaggedVal>(),
+            std::mem::align_of::<crate::tagged::TaggedVal>(),
+        ));
+    }
+    out
+}
+
+/// Copy all elements from `src` into `dst` (tagged arrays only).
+/// Used by lin concat(a, b) — appends all elements of src to dst.
+#[no_mangle]
+pub unsafe extern "C" fn lin_array_concat_into(dst: *mut LinArray, src: *const LinArray) {
+    if src.is_null() { return; }
+    let src_len = (*src).len as usize;
+    for i in 0..src_len {
+        let elem = (*src).data.add(i);
+        lin_array_push_tagged(dst, elem as *const u8);
+    }
+}
+
+/// Copy all i32 elements from `src` flat array into `dst` flat array.
+#[no_mangle]
+pub unsafe extern "C" fn lin_flat_array_concat_into_i32(dst: *mut LinArray, src: *const LinArray) {
+    if src.is_null() { return; }
+    let src_len = (*src).len as usize;
+    let src_data = (*src).data as *const i32;
+    for i in 0..src_len {
+        lin_flat_array_push_i32(dst, *src_data.add(i));
+    }
+}
+
+/// Copy all i64 elements from `src` flat array into `dst` flat array.
+#[no_mangle]
+pub unsafe extern "C" fn lin_flat_array_concat_into_i64(dst: *mut LinArray, src: *const LinArray) {
+    if src.is_null() { return; }
+    let src_len = (*src).len as usize;
+    let src_data = (*src).data as *const i64;
+    for i in 0..src_len {
+        lin_flat_array_push_i64(dst, *src_data.add(i));
+    }
+}
+
+/// Copy all f32 elements from `src` flat array into `dst` flat array.
+#[no_mangle]
+pub unsafe extern "C" fn lin_flat_array_concat_into_f32(dst: *mut LinArray, src: *const LinArray) {
+    if src.is_null() { return; }
+    let src_len = (*src).len as usize;
+    let src_data = (*src).data as *const f32;
+    for i in 0..src_len {
+        lin_flat_array_push_f32(dst, *src_data.add(i));
+    }
+}
+
+/// Copy all f64 elements from `src` flat array into `dst` flat array.
+#[no_mangle]
+pub unsafe extern "C" fn lin_flat_array_concat_into_f64(dst: *mut LinArray, src: *const LinArray) {
+    if src.is_null() { return; }
+    let src_len = (*src).len as usize;
+    let src_data = (*src).data as *const f64;
+    for i in 0..src_len {
+        lin_flat_array_push_f64(dst, *src_data.add(i));
+    }
+}
+
+/// Tagged-element array equality (structural, element-by-element).
+#[no_mangle]
+pub unsafe extern "C" fn lin_array_eq(a: *const LinArray, b: *const LinArray) -> u8 {
+    if a == b { return 1; }
+    if a.is_null() || b.is_null() { return 0; }
+    let len = (*a).len;
+    if len != (*b).len { return 0; }
+    for i in 0..len as usize {
+        let ae = (*a).data.add(i);
+        let be = (*b).data.add(i);
+        if (*ae).tag != (*be).tag { return 0; }
+        // Compare payloads — for strings/arrays/objects this is pointer eq (shallow),
+        // which matches the spec for the typed-array case where elements are scalars.
+        if (*ae).payload != (*be).payload { return 0; }
+    }
+    1
+}
+
+/// Flat i32 array equality.
+#[no_mangle]
+pub unsafe extern "C" fn lin_flat_array_eq_i32(a: *const LinArray, b: *const LinArray) -> u8 {
+    if a == b { return 1; }
+    if a.is_null() || b.is_null() { return 0; }
+    let len = (*a).len;
+    if len != (*b).len { return 0; }
+    let da = (*a).data as *const i32;
+    let db = (*b).data as *const i32;
+    for i in 0..len as usize {
+        if *da.add(i) != *db.add(i) { return 0; }
+    }
+    1
+}
+
+/// Flat i64 array equality.
+#[no_mangle]
+pub unsafe extern "C" fn lin_flat_array_eq_i64(a: *const LinArray, b: *const LinArray) -> u8 {
+    if a == b { return 1; }
+    if a.is_null() || b.is_null() { return 0; }
+    let len = (*a).len;
+    if len != (*b).len { return 0; }
+    let da = (*a).data as *const i64;
+    let db = (*b).data as *const i64;
+    for i in 0..len as usize {
+        if *da.add(i) != *db.add(i) { return 0; }
+    }
+    1
+}
+
 // -------------------------------------------------------------------------
 // Flat (unboxed) scalar arrays
 // -------------------------------------------------------------------------
@@ -132,9 +389,11 @@ pub unsafe extern "C" fn lin_array_length(arr: *const LinArray) -> i64 {
 // *mut LinArrayElem.  A flat i32 array stores 4-byte elements; the tag byte
 // is never written.
 //
-// Flat array: refcount | _pad | len | cap | data(*mut T)
+// Flat array: refcount | elem_tag | _pad3 | len | cap | data(*mut T)
 // The `data` field is typed as *mut LinArrayElem for layout compatibility but
 // treated as *mut T internally — always accessed via the flat functions below.
+// elem_tag stores TAG_INT32/TAG_INT64/TAG_FLOAT32/TAG_FLOAT64 so the equality
+// function can dispatch to the right comparison without extra type info.
 
 // --- i32 ---
 
@@ -144,6 +403,8 @@ pub unsafe extern "C" fn lin_flat_array_alloc_i32(initial_cap: u64) -> *mut LinA
     let arr_layout = array_layout();
     let ptr = alloc(arr_layout) as *mut LinArray;
     (*ptr).refcount = 1;
+    (*ptr).elem_tag = crate::tagged::TAG_INT32;
+    (*ptr)._pad3 = [0; 3];
     (*ptr).len = 0;
     (*ptr).cap = cap;
     let data_layout = Layout::from_size_align_unchecked(
@@ -202,6 +463,8 @@ pub unsafe extern "C" fn lin_flat_array_alloc_i64(initial_cap: u64) -> *mut LinA
     let arr_layout = array_layout();
     let ptr = alloc(arr_layout) as *mut LinArray;
     (*ptr).refcount = 1;
+    (*ptr).elem_tag = crate::tagged::TAG_INT64;
+    (*ptr)._pad3 = [0; 3];
     (*ptr).len = 0;
     (*ptr).cap = cap;
     let data_layout = Layout::from_size_align_unchecked(
@@ -260,6 +523,8 @@ pub unsafe extern "C" fn lin_flat_array_alloc_f32(initial_cap: u64) -> *mut LinA
     let arr_layout = array_layout();
     let ptr = alloc(arr_layout) as *mut LinArray;
     (*ptr).refcount = 1;
+    (*ptr).elem_tag = crate::tagged::TAG_FLOAT32;
+    (*ptr)._pad3 = [0; 3];
     (*ptr).len = 0;
     (*ptr).cap = cap;
     let data_layout = Layout::from_size_align_unchecked(
@@ -318,6 +583,8 @@ pub unsafe extern "C" fn lin_flat_array_alloc_f64(initial_cap: u64) -> *mut LinA
     let arr_layout = array_layout();
     let ptr = alloc(arr_layout) as *mut LinArray;
     (*ptr).refcount = 1;
+    (*ptr).elem_tag = crate::tagged::TAG_FLOAT64;
+    (*ptr)._pad3 = [0; 3];
     (*ptr).len = 0;
     (*ptr).cap = cap;
     let data_layout = Layout::from_size_align_unchecked(

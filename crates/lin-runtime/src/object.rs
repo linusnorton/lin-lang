@@ -90,6 +90,76 @@ pub unsafe extern "C" fn lin_object_get(obj: *const LinObject, key: *const LinSt
     std::ptr::null()
 }
 
+/// Copy all fields from `src` into `dst`, overwriting existing keys.
+/// Used to implement object spread: `{ ...src, ... }`.
+#[no_mangle]
+pub unsafe extern "C" fn lin_object_merge(dst: *mut LinObject, src: *const LinObject) {
+    if src.is_null() {
+        eprintln!("Runtime error: cannot spread null into object");
+        std::process::exit(1);
+    }
+    let src_len = (*src).len;
+    for i in 0..src_len {
+        let entry = (*src).entries.add(i as usize);
+        lin_object_set(dst, (*entry).key, &(*entry).value);
+    }
+}
+
+/// Return a LinArray* containing all keys as LinString* (tagged TAG_STR).
+#[no_mangle]
+pub unsafe extern "C" fn lin_object_keys(obj: *const LinObject) -> *mut crate::array::LinArray {
+    let len = if obj.is_null() { 0 } else { (*obj).len };
+    let arr = crate::array::lin_array_alloc(len as u64);
+    for i in 0..len {
+        let entry = (*obj).entries.add(i as usize);
+        let key_ptr = (*entry).key as u64;
+        let slot = (*arr).data.add(i as usize);
+        (*slot).tag = crate::tagged::TAG_STR;
+        (*slot).payload = key_ptr;
+    }
+    (*arr).len = len as u64;
+    arr
+}
+
+/// Return a LinArray* containing all values as TaggedVal (each stored inline).
+#[no_mangle]
+pub unsafe extern "C" fn lin_object_values(obj: *const LinObject) -> *mut crate::array::LinArray {
+    let len = if obj.is_null() { 0 } else { (*obj).len };
+    let arr = crate::array::lin_array_alloc(len as u64);
+    for i in 0..len {
+        let entry = (*obj).entries.add(i as usize);
+        let src = &(*entry).value as *const TaggedVal;
+        let slot = (*arr).data.add(i as usize);
+        // Copy tag+payload from the TaggedVal directly into the array slot.
+        std::ptr::copy_nonoverlapping(src as *const u8, slot as *mut u8, 16);
+    }
+    (*arr).len = len as u64;
+    arr
+}
+
+/// Return a LinArray* of pairs (each pair is a LinArray* with [key, value]).
+#[no_mangle]
+pub unsafe extern "C" fn lin_object_entries(obj: *const LinObject) -> *mut crate::array::LinArray {
+    let len = if obj.is_null() { 0 } else { (*obj).len };
+    let out = crate::array::lin_array_alloc(len as u64);
+    for i in 0..len {
+        let entry = (*obj).entries.add(i as usize);
+        // Build pair array [key, value]
+        let pair = crate::array::lin_array_alloc(2);
+        (*(*pair).data.add(0)).tag = crate::tagged::TAG_STR;
+        (*(*pair).data.add(0)).payload = (*entry).key as u64;
+        let val_src = &(*entry).value as *const TaggedVal;
+        std::ptr::copy_nonoverlapping(val_src as *const u8, (*pair).data.add(1) as *mut u8, 16);
+        (*pair).len = 2;
+        // Store pair pointer in output array as TAG_ARRAY
+        let slot = (*out).data.add(i as usize);
+        (*slot).tag = crate::tagged::TAG_ARRAY;
+        (*slot).payload = pair as u64;
+    }
+    (*out).len = len as u64;
+    out
+}
+
 /// Check if two LinString keys are equal.
 unsafe fn lin_string_key_eq(a: *const LinString, b: *const LinString) -> bool {
     if a == b { return true; }
@@ -179,8 +249,71 @@ unsafe fn tagged_val_eq(a: *const crate::tagged::TaggedVal, b: *const crate::tag
         let bs_ptr = bp as *const crate::string::LinString;
         return crate::string::lin_string_eq(as_ptr, bs_ptr);
     }
-    // For objects, arrays, etc.: compare by pointer (structural eq not yet recursive).
+    if at == TAG_OBJECT {
+        let ao = ap as *const LinObject;
+        let bo = bp as *const LinObject;
+        return lin_object_eq(ao, bo) != 0;
+    }
+    if at == TAG_ARRAY {
+        let aa = ap as *const crate::array::LinArray;
+        let ba = bp as *const crate::array::LinArray;
+        return lin_array_eq_deep(aa, ba);
+    }
+    // For other types (closures, iterators): pointer equality.
     ap == bp
+}
+
+/// Deep equality for arrays: dispatches on elem_tag to handle flat vs tagged layouts.
+unsafe fn lin_array_eq_deep(a: *const crate::array::LinArray, b: *const crate::array::LinArray) -> bool {
+    use crate::tagged::*;
+    if a == b { return true; }
+    if a.is_null() || b.is_null() { return false; }
+    let len = (*a).len;
+    if len != (*b).len { return false; }
+    let tag_a = (*a).elem_tag;
+    let tag_b = (*b).elem_tag;
+    if tag_a != tag_b { return false; }
+    match tag_a {
+        TAG_INT32 => {
+            let da = (*a).data as *const i32;
+            let db = (*b).data as *const i32;
+            for i in 0..len as usize {
+                if *da.add(i) != *db.add(i) { return false; }
+            }
+        }
+        TAG_INT64 => {
+            let da = (*a).data as *const i64;
+            let db = (*b).data as *const i64;
+            for i in 0..len as usize {
+                if *da.add(i) != *db.add(i) { return false; }
+            }
+        }
+        TAG_FLOAT32 => {
+            let da = (*a).data as *const f32;
+            let db = (*b).data as *const f32;
+            for i in 0..len as usize {
+                if *da.add(i) != *db.add(i) { return false; }
+            }
+        }
+        TAG_FLOAT64 => {
+            let da = (*a).data as *const f64;
+            let db = (*b).data as *const f64;
+            for i in 0..len as usize {
+                if *da.add(i) != *db.add(i) { return false; }
+            }
+        }
+        _ => {
+            // Tagged array (elem_tag == 0xFF or any other): elements are LinArrayElem.
+            for i in 0..len as usize {
+                let ae = (*a).data.add(i);
+                let be = (*b).data.add(i);
+                let av = ae as *const crate::tagged::TaggedVal;
+                let bv = be as *const crate::tagged::TaggedVal;
+                if !tagged_val_eq(av, bv) { return false; }
+            }
+        }
+    }
+    true
 }
 
 /// Decrement refcount and free the object struct + entries buffer if zero.
@@ -195,5 +328,35 @@ pub unsafe extern "C" fn lin_object_release(obj: *mut LinObject) {
         let cap = (*obj).cap;
         std::alloc::dealloc((*obj).entries as *mut u8, entries_layout(cap));
         std::alloc::dealloc(obj as *mut u8, object_layout());
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lin_object_length(obj: *const LinObject) -> i64 {
+    if obj.is_null() { return 0; }
+    (*obj).len as i64
+}
+
+/// Copy all fields from `src` into `dst` except those whose keys are in `excluded`.
+/// `excluded` is a pointer to `n_excluded` LinString* values.
+/// Used to implement object rest destructuring: `val { a, b, ...rest } = obj`.
+#[no_mangle]
+pub unsafe extern "C" fn lin_object_copy_except(
+    dst: *mut LinObject,
+    src: *const LinObject,
+    excluded: *const *const LinString,
+    n_excluded: u32,
+) {
+    if src.is_null() { return; }
+    let len = (*src).len;
+    'outer: for i in 0..len {
+        let entry = (*src).entries.add(i as usize);
+        let key = (*entry).key;
+        for j in 0..n_excluded {
+            if lin_string_key_eq(key, *excluded.add(j as usize)) {
+                continue 'outer;
+            }
+        }
+        lin_object_set(dst, key, &(*entry).value);
     }
 }

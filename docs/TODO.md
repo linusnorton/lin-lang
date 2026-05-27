@@ -569,8 +569,11 @@ See spec §34 for the full design.
 
 ## Next
 
-- Implement Http server.
+- Tidy up stdlib, add .at for strings and re-implement into more native Lin
+- Compiled compiler and release pipeline
 - Implement language server / VS Code support with syntax highlighting.
+- Example with web server and lint
+- More stdlib utilities
 
 ---
 

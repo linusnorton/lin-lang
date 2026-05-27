@@ -3,12 +3,12 @@ members = [
     "crates/lin-common",
     "crates/lin-lex",
     "crates/lin-parse",
-    "crates/lin-eval",
     "crates/lin-check",
     "crates/lin-ir",
     "crates/lin-codegen",
     "crates/lin-runtime",
     "crates/lin-compile",
+    "crates/lin-eval",
     "crates/lin",
     "crates/lin-lsp",
 ]

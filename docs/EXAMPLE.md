@@ -205,7 +205,7 @@ val bob: Person = {
 // A value can have extra fields and still match a smaller shape
 
 val greet = (item: Named): String =>
-  "Hello " + item["name"]
+  "Hello ${item["name"]}"
 
 val greeting2 = greet({
   "name": "Alice",
@@ -221,7 +221,7 @@ val multiply = (a: Int32, b: Int32): Int32 =>
   a * b
 
 val fullName = (first: String, last: String): String =>
-  first + " " + last
+  "${first} ${last}"
 
 val answer = add(40, 2)
 
@@ -269,10 +269,10 @@ val l2 = if person["age"] >= 18
 val l3 = if person["age"] >= 18
   then
     val prefix = "ad"
-    prefix + "ult"
+    "${prefix}ult"
   else
     val prefix = "ch"
-    prefix + "ild"
+    "${prefix}ild"
 
 // Continuation with && or || on the next line
 

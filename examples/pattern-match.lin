@@ -12,8 +12,8 @@ print(describe("hi"))
 // Pattern matching with has
 val describePerson = (input: Json): String =>
   match input
-    has { name, age } when age > 30 => "Old: " + name
-    has { name } => "Young: " + name
+    has { name, age } when age > 30 => "Old: ${name}"
+    has { name } => "Young: ${name}"
     is Null => "nothing"
     else => "other"
 
@@ -30,14 +30,14 @@ val divide = (a: Float64, b: Float64): Json =>
 
 val result = divide(10.0, 2.0)
 val message = match result
-  has { "type": "success", value } => "Result: " + toString(value)
-  has { "type": "failure", error } => "Error: " + error
+  has { "type": "success", value } => "Result: ${value}"
+  has { "type": "failure", error } => "Error: ${error}"
 
 print(message)
 
 val errResult = divide(10.0, 0.0)
 val errMessage = match errResult
-  has { "type": "success", value } => "Result: " + toString(value)
-  has { "type": "failure", error } => "Error: " + error
+  has { "type": "success", value } => "Result: ${value}"
+  has { "type": "failure", error } => "Error: ${error}"
 
 print(errMessage)

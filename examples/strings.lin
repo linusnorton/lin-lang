@@ -11,6 +11,8 @@ print(tabbed)
 val quoted = "she said \"hi\""
 print(quoted)
 
-// String concatenation
-val full = "Hello" + " " + "World"
+// String building via interpolation
+val first = "Hello"
+val rest = "World"
+val full = "${first} ${rest}"
 print(full)

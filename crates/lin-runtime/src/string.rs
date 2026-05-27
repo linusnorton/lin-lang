@@ -1,5 +1,5 @@
 use std::alloc::{alloc_zeroed, dealloc, Layout};
-use crate::tagged::{TaggedVal, TAG_NULL, TAG_BOOL, TAG_INT32, TAG_INT64, TAG_FLOAT64, TAG_STR, TAG_FLOAT32};
+use crate::tagged::{TaggedVal, TAG_NULL, TAG_BOOL, TAG_INT32, TAG_INT64, TAG_FLOAT64, TAG_STR, TAG_FLOAT32, TAG_ARRAY, TAG_OBJECT};
 
 /// Runtime string representation: reference-counted, UTF-8.
 /// Layout: refcount (u32) | len (u32) | data ([u8; len])
@@ -68,6 +68,22 @@ pub unsafe extern "C" fn lin_string_concat(a: *const LinString, b: *const LinStr
     ptr
 }
 
+/// Concatenate `n` strings in a single allocation.
+/// `parts` is a pointer to an array of `n` `*const LinString` pointers.
+#[no_mangle]
+pub unsafe extern "C" fn lin_string_build_n(parts: *const *const LinString, n: u32) -> *mut LinString {
+    let parts = std::slice::from_raw_parts(parts, n as usize);
+    let total_len: u32 = parts.iter().map(|&s| (*s).len).sum();
+    let ptr = lin_string_alloc(total_len);
+    let mut dst = (*ptr).data.as_mut_ptr();
+    for &s in parts {
+        let len = (*s).len as usize;
+        std::ptr::copy_nonoverlapping((*s).data.as_ptr(), dst, len);
+        dst = dst.add(len);
+    }
+    ptr
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn lin_string_length(s: *const LinString) -> i32 {
     (*s).len as i32
@@ -115,6 +131,18 @@ pub unsafe extern "C" fn lin_string_char_at(s: *const LinString, index: i32) -> 
     let ptr = lin_string_alloc(1);
     *(*ptr).data.as_mut_ptr() = byte;
     ptr
+}
+
+/// Lexicographic comparison. Returns -1, 0, or 1.
+#[no_mangle]
+pub unsafe extern "C" fn lin_string_cmp(a: *const LinString, b: *const LinString) -> i32 {
+    let a_bytes = std::slice::from_raw_parts((*a).data.as_ptr(), (*a).len as usize);
+    let b_bytes = std::slice::from_raw_parts((*b).data.as_ptr(), (*b).len as usize);
+    match a_bytes.cmp(b_bytes) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    }
 }
 
 // Numeric -> string conversions
@@ -248,6 +276,87 @@ pub unsafe extern "C" fn lin_string_join(arr: *const crate::array::LinArray, sep
     lin_string_from_bytes(result.as_ptr(), result.len() as u32)
 }
 
+/// Recursively convert a TaggedVal to its JSON string representation.
+/// Used for toString(obj), toString(arr), and string interpolation of complex values.
+pub unsafe fn tagged_to_json_string(tagged: *const TaggedVal) -> String {
+    if tagged.is_null() {
+        return "null".to_string();
+    }
+    let tag = (*tagged).tag;
+    let payload = (*tagged).payload;
+    if tag == TAG_NULL { return "null".to_string(); }
+    if tag == TAG_BOOL { return if payload != 0 { "true" } else { "false" }.to_string(); }
+    if tag == TAG_INT32 { return (payload as i32).to_string(); }
+    if tag == TAG_INT64 { return (payload as i64).to_string(); }
+    if tag == TAG_FLOAT32 {
+        let f = f32::from_bits(payload as u32);
+        return format!("{}", f);
+    }
+    if tag == TAG_FLOAT64 {
+        let f = f64::from_bits(payload);
+        return format!("{}", f);
+    }
+    if tag == TAG_STR {
+        let s = payload as *const LinString;
+        if s.is_null() { return "null".to_string(); }
+        return format!("\"{}\"", (*s).as_str());
+    }
+    if tag == TAG_ARRAY {
+        let arr = payload as *const crate::array::LinArray;
+        if arr.is_null() { return "[]".to_string(); }
+        return array_to_json_string(arr);
+    }
+    if tag == TAG_OBJECT {
+        let obj = payload as *const crate::object::LinObject;
+        if obj.is_null() { return "{}".to_string(); }
+        return object_to_json_string(obj);
+    }
+    "[object]".to_string()
+}
+
+unsafe fn array_to_json_string(arr: *const crate::array::LinArray) -> String {
+    let len = (*arr).len as usize;
+    let mut parts = Vec::with_capacity(len);
+    for i in 0..len {
+        let elem = (*arr).data.add(i);
+        parts.push(tagged_to_json_string(elem as *const TaggedVal));
+    }
+    format!("[{}]", parts.join(", "))
+}
+
+unsafe fn object_to_json_string(obj: *const crate::object::LinObject) -> String {
+    let len = (*obj).len as usize;
+    let mut parts = Vec::with_capacity(len);
+    for i in 0..len {
+        let entry = (*obj).entries.add(i);
+        let key = (*entry).key;
+        let key_str = if key.is_null() { "null".to_string() } else { (*key).as_str().to_string() };
+        let val_str = tagged_to_json_string(&(*entry).value as *const TaggedVal);
+        parts.push(format!("\"{}\": {}", key_str, val_str));
+    }
+    format!("{{{}}}", parts.join(", "))
+}
+
+/// Convert a LinArray* to its JSON string representation.
+#[no_mangle]
+pub unsafe extern "C" fn lin_array_to_string(arr: *const crate::array::LinArray) -> *mut LinString {
+    if arr.is_null() {
+        return lin_string_from_bytes(b"null".as_ptr(), 4);
+    }
+    let s = array_to_json_string(arr);
+    lin_string_from_bytes(s.as_ptr(), s.len() as u32)
+}
+
+/// Convert a LinObject* to its JSON string representation.
+#[no_mangle]
+pub unsafe extern "C" fn lin_object_to_string(obj: *const crate::object::LinObject) -> *mut LinString {
+    if obj.is_null() {
+        return lin_string_from_bytes(b"null".as_ptr(), 4);
+    }
+    let s = object_to_json_string(obj);
+    lin_string_from_bytes(s.as_ptr(), s.len() as u32)
+}
+
 /// Convert a TaggedVal* to a string, dispatching on the runtime tag.
 /// `tagged` may be null (treated as Null) or a pointer to a TaggedVal.
 #[no_mangle]
@@ -272,8 +381,13 @@ pub unsafe extern "C" fn lin_tagged_to_string(tagged: *const TaggedVal) -> *mut 
         let f = f64::from_bits(payload);
         lin_float_to_string(f)
     } else if tag == TAG_STR {
-        // payload is LinString*
         payload as *mut LinString
+    } else if tag == TAG_ARRAY {
+        let arr = payload as *const crate::array::LinArray;
+        lin_array_to_string(arr)
+    } else if tag == TAG_OBJECT {
+        let obj = payload as *const crate::object::LinObject;
+        lin_object_to_string(obj)
     } else {
         lin_string_from_bytes(b"[object]".as_ptr(), 8)
     }

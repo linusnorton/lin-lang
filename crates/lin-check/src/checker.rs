@@ -13,8 +13,10 @@ use crate::widen::widen_numeric;
 
 /// Collect TypeVar substitutions from matching `actual` against `pattern`.
 /// E.g., matching `Iterator<Int32>` against `Iterator<TypeVar(9010)>` yields `9010 -> Int32`.
+/// TypeVar(u32::MAX) is the special "any"/"Json" wildcard — never substituted.
 fn collect_type_subs(pattern: &Type, actual: &Type, subs: &mut std::collections::HashMap<u32, Type>) {
     match (pattern, actual) {
+        (Type::TypeVar(id), _) if *id == u32::MAX => {}  // Json wildcard: skip
         (Type::TypeVar(id), t) => { subs.insert(*id, t.clone()); }
         (Type::Array(pt), Type::Array(at)) => collect_type_subs(pt, at, subs),
         (Type::Array(pt), Type::FixedArray(ats)) => {
@@ -70,6 +72,9 @@ pub struct Checker {
     /// Global accumulator of TypeVar solutions discovered during inference.
     /// Populated by every call to collect_type_subs. Used by the zonking pass.
     solved_type_vars: std::collections::HashMap<u32, Type>,
+    /// TypeVar IDs from imported module signatures. These are generic "any" slots
+    /// that must never be solved to a concrete type in this module's zonking pass.
+    protected_type_vars: std::collections::HashSet<u32>,
     /// Slots of mutable global (`var`) bindings. Used by the async var-capture check.
     mutable_global_slots: std::collections::HashMap<usize, String>,
 }
@@ -88,6 +93,7 @@ impl Checker {
             span_type_map: Vec::new(),
             import_types: std::collections::HashMap::new(),
             solved_type_vars: std::collections::HashMap::new(),
+            protected_type_vars: std::collections::HashSet::new(),
             mutable_global_slots: std::collections::HashMap::new(),
         }
     }
@@ -183,29 +189,73 @@ impl Checker {
                 // Object/array destructuring: bind each field/element to its own slot
                 // by emitting a Destructure statement that codegen handles properly.
                 match pattern {
-                    lin_parse::ast::Pattern::Object(fields, _, _) => {
+                    lin_parse::ast::Pattern::Object(fields, obj_rest, _) => {
                         // First store the whole object in a temp slot.
                         let obj_slot = self.env.define("__destr_obj".to_string(), ty.clone(), false);
+                        let mut typed_fields = Vec::new();
+                        for f in fields.iter() {
+                            let key = f.key.clone().or_else(|| match &f.pattern {
+                                lin_parse::ast::Pattern::Ident(n, _) => Some(n.clone()),
+                                _ => None,
+                            }).unwrap_or_default();
+                            let field_ty = if let Type::Object(ref obj_fields) = ty {
+                                obj_fields.get(&key).cloned().unwrap_or(Type::Null)
+                            } else { Type::TypeVar(u32::MAX) };
+                            let slot = match &f.pattern {
+                                lin_parse::ast::Pattern::Ident(name, _) => {
+                                    self.env.define(name.clone(), field_ty.clone(), false)
+                                }
+                                _ => self.env.define("_".to_string(), field_ty.clone(), false),
+                            };
+                            typed_fields.push((key, slot, field_ty));
+                        }
+                        // Bind the rest slot if present
+                        let rest_slot = if let Some(rest_name) = obj_rest {
+                            let slot = self.env.define(rest_name.clone(), Type::TypeVar(u32::MAX), false);
+                            Some(slot)
+                        } else {
+                            None
+                        };
                         let result = TypedStmt::Destructure {
                             obj_slot,
                             value: typed_value,
                             obj_ty: ty.clone(),
-                            fields: fields.iter().map(|f| {
-                                let key = f.key.clone().or_else(|| match &f.pattern {
-                                    lin_parse::ast::Pattern::Ident(n, _) => Some(n.clone()),
-                                    _ => None,
-                                }).unwrap_or_default();
-                                let field_ty = if let Type::Object(ref obj_fields) = ty {
-                                    obj_fields.get(&key).cloned().unwrap_or(Type::Null)
-                                } else { Type::TypeVar(u32::MAX) };
-                                let slot = match &f.pattern {
-                                    lin_parse::ast::Pattern::Ident(name, _) => {
-                                        self.env.define(name.clone(), field_ty.clone(), false)
-                                    }
-                                    _ => self.env.define("_".to_string(), field_ty.clone(), false),
-                                };
-                                (key, slot, field_ty)
-                            }).collect(),
+                            fields: typed_fields,
+                            rest: rest_slot,
+                            span: *span,
+                        };
+                        return Ok(result);
+                    }
+                    lin_parse::ast::Pattern::Array(elements, arr_rest, _) => {
+                        let arr_slot = self.env.define("__destr_arr".to_string(), ty.clone(), false);
+                        let elem_ty_inner = if let Type::Array(inner) = &ty {
+                            *inner.clone()
+                        } else {
+                            Type::TypeVar(u32::MAX)
+                        };
+                        let mut typed_elements = Vec::new();
+                        for (i, elem) in elements.iter().enumerate() {
+                            let slot = match elem {
+                                lin_parse::ast::Pattern::Ident(name, _) => {
+                                    self.env.define(name.clone(), elem_ty_inner.clone(), false)
+                                }
+                                _ => self.env.define("_".to_string(), elem_ty_inner.clone(), false),
+                            };
+                            typed_elements.push((i, slot, elem_ty_inner.clone()));
+                        }
+                        let rest_info = if let Some(rest_name) = arr_rest {
+                            let rest_ty = Type::Array(Box::new(elem_ty_inner.clone()));
+                            let rest_slot = self.env.define(rest_name.clone(), rest_ty.clone(), false);
+                            Some((rest_slot, rest_ty))
+                        } else {
+                            None
+                        };
+                        let result = TypedStmt::ArrayDestructure {
+                            arr_slot,
+                            value: typed_value,
+                            elem_ty: elem_ty_inner,
+                            elements: typed_elements,
+                            rest: rest_info,
                             span: *span,
                         };
                         return Ok(result);
@@ -333,8 +383,8 @@ impl Checker {
     fn check_expr(&mut self, expr: &Expr, expected: &Type) -> Result<TypedExpr, Diagnostic> {
         // For function expressions with a known expected function type, use the expected
         // param types to guide inference (bidirectional type checking).
-        if let (Expr::Function { params, return_type, body, span }, Type::Function { params: expected_params, .. }) = (expr, expected) {
-            return self.infer_function_with_hints(params, return_type, body, *span, None, expected_params);
+        if let (Expr::Function { params, return_type, body, span }, Type::Function { params: expected_params, ret: expected_ret }) = (expr, expected) {
+            return self.infer_function_with_hints(params, return_type, body, *span, None, expected_params, expected_ret);
         }
 
         let inferred = self.infer_expr(expr)?;
@@ -416,17 +466,25 @@ impl Checker {
         let slot = info.slot;
         let is_mutable = info.mutable;
         let def_span = info.def_span;
-        // Record as a capture if inside a function and defined in a non-global outer scope.
-        // Global scope (depth 0) is accessed via global_fn_slots/intrinsic_slots in codegen.
-        if let Some(&fn_entry_depth) = self.function_scope_depths.last() {
-            if var_scope_depth > 0 && var_scope_depth < fn_entry_depth {
-                if let Some(captures) = self.capture_stack.last_mut() {
-                    captures.entry(slot).or_insert_with(|| Capture {
-                        name: name.to_string(),
-                        outer_slot: slot,
-                        is_mutable,
-                        ty: ty.clone(),
-                    });
+        // Record as a capture in every enclosing function where the variable was defined
+        // in a strictly outer scope. This handles multi-level captures: when an inner
+        // closure (depth N) captures a variable from depth D < N, ALL intermediate
+        // closures also need to capture it so each can pass it down to its inner closure.
+        // Global scope (depth 0) is always accessible directly — never captured.
+        if var_scope_depth > 0 {
+            for (i, &fn_entry_depth) in self.function_scope_depths.iter().enumerate().rev() {
+                if var_scope_depth < fn_entry_depth {
+                    if let Some(captures) = self.capture_stack.get_mut(i) {
+                        captures.entry(slot).or_insert_with(|| Capture {
+                            name: name.to_string(),
+                            outer_slot: slot,
+                            is_mutable,
+                            ty: ty.clone(),
+                        });
+                    }
+                } else {
+                    // This function owns or is the variable — no more outer captures needed.
+                    break;
                 }
             }
         }
@@ -593,7 +651,7 @@ impl Checker {
     }
 
     fn infer_assign(&mut self, target: &str, value: &Expr, span: Span) -> Result<TypedExpr, Diagnostic> {
-        let info = self.env.lookup(target).ok_or_else(|| {
+        let (var_scope_depth, info) = self.env.lookup_with_depth(target).ok_or_else(|| {
             Diagnostic::error(span, format!("Undefined variable '{}'", target))
         })?;
         if !info.mutable {
@@ -602,6 +660,25 @@ impl Checker {
         let expected_ty = info.ty.clone();
         let slot = info.slot;
         let def_span = info.def_span;
+        let is_mutable = info.mutable;
+        // Register as a capture in every enclosing function where the variable is defined
+        // in a strictly outer scope (same multi-level propagation as infer_ident).
+        if var_scope_depth > 0 {
+            for (i, &fn_entry_depth) in self.function_scope_depths.iter().enumerate().rev() {
+                if var_scope_depth < fn_entry_depth {
+                    if let Some(captures) = self.capture_stack.get_mut(i) {
+                        captures.entry(slot).or_insert_with(|| Capture {
+                            name: target.to_string(),
+                            outer_slot: slot,
+                            is_mutable,
+                            ty: expected_ty.clone(),
+                        });
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
         let typed_value = self.check_expr(value, &expected_ty)?;
         self.span_type_map.push((span, expected_ty.to_string(), def_span));
         self.env.clear_narrowing(target);
@@ -638,11 +715,11 @@ impl Checker {
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
                 let left_is_any = matches!(left_ty, Type::TypeVar(_));
                 let right_is_any = matches!(right_ty, Type::TypeVar(_));
-                if left_ty == Type::Str && right_ty == Type::Str && op == BinOp::Add {
-                    Type::Str
-                } else if op == BinOp::Add && (left_ty == Type::Str || right_ty == Type::Str) && (left_is_any || right_is_any) {
-                    // String + dynamic (Json field) → String
-                    Type::Str
+                if op == BinOp::Add && (left_ty == Type::Str || right_ty == Type::Str) {
+                    return Err(Diagnostic::error(
+                        span,
+                        "String concatenation with + is not supported; use interpolation: \"${a}${b}\"".to_string(),
+                    ));
                 } else if left_ty.is_numeric() && right_ty.is_numeric() {
                     widen_numeric(&left_ty, &right_ty).unwrap_or(Type::Int32)
                 } else if left_is_any || right_is_any {
@@ -849,6 +926,22 @@ impl Checker {
         span: Span,
     ) -> Result<TypedExpr, Diagnostic> {
         // Desugar: receiver.method(args) -> method(receiver, args)
+        // Special case: TupleArgs receiver spreads all elements as individual args.
+        // e.g. (10, 3).sub -> sub(10, 3), not sub((10, 3))
+        if let Expr::TupleArgs(tuple_exprs, _) = receiver {
+            if tuple_exprs.len() > 1 {
+                let extra_args: Vec<&Expr> = args.as_ref().map(|a| a.as_slice()).unwrap_or(&[]).iter().collect();
+                let all_arg_exprs: Vec<&Expr> = tuple_exprs.iter().chain(extra_args).collect();
+                // Build a synthetic call: method(tuple_exprs[0], tuple_exprs[1], ..., extra_args)
+                let dummy_call = Expr::Call {
+                    func: Box::new(Expr::Ident(method.to_string(), span)),
+                    args: all_arg_exprs.into_iter().cloned().collect(),
+                    span,
+                };
+                return self.infer_expr(&dummy_call);
+            }
+        }
+
         let typed_receiver = self.infer_expr(receiver)?;
 
         // Look up method type for TypeVar substitution.
@@ -1005,8 +1098,10 @@ impl Checker {
         self.env.push_scope();
 
         let mut typed_params = Vec::new();
+        // Destructuring stmts for params with non-Ident patterns (e.g. `{ name, age }: Json`).
+        let mut param_destr_stmts: Vec<TypedStmt> = Vec::new();
 
-        for param in params {
+        for (i, param) in params.iter().enumerate() {
             let ty = if let Some(ref type_ann) = param.type_ann {
                 resolve_type(type_ann, &self.env).map_err(|e| Diagnostic::error(span, e))?
             } else {
@@ -1015,7 +1110,7 @@ impl Checker {
 
             let (name, name_span) = match &param.pattern {
                 Pattern::Ident(name, span) => (name.clone(), Some(*span)),
-                _ => ("_".to_string(), None),
+                _ => (format!("__param_{}", i), None),
             };
 
             let slot = self.env.define_at(name.clone(), ty.clone(), false, name_span);
@@ -1024,6 +1119,38 @@ impl Checker {
                 name,
                 ty: ty.clone(),
             });
+
+            // For destructuring patterns, emit a synthetic Destructure stmt into the body.
+            if let Pattern::Object(fields, obj_rest, _) = &param.pattern {
+                let obj_slot = typed_params.last().unwrap().slot;
+                let mut typed_fields = Vec::new();
+                for f in fields.iter() {
+                    let key = f.key.clone().or_else(|| match &f.pattern {
+                        Pattern::Ident(n, _) => Some(n.clone()),
+                        _ => None,
+                    }).unwrap_or_default();
+                    let field_ty = if let Type::Object(ref obj_fields) = ty {
+                        obj_fields.get(&key).cloned().unwrap_or(Type::Null)
+                    } else { Type::TypeVar(u32::MAX) };
+                    let fslot = match &f.pattern {
+                        Pattern::Ident(fname, _) => self.env.define(fname.clone(), field_ty.clone(), false),
+                        _ => self.env.define("_".to_string(), field_ty.clone(), false),
+                    };
+                    typed_fields.push((key, fslot, field_ty));
+                }
+                let rest_slot = if let Some(rest_name) = obj_rest {
+                    let rslot = self.env.define(rest_name.clone(), Type::TypeVar(u32::MAX), false);
+                    Some(rslot)
+                } else { None };
+                param_destr_stmts.push(TypedStmt::Destructure {
+                    obj_slot,
+                    value: TypedExpr::LocalGet { slot: obj_slot, ty: ty.clone(), span },
+                    obj_ty: ty.clone(),
+                    fields: typed_fields,
+                    rest: rest_slot,
+                    span,
+                });
+            }
         }
 
         let prev_fn = self.current_function.take();
@@ -1032,7 +1159,19 @@ impl Checker {
         // Function body is always in tail position of itself.
         self.in_tail_position = self.current_function.is_some();
 
-        let typed_body = self.infer_expr(body)?;
+        let typed_body_raw = self.infer_expr(body)?;
+        // Wrap body in a Block with destructuring preamble if needed.
+        let typed_body = if param_destr_stmts.is_empty() {
+            typed_body_raw
+        } else {
+            let body_ty = typed_body_raw.ty();
+            TypedExpr::Block {
+                stmts: param_destr_stmts,
+                expr: Box::new(typed_body_raw),
+                ty: body_ty,
+                span,
+            }
+        };
         let body_ty = typed_body.ty();
 
         self.current_function = prev_fn;
@@ -1072,6 +1211,7 @@ impl Checker {
     }
 
     /// Like infer_function, but substitutes TypeVar parameter types with hints from expected_params.
+    /// `expected_ret` is the expected return type from the calling context (e.g. TypeVar for f: Function).
     fn infer_function_with_hints(
         &mut self,
         params: &[Param],
@@ -1080,6 +1220,7 @@ impl Checker {
         span: Span,
         fn_name: Option<&str>,
         expected_params: &[Type],
+        expected_ret: &Type,
     ) -> Result<TypedExpr, Diagnostic> {
         let entry_scope_depth = self.env.scope_depth();
         self.function_scope_depths.push(entry_scope_depth);
@@ -1088,6 +1229,7 @@ impl Checker {
         self.env.push_scope();
 
         let mut typed_params = Vec::new();
+        let mut param_destr_stmts: Vec<TypedStmt> = Vec::new();
         for (i, param) in params.iter().enumerate() {
             // Use the declared annotation if present; otherwise use the hint from expected_params.
             let ty = if let Some(ref type_ann) = param.type_ann {
@@ -1100,11 +1242,41 @@ impl Checker {
 
             let name = match &param.pattern {
                 Pattern::Ident(name, _) => name.clone(),
-                _ => "_".to_string(),
+                _ => format!("__param_{}", i),
             };
 
             let slot = self.env.define(name.clone(), ty.clone(), false);
             typed_params.push(TypedParam { slot, name, ty: ty.clone() });
+
+            if let Pattern::Object(fields, obj_rest, _) = &param.pattern {
+                let obj_slot = typed_params.last().unwrap().slot;
+                let mut typed_fields = Vec::new();
+                for f in fields.iter() {
+                    let key = f.key.clone().or_else(|| match &f.pattern {
+                        Pattern::Ident(n, _) => Some(n.clone()),
+                        _ => None,
+                    }).unwrap_or_default();
+                    let field_ty = if let Type::Object(ref obj_fields) = ty {
+                        obj_fields.get(&key).cloned().unwrap_or(Type::Null)
+                    } else { Type::TypeVar(u32::MAX) };
+                    let fslot = match &f.pattern {
+                        Pattern::Ident(fname, _) => self.env.define(fname.clone(), field_ty.clone(), false),
+                        _ => self.env.define("_".to_string(), field_ty.clone(), false),
+                    };
+                    typed_fields.push((key, fslot, field_ty));
+                }
+                let rest_slot = if let Some(rest_name) = obj_rest {
+                    Some(self.env.define(rest_name.clone(), Type::TypeVar(u32::MAX), false))
+                } else { None };
+                param_destr_stmts.push(TypedStmt::Destructure {
+                    obj_slot,
+                    value: TypedExpr::LocalGet { slot: obj_slot, ty: ty.clone(), span },
+                    obj_ty: ty.clone(),
+                    fields: typed_fields,
+                    rest: rest_slot,
+                    span,
+                });
+            }
         }
 
         let prev_fn = self.current_function.take();
@@ -1112,7 +1284,18 @@ impl Checker {
         self.current_function = fn_name.map(|s| s.to_string());
         self.in_tail_position = self.current_function.is_some();
 
-        let typed_body = self.infer_expr(body)?;
+        let typed_body_raw = self.infer_expr(body)?;
+        let typed_body = if param_destr_stmts.is_empty() {
+            typed_body_raw
+        } else {
+            let body_ty = typed_body_raw.ty();
+            TypedExpr::Block {
+                stmts: param_destr_stmts,
+                expr: Box::new(typed_body_raw),
+                ty: body_ty,
+                span,
+            }
+        };
         let body_ty = typed_body.ty();
 
         self.current_function = prev_fn;
@@ -1132,6 +1315,11 @@ impl Checker {
                 )));
             }
             declared
+        } else if matches!(expected_ret, Type::TypeVar(_)) {
+            // Expected return is a TypeVar (e.g. worker reply, promise result).
+            // Use TypeVar so codegen boxes the concrete result — ensures a consistent tagged
+            // calling convention when the closure is called through a polymorphic slot.
+            expected_ret.clone()
         } else {
             body_ty
         };
@@ -1158,8 +1346,14 @@ impl Checker {
             MatchPattern::Is(pat) => {
                 let tp = self.check_pattern(pat, scrutinee_ty)?;
                 // Narrow the scrutinee variable within this arm's scope.
+                // Reuse the same slot so LocalGet can unbox the TaggedVal pointer correctly.
                 if let (Some(name), TypedPattern::TypeCheck(ref narrowed_ty, _)) = (scrutinee_name, &tp) {
-                    self.env.define(name.to_string(), narrowed_ty.clone(), false);
+                    if let Some(orig_info) = self.env.lookup(name) {
+                        let orig_slot = orig_info.slot;
+                        self.env.define_narrowed(name.to_string(), narrowed_ty.clone(), orig_slot);
+                    } else {
+                        self.env.define(name.to_string(), narrowed_ty.clone(), false);
+                    }
                 }
                 TypedMatchPattern::Is(tp)
             }
@@ -1325,7 +1519,7 @@ impl Checker {
                 Ok(self.env.define_at(name.clone(), ty.clone(), mutable, Some(*span)))
             }
             Pattern::Wildcard(_) => Ok(self.env.define("_".to_string(), ty.clone(), false)),
-            Pattern::Object(fields, _rest, span) => {
+            Pattern::Object(fields, rest, span) => {
                 for field in fields {
                     let key = field
                         .key
@@ -1338,6 +1532,8 @@ impl Checker {
 
                     let field_ty = if let Type::Object(ref obj_fields) = ty {
                         obj_fields.get(&key).cloned().unwrap_or(Type::Null)
+                    } else if ty.is_json() {
+                        crate::resolve::json_type()
                     } else {
                         return Err(Diagnostic::error(
                             *span,
@@ -1347,14 +1543,21 @@ impl Checker {
 
                     self.bind_pattern(&field.pattern, &field_ty, mutable)?;
                 }
+                if let Some(rest_name) = rest {
+                    // rest collects remaining fields as a Json object
+                    self.env.define(rest_name.clone(), crate::resolve::json_type(), mutable);
+                }
                 Ok(self.env.next_slot() - 1)
             }
-            Pattern::Array(elements, _rest, span) => {
+            Pattern::Array(elements, rest, span) => {
                 for (i, elem) in elements.iter().enumerate() {
                     let elem_ty = if let Type::Array(ref inner) = ty {
                         *inner.clone()
                     } else if let Type::FixedArray(ref types) = ty {
                         types.get(i).cloned().unwrap_or(Type::Never)
+                    } else if ty.is_json() {
+                        // Dynamic JSON value — treat element type as Json
+                        crate::resolve::json_type()
                     } else {
                         return Err(Diagnostic::error(
                             *span,
@@ -1362,6 +1565,14 @@ impl Checker {
                         ));
                     };
                     self.bind_pattern(elem, &elem_ty, mutable)?;
+                }
+                if let Some(rest_name) = rest {
+                    let rest_ty = if let Type::Array(inner) = ty {
+                        Type::Array(inner.clone())
+                    } else {
+                        Type::Array(Box::new(crate::resolve::json_type()))
+                    };
+                    self.env.define(rest_name.clone(), rest_ty, mutable);
                 }
                 Ok(self.env.next_slot() - 1)
             }
@@ -1375,9 +1586,35 @@ impl Checker {
         collect_type_subs(pattern, actual, local);
         for (id, ty) in local.iter() {
             // Intrinsic TypeVars (≥ 9000) are generic slots — don't solve them globally.
-            if *id < 9000 {
+            // Protected TypeVars come from imported module signatures — never solve them either.
+            if *id < 9000 && !self.protected_type_vars.contains(id) {
                 self.solved_type_vars.entry(*id).or_insert_with(|| ty.clone());
             }
+        }
+    }
+
+    /// Collect all TypeVar IDs recursively from a type into `out`.
+    fn collect_typevar_ids(ty: &Type, out: &mut std::collections::HashSet<u32>) {
+        match ty {
+            Type::TypeVar(id) => { out.insert(*id); }
+            Type::Array(t) | Type::Iterator(t) => Self::collect_typevar_ids(t, out),
+            Type::FixedArray(ts) => { for t in ts { Self::collect_typevar_ids(t, out); } }
+            Type::Union(ts) => { for t in ts { Self::collect_typevar_ids(t, out); } }
+            Type::Function { params, ret } => {
+                for p in params { Self::collect_typevar_ids(p, out); }
+                Self::collect_typevar_ids(ret, out);
+            }
+            Type::Object(fields) => { for v in fields.values() { Self::collect_typevar_ids(v, out); } }
+            _ => {}
+        }
+    }
+
+    /// Register TypeVar IDs from all import types as protected so they won't be
+    /// solved/zonked based on call-site argument types in this module.
+    pub fn protect_import_typevars(&mut self) {
+        let types: Vec<Type> = self.import_types.values().cloned().collect();
+        for ty in &types {
+            Self::collect_typevar_ids(ty, &mut self.protected_type_vars);
         }
     }
 
@@ -1462,7 +1699,8 @@ impl Checker {
             },
         );
 
-        // length: (String | Array<T> | Iterator<T>) => Int32
+        // length: (String | Array<T> | Iterator<T> | Object) => Int32
+        // Uses TypeVar(u32::MAX) as the "any" Json type for the object case.
         self.define_intrinsic(
             "length",
             Type::Function {
@@ -1470,6 +1708,7 @@ impl Checker {
                     Type::Str,
                     Type::Array(Box::new(Type::TypeVar(9000))),
                     Type::Iterator(Box::new(Type::TypeVar(9000))),
+                    Type::TypeVar(u32::MAX),
                 ])],
                 ret: Box::new(Type::Int32),
             },
@@ -1665,13 +1904,15 @@ impl Checker {
             params: vec![Type::TypeVar(9101)],
             ret: Box::new(Type::TypeVar(9101)),
         });
-        // parallel: variadic — modelled as ((() => T)[]) => T[]
+        // parallel: variadic — always returns a tagged array (TypeVar(u32::MAX) = Json/any).
+        // Using u32::MAX prevents zonking from resolving the element type to a flat scalar,
+        // which would cause codegen to use a flat array representation for a tagged array.
         self.define_intrinsic("parallel", Type::Function {
             params: vec![Type::Array(Box::new(Type::Function {
                 params: vec![],
                 ret: Box::new(Type::TypeVar(9102)),
             }))],
-            ret: Box::new(Type::Array(Box::new(Type::TypeVar(9102)))),
+            ret: Box::new(Type::Array(Box::new(Type::TypeVar(u32::MAX)))),
         });
         // race: Promise[] => Promise
         self.define_intrinsic("race", Type::Function {
@@ -1704,11 +1945,26 @@ impl Checker {
             ],
             ret: Box::new(Type::TypeVar(9109)),
         });
+        // worker.request(msg): (Worker, Msg) => Reply
+        self.define_intrinsic("request", Type::Function {
+            params: vec![Type::TypeVar(9109), Type::TypeVar(9107)],
+            ret: Box::new(Type::TypeVar(9108)),
+        });
+        // worker.message(msg): (Worker, Msg) => Null
+        self.define_intrinsic("message", Type::Function {
+            params: vec![Type::TypeVar(9109), Type::TypeVar(9107)],
+            ret: Box::new(Type::Null),
+        });
+        // worker.close(): (Worker) => Null
+        self.define_intrinsic("close", Type::Function {
+            params: vec![Type::TypeVar(9109)],
+            ret: Box::new(Type::Null),
+        });
         // IO/fs/http/server intrinsics
         self.define_intrinsic("__ioReadLine",    Type::Function { params: vec![], ret: Box::new(Type::Union(vec![Type::Str, Type::Null])) });
         self.define_intrinsic("__ioReadAll",     Type::Function { params: vec![], ret: Box::new(Type::Str) });
         self.define_intrinsic("__ioLines",       Type::Function { params: vec![], ret: Box::new(Type::Array(Box::new(Type::Str))) });
-        self.define_intrinsic("__fsReadFile",    Type::Function { params: vec![Type::Str], ret: Box::new(Type::Union(vec![Type::Str, Type::TypeVar(u32::MAX)])) });
+        self.define_intrinsic("__fsReadFile",    Type::Function { params: vec![Type::Str], ret: Box::new(Type::TypeVar(u32::MAX)) });
         self.define_intrinsic("__fsWriteFile",   Type::Function { params: vec![Type::Str, Type::Str], ret: Box::new(Type::Null) });
         self.define_intrinsic("__fsAppendFile",  Type::Function { params: vec![Type::Str, Type::Str], ret: Box::new(Type::Null) });
         self.define_intrinsic("__fsReadLines",   Type::Function { params: vec![Type::Str], ret: Box::new(Type::Array(Box::new(Type::Str))) });

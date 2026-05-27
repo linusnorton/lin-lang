@@ -139,13 +139,15 @@ Inside a string literal, the following escape sequences are recognised:
 
 #### 3.5.2 Interpolation
 
-Strings support interpolation with `${ expression }`. The expression is evaluated in the surrounding scope and its result is converted to a string via `toString`.
+Strings support interpolation with `${ expression }`. The expression is evaluated in the surrounding scope and its result is converted to a string via `toString`. Interpolation is the only way to build strings from parts; `+` does not work on strings.
 
 ```txt
 val name = "Bob"
 val age = 42
 val greeting = "Hello ${name}, you are ${age + 1} next year"
 ```
+
+Because the compiler sees all parts of an interpolated string as a single AST node, it can compute the total length and allocate exactly once, with no intermediate allocations.
 
 Interpolated expressions can themselves contain string literals, function calls, and arbitrary expressions, but they cannot span multiple statements.
 
@@ -521,7 +523,7 @@ type Named = {
 }
 
 val greet = (item: Named): String =>
-  "Hello " + item["name"]
+  "Hello ${item["name"]}"
 ```
 
 A value with additional fields is compatible with a smaller structural type *for the purpose of function-argument passing and type ascription*.
@@ -719,10 +721,10 @@ val b = if cond
 val c = if cond
   then
     val prefix = "ad"
-    prefix + "ult"
+    "${prefix}ult"
   else
     val prefix = "ch"
-    prefix + "ild"
+    "${prefix}ild"
 ```
 
 `then` and `else` must be at the same indent level — exactly one indent level deeper than the column of `if`.
@@ -803,7 +805,7 @@ A single `match` arm may not combine `is` and `has` patterns — each arm uses o
 ```txt
 val describeNamed = (input: Json): String =>
   if input has { name }
-    then "Named: " + input["name"]
+    then "Named: ${input["name"]}"
     else "Unnamed"
 ```
 
@@ -910,7 +912,7 @@ Object spread is also valid in object *expressions*; see §4.3.
 
 ```txt
 val describePerson = ({ name, age }: Person): String =>
-  name + " is " + age.toString()
+  "${name} is ${age}"
 ```
 
 ## 16. Pattern Matching
@@ -924,10 +926,10 @@ val describe = (input: String | Int32 | Null): String =>
       "No value"
 
     is Int32 =>
-      "Int32: " + input.toString()
+      "Int32: ${input}"
 
     is String =>
-      "String: " + input
+      "String: ${input}"
 ```
 
 ### 16.1 `is` Patterns
@@ -989,13 +991,13 @@ val describeName = (input: String | Person | Null): String =>
       "Big Dave!"
 
     has { name, age } when age > 30 =>
-      "Old person: " + name
+      "Old person: ${name}"
 
     has { name } =>
-      "Young person: " + name
+      "Young person: ${name}"
 
     is String =>
-      "Name: " + input
+      "Name: ${input}"
 ```
 
 The pattern must match first. If it matches, the `when` condition is evaluated; if the guard is false, matching continues with the next arm.
@@ -1212,10 +1214,10 @@ Consuming the result:
 ```txt
 val message = match divide(10.0, 2.0)
   has { "type": "success", value } =>
-    "Result: " + value.toString()
+    "Result: ${value}"
 
   has { "type": "failure", error } =>
-    "Error: " + error
+    "Error: ${error}"
 ```
 
 ## 19. Errors
@@ -1355,6 +1357,8 @@ Closures capture bindings from their defining scope. Mutable bindings are captur
 ```
 
 These are built-in operators, not ordinary functions. They are not available through dot application or partial application.
+
+`+` operates only on numeric types. String building uses interpolation (`"${a}${b}"`) — see §3.5.2.
 
 There are no unary operators in v1 (see §3.7 for negative literals). Boolean negation must be done explicitly:
 

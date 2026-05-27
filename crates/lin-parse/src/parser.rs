@@ -792,10 +792,7 @@ impl Parser {
         if self.check(TokenKind::Indent) {
             return self.parse_block();
         }
-        if matches!(self.peek_kind(), TokenKind::Val | TokenKind::Var) {
-            return self.parse_inline_block();
-        }
-        self.parse_expr()
+        self.parse_inline_block()
     }
 
     fn parse_inline_block(&mut self) -> Expr {
@@ -804,8 +801,14 @@ impl Parser {
         let mut last_expr: Option<Expr> = None;
 
         loop {
-            self.skip_newlines();
-            if self.check(TokenKind::RParen) || self.check(TokenKind::Dedent) || self.is_at_end() {
+            if self.check(TokenKind::Newline)
+                || self.check(TokenKind::RParen)
+                || self.check(TokenKind::RBracket)
+                || self.check(TokenKind::RBrace)
+                || self.check(TokenKind::Comma)
+                || self.check(TokenKind::Dedent)
+                || self.is_at_end()
+            {
                 break;
             }
 

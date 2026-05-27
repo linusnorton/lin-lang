@@ -76,6 +76,16 @@ fn zonk_stmt(stmt: &mut TypedStmt, subs: &HashMap<u32, Type>) {
                 *ty = zonk_type(ty, subs);
             }
         }
+        TypedStmt::ArrayDestructure { value, elem_ty, elements, rest, .. } => {
+            *elem_ty = zonk_type(elem_ty, subs);
+            zonk_expr(value, subs);
+            for (_, _, ty) in elements {
+                *ty = zonk_type(ty, subs);
+            }
+            if let Some((_, ty)) = rest {
+                *ty = zonk_type(ty, subs);
+            }
+        }
         TypedStmt::Expr(e) => zonk_expr(e, subs),
     }
 }

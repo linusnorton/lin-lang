@@ -1,0 +1,10 @@
+import { readFile } from "std/fs"
+
+export val renderWith = (template: String, data: {}) =>
+  __templateRender(template, data)
+
+export val render = (path: String, data: {}) =>
+  val content = readFile(path)
+  match content
+    is { "type": "error", "message": _ } => content
+    else => __templateRender(content, data)

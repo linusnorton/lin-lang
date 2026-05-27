@@ -17,6 +17,8 @@ This document specifies the standard library for the Lin language. All modules a
 | [`std/fs`](#stdfs) | Filesystem read and write |
 | [`std/http`](#stdhttp) | HTTP client |
 | [`std/server`](#stdserver) | HTTP server |
+| [`std/template`](#stdtemplate) | String template rendering |
+| [`std/test`](#stdtest) | Test framework |
 
 ### Functions by module
 
@@ -118,6 +120,22 @@ This document specifies the standard library for the Lin language. All modules a
 | [`badRequest`](#badRequest) | `(String) -> HttpResponse` | Build a 400 response with a message |
 | [`pathMatch`](#pathMatch) | `(String, String) -> { ...String } \| Null` | Match a path pattern, returning captured params |
 | [`parseBody`](#parseBody) | `(HttpRequest) -> Json \| Error` | Parse the request body as JSON |
+
+**std/template**
+
+| Function | Signature | Summary |
+| --- | --- | --- |
+| [`render`](#render) | `(String, {}) -> String \| Error` | Load a `.lint` file and render it with a data record |
+| [`renderWith`](#renderWith) | `(String, {}) -> String` | Render a template string with a data record |
+
+**std/test**
+
+| Name | Signature | Summary |
+| --- | --- | --- |
+| [`suite`](#suite) | `(String, Test[]) -> Suite` | Group tests under a name |
+| [`test`](#test) | `(String, () -> Assertion \| Assertion[]) -> Test` | Declare a single test case |
+| [`run`](#run) | `(Suite[]) -> Null` | Execute suites, print results, exit non-zero on failure |
+| [`expect`](#expect) | `(Json) -> Asserter` | Begin an assertion chain |
 
 ---
 
@@ -1278,3 +1296,324 @@ match parseBody(req)
   is { "type": "failure", "error": e }    => badRequest(e)
   is { "type": "success", "value": body } => createItem(body)
 ```
+
+---
+
+## std/template
+
+Functions for rendering template strings. Template syntax uses `${key}` holes where `key` is either a top-level field name or a dot-separated path into the data record. Everything outside a `${}` hole is emitted verbatim, including newlines.
+
+Import:
+
+```txt
+import { render, renderWith } from "std/template"
+```
+
+---
+
+### render
+
+```txt
+val render: (path: String, data: {}) -> String | Error
+```
+
+Reads the file at `path` and renders it as a template against `data`. Returns the rendered `String` on success, or an `Error` if the file cannot be read. Intended for use with `.lint` template files.
+
+```txt
+// greet.lint:
+// Hello, ${name}! Your score is ${stats.score}.
+
+import { render } from "std/template"
+
+match render("greet.lint", { "name": "Alice", "stats": { "score": 42 } })
+  is { "type": "error", "message": e } => print("error: ${e}")
+  else => val output = render("greet.lint", { "name": "Alice", "stats": { "score": 42 } })
+          print(output)
+```
+
+---
+
+### renderWith
+
+```txt
+val renderWith: (template: String, data: {}) -> String
+```
+
+Renders a template string directly against `data`. Holes are `${key}` where `key` is a field name or dot-separated path. Missing keys render as `"null"`.
+
+```txt
+renderWith("Hello, ${name}!", { "name": "Alice" })
+// "Hello, Alice!"
+
+renderWith("${user.name} scored ${user.score}", { "user": { "name": "Bob", "score": 99 } })
+// "Bob scored 99"
+
+renderWith("x = ${x}, y = ${y}", { "x": 1, "y": 2 })
+// "x = 1, y = 2"
+```
+
+---
+
+## std/test
+
+A lightweight test framework. Tests are plain Lin values — `test` returns a `Test` record, `suite` groups them, `run` executes and reports. A test file is a regular `.lin` file run with `lin run`; no special runner binary is required.
+
+Import:
+
+```txt
+import { suite, test, run, expect } from "std/test"
+```
+
+**Conventions:** name test files `*.test.lin` or `*_test.lin`. A future `lin test` subcommand will discover and run them automatically; until then `lin run my_test.lin` works.
+
+**Basic usage:**
+
+```txt
+import { suite, test, run, expect } from "std/test"
+
+val add = (a: Int32, b: Int32): Int32 => a + b
+
+val arithmetic = suite("arithmetic", [
+  test("adds two positives", () =>
+    expect(add(1, 2)).toBe(3)
+  ),
+  test("adds negatives", () =>
+    expect(add(-1, -1)).toBe(-2)
+  ),
+  test("multiple assertions", () =>
+    expect(add(0, 0)).toBe(0)
+    expect(add(10, -10)).toBe(0)
+  )
+])
+
+run([arithmetic])
+```
+
+**Multi-assertion tests** use bare expression statements in the lambda body. Each `expect(...).toX()` call is evaluated in order; the test collects all failures before reporting rather than stopping at the first.
+
+---
+
+### Types
+
+```txt
+type Assertion =
+  | { "type": "pass" }
+  | { "type": "fail", "message": String }
+
+type Test = {
+  "name": String,
+  "run": () -> Assertion | Assertion[]
+}
+
+type Suite = {
+  "name": String,
+  "tests": Test[]
+}
+
+type Asserter = {
+  "value": Json,
+  "toBe":       (Json) -> Assertion,
+  "toBeNull":   () -> Assertion,
+  "toSatisfy":  ((Json) -> Boolean) -> Assertion,
+  "toSucceed":  () -> Assertion,
+  "toFail":     () -> Assertion,
+  "toFailWith": (String) -> Assertion
+}
+```
+
+`Assertion`, `Test`, `Suite`, and `Asserter` are structural — they have no special runtime representation. The type names are exported for documentation purposes only; you do not need to import them to use the framework.
+
+---
+
+### suite
+
+```txt
+val suite: (name: String, tests: Test[]) -> Suite
+```
+
+Groups a list of `Test` values under a name. The name is printed as a heading when `run` executes the suite.
+
+```txt
+val myTests = suite("math", [
+  test("one plus one", () => expect(1 + 1).toBe(2))
+])
+```
+
+Suites are plain data and can be composed, filtered, or built programmatically:
+
+```txt
+val cases = range(1, 5).map(n =>
+  test("double of ${toString(n)}", () =>
+    expect(n * 2).toBe(n + n)
+  )
+)
+val generated = suite("doubles", cases)
+```
+
+---
+
+### test
+
+```txt
+val test: (name: String, body: () -> Assertion | Assertion[]) -> Test
+```
+
+Declares a single test case. `body` is a zero-argument lambda that returns either one `Assertion` or an array of `Assertion` values. All assertions in the body are evaluated; the test fails if any of them fail.
+
+**Single assertion:**
+
+```txt
+test("empty array has length zero", () =>
+  expect(length([])).toBe(0)
+)
+```
+
+**Multiple assertions** — write bare expression statements; each is evaluated in order:
+
+```txt
+test("string conversions", () =>
+  expect(toString(42)).toBe("42")
+  expect(toString(true)).toBe("true")
+  expect(toString(null)).toBe("null")
+)
+```
+
+**Using `val` bindings inside a test:**
+
+```txt
+test("pipeline result", () =>
+  val xs = [1, 2, 3].map(x => x * 2)
+  expect(xs[0]).toBe(2)
+  expect(length(xs)).toBe(3)
+)
+```
+
+---
+
+### run
+
+```txt
+val run: (suites: Suite[]) -> Null
+```
+
+Executes all suites in order, prints a summary to stdout, and exits the process with a non-zero code if any test failed. Each passing test prints a line beginning with `ok`; each failing test prints the failure message with the test name. A final line reports total passed and failed counts.
+
+```txt
+run([unitTests, integrationTests])
+```
+
+Output format (illustrative):
+
+```txt
+arithmetic
+  ok  adds two positives
+  ok  adds negatives
+  FAIL  identity element
+    expected: 1
+    actual:   0
+
+1 failed, 2 passed
+```
+
+`run` always executes all tests — it does not short-circuit on the first failure.
+
+---
+
+### expect
+
+```txt
+val expect: (value: Json) -> Asserter
+```
+
+Wraps `value` in an `Asserter`. Call one assertion method on the returned object to produce an `Assertion`.
+
+```txt
+expect(add(1, 2)).toBe(3)
+expect(result).toSucceed()
+expect(name).toSatisfy(s => length(s) > 0)
+```
+
+#### .toBe
+
+```txt
+.toBe: (expected: Json) -> Assertion
+```
+
+Passes when `value` is deeply structurally equal to `expected` (same semantics as `==`). Works for all JSON-compatible values. Object comparison is order-independent; array comparison is ordered.
+
+```txt
+expect([1, 2, 3]).toBe([1, 2, 3])    // pass
+expect({ "a": 1 }).toBe({ "a": 1 }) // pass
+expect([1, 2]).toBe([2, 1])          // fail
+```
+
+Failure message: `expected: <expected>\nactual:   <actual>`
+
+#### .toBeNull
+
+```txt
+.toBeNull: () -> Assertion
+```
+
+Passes when `value` is `null`.
+
+```txt
+expect(obj["missing"]).toBeNull()
+```
+
+#### .toSatisfy
+
+```txt
+.toSatisfy: (pred: (Json) -> Boolean) -> Assertion
+```
+
+Passes when `pred(value)` returns `true`. The general escape hatch for structural assertions that cannot be expressed with `.toBe`, including inspecting union shapes:
+
+```txt
+expect(name).toSatisfy(s => length(s) > 0)
+expect(result).toSatisfy(r => r has { "type": "success" })
+```
+
+Failure message: `value did not satisfy predicate: <value>`
+
+#### .toSucceed
+
+```txt
+.toSucceed: () -> Assertion
+```
+
+Passes when `value` has shape `{ "type": "success", ... }`.
+
+```txt
+expect(parseAge("42")).toSucceed()
+```
+
+Failure message: `expected success, got: <value>`
+
+#### .toFail
+
+```txt
+.toFail: () -> Assertion
+```
+
+Passes when `value` has shape `{ "type": "failure", ... }`.
+
+```txt
+expect(parseAge("not-a-number")).toFail()
+```
+
+Failure message: `expected failure, got: <value>`
+
+#### .toFailWith
+
+```txt
+.toFailWith: (message: String) -> Assertion
+```
+
+Passes when `value` has shape `{ "type": "failure", "error": e }` and `e == message`.
+
+```txt
+expect(divide(1.0, 0.0)).toFailWith("Cannot divide by zero")
+```
+
+Failure message: `expected failure with "${message}", got: <value>`

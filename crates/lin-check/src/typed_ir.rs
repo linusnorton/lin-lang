@@ -45,6 +45,19 @@ pub enum TypedStmt {
         obj_ty: Type,
         /// (field_name, binding_slot, field_ty)
         fields: Vec<(String, usize, Type)>,
+        /// rest binding slot (captures remaining fields as a new object)
+        rest: Option<usize>,
+        span: Span,
+    },
+    /// Array destructuring: evaluate value, store in arr_slot, then extract elements by index.
+    ArrayDestructure {
+        arr_slot: usize,
+        value: TypedExpr,
+        elem_ty: Type,
+        /// (index, binding_slot, element_ty)
+        elements: Vec<(usize, usize, Type)>,
+        /// rest binding slot and type, if any
+        rest: Option<(usize, Type)>,
         span: Span,
     },
     Expr(TypedExpr),

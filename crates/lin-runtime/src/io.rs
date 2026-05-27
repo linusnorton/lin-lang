@@ -1,5 +1,54 @@
-use crate::string::LinString;
-use std::io::Write;
+use crate::string::{LinString, lin_string_from_bytes};
+use crate::tagged::{TaggedVal, alloc_tagged, TAG_STR, TAG_ARRAY};
+use std::io::{BufRead, Read, Write};
+
+/// Read one line from stdin. Returns TaggedVal*(Str) or null if EOF.
+/// Return type in Lin is Union(Str, Null), so we return a tagged pointer.
+#[no_mangle]
+pub unsafe extern "C" fn lin_io_read_line() -> *mut u8 {
+    let stdin = std::io::stdin();
+    let mut line = String::new();
+    match stdin.lock().read_line(&mut line) {
+        Ok(0) => std::ptr::null_mut(),
+        Ok(_) => {
+            if line.ends_with('\n') { line.pop(); if line.ends_with('\r') { line.pop(); } }
+            let s = lin_string_from_bytes(line.as_ptr(), line.len() as u32);
+            alloc_tagged(TAG_STR, s as u64)
+        }
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Read all of stdin as a string. Returns bare LinString* (result type is Str).
+#[no_mangle]
+pub unsafe extern "C" fn lin_io_read_all() -> *mut LinString {
+    let mut buf = String::new();
+    let _ = std::io::stdin().lock().read_to_string(&mut buf);
+    lin_string_from_bytes(buf.as_ptr(), buf.len() as u32)
+}
+
+/// Read all stdin lines into a LinArray of TaggedVal*(Str). Returns bare LinArray*.
+/// Result type is Array(Str), so codegen expects a raw LinArray*.
+#[no_mangle]
+pub unsafe extern "C" fn lin_io_lines() -> *mut u8 {
+    let stdin = std::io::stdin();
+    let mut lines: Vec<String> = Vec::new();
+    for line in stdin.lock().lines() {
+        match line {
+            Ok(l) => lines.push(l),
+            Err(_) => break,
+        }
+    }
+    let arr = crate::array::lin_array_alloc(lines.len().max(4) as u64);
+    for line in &lines {
+        let s = lin_string_from_bytes(line.as_ptr(), line.len() as u32);
+        let mut tv: TaggedVal = std::mem::zeroed();
+        tv.tag = TAG_STR;
+        tv.payload = s as u64;
+        crate::array::lin_array_push_tagged(arr, &tv as *const TaggedVal as *const u8);
+    }
+    arr as *mut u8
+}
 
 #[no_mangle]
 pub unsafe extern "C" fn lin_print(s: *const LinString) {
