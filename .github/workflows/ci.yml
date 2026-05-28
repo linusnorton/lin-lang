@@ -74,4 +74,4 @@ jobs:
           done
 
       - name: Run stdlib tests
-        run: cargo run -p lin --quiet -- test stdlib/
+        run: cargo run -p lin --quiet -- test stdlib/ --timeout 120
