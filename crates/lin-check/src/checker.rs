@@ -1778,6 +1778,24 @@ impl Checker {
             },
         );
 
+        // while: (Array<T> | Iterator<T>, (T) => Boolean) => Null
+        self.define_intrinsic(
+            "lin_while",
+            Type::Function {
+                params: vec![
+                    Type::Union(vec![
+                        Type::Array(Box::new(Type::TypeVar(9011))),
+                        Type::Iterator(Box::new(Type::TypeVar(9011))),
+                    ]),
+                    Type::Function {
+                        params: vec![Type::TypeVar(9011)],
+                        ret: Box::new(Type::Bool),
+                    },
+                ],
+                ret: Box::new(Type::Null),
+            },
+        );
+
         // iter: (() => State, (State) => Boolean, (State) => State, (State) => T) => Iterator<T>
         self.define_intrinsic(
             "lin_iter",

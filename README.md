@@ -2,53 +2,178 @@
 
 A small, expression-based programming language built around JSON data, structural typing, pattern matching, and functional-style pipelines.
 
-```
+```lin
 val greet = (name: String): String => "Hello, ${name}!"
 print(greet("world"))
 ```
 
-## Design
-
 - Everything is an expression
 - Runtime values are strict JSON (null, bool, number, string, array, object) plus functions and iterators
-- Indentation defines blocks — no braces or semicolons
+- Indentation defines blocks — no braces or semicolons needed
 - Structural typing with union types and pattern matching
 - Errors are ordinary values
 - Dot syntax for chaining: `x.f(y)` calls `f(x, y)`
 
-## Getting Started
+---
 
-**Prerequisites:** Rust toolchain, LLVM 18+ (tested with LLVM 22), a C linker (`cc`).
+## Installation
 
+Download the latest binary for your platform and put it on your `$PATH`:
+
+**macOS (Apple Silicon)**
 ```bash
-git clone <repo>
-cd lin-lang
-cargo build --workspace
+curl -L https://github.com/linusnorton/lin-lang/releases/download/latest/lin-macos-arm64.tar.gz \
+  | tar -xz -C /usr/local/bin
 ```
 
-## Running Programs
+**Linux (x86_64)**
+```bash
+curl -L https://github.com/linusnorton/lin-lang/releases/download/latest/lin-linux-x86_64.tar.gz \
+  | tar -xz -C /usr/local/bin
+```
 
-### Compile to a native binary
+The binary is self-contained — no LLVM installation required. A C linker (`cc`) must be on your `$PATH` to link compiled programs; on macOS this comes with Xcode Command Line Tools, on Linux install `gcc` or `clang`.
+
+**Verify**
+```bash
+lin --version
+```
+
+---
+
+## Quick Start
 
 ```bash
-cargo run -p lin -- build examples/hello.lin -o hello
+# Compile and run immediately
+lin run examples/hello.lin
+
+# Compile to a binary
+lin build examples/hello.lin -o hello
 ./hello
-```
 
-Specify a custom output path with `-o`. The default output name is derived from the source file.
-
-```bash
-lin build myprogram.lin -o myprogram
-./myprogram
-```
-
-### Type check only
-
-```bash
+# Type-check without compiling
 lin check examples/hello.lin
 ```
 
-Reports type errors without producing a binary.
+---
+
+## Commands
+
+### `lin build` — compile to a native binary
+
+```bash
+lin build <file.lin> [options]
+```
+
+| Flag | Description |
+|---|---|
+| `-o, --output <path>` | Output binary path (default: source filename stem) |
+| `--emit-ir` | Write LLVM IR (`.ll` file) alongside the binary |
+| `--no-opt` | Disable optimisation passes (faster compile, slower output) |
+| `--verbose` | Print build timing |
+
+```bash
+lin build src/main.lin -o myapp
+lin build src/main.lin --emit-ir --verbose
+```
+
+### `lin run` — compile and execute
+
+Compiles to a temporary binary, runs it, and forwards its exit code. Arguments after `--` are passed to the compiled program.
+
+```bash
+lin run <file.lin> [options] [-- <args>...]
+```
+
+| Flag | Description |
+|---|---|
+| `--no-opt` | Disable optimisation (faster startup) |
+| `--emit-ir` | Write LLVM IR alongside the temp binary |
+
+```bash
+lin run src/main.lin
+lin run src/main.lin -- --port 8080
+```
+
+### `lin check` — type-check only
+
+```bash
+lin check <file.lin>
+```
+
+Reports type errors without producing a binary. Useful as a pre-commit hook or editor integration.
+
+### `lin test` — run test suites
+
+Discovers `*.test.lin` files and compiles + runs each one. A test binary exits 0 to pass, non-zero to fail.
+
+```bash
+lin test [paths...] [options]
+```
+
+| Flag | Description |
+|---|---|
+| `--filter <str>` | Only run tests whose path contains `<str>` |
+| `--parallel <N>` | Number of parallel runners (default: CPU count) |
+| `--timeout <secs>` | Kill a test binary after this many seconds (default: 30) |
+| `-v, --verbose` | Show stdout/stderr from passing tests too |
+| `--coverage` | Instrument binaries for source coverage |
+| `--format <fmt>` | Coverage output format: `console` (default) or `llvm-cov` |
+| `--output <path>` | Output file for `--format=llvm-cov` (default: `lcov.info`) |
+
+```bash
+# Run all tests in a directory (recursive)
+lin test src/
+
+# Glob patterns
+lin test 'src/**/*.test.lin'
+
+# Run matching tests in parallel
+lin test src/ --filter=array --parallel=8
+
+# Coverage summary in the terminal
+lin test src/ --coverage
+
+# Write lcov.info for CI upload (e.g. Codecov)
+lin test src/ --coverage --format=llvm-cov --output=coverage/lcov.info
+```
+
+### `lin watch` — rebuild on file changes
+
+Watches for file changes and re-runs a command automatically. Debounces 200 ms.
+
+```bash
+lin watch <file> [options]
+```
+
+| Flag | Description |
+|---|---|
+| `--command <cmd>` | What to re-run: `build` (default), `run`, `test` |
+| `--include <glob>` | Only trigger on paths matching this glob (comma-separated or repeated) |
+| `--exclude <glob>` | Never trigger on paths matching this glob |
+
+```bash
+# Rebuild on any change under the source directory
+lin watch src/main.lin
+
+# Rebuild and run on .lin or .json changes, ignoring generated files
+lin watch src/main.lin --command=run \
+  --include='**/*.lin,**/*.json' \
+  --exclude='**/*.lang.json'
+
+# Re-run tests on change
+lin watch src/ --command=test
+```
+
+### `lin clean` — remove build artefacts
+
+```bash
+lin clean [path]
+```
+
+Removes all `.lin-cache/` directories under the given path (default: current directory).
+
+---
 
 ## Language Tour
 
@@ -121,9 +246,9 @@ val describePerson = (p: Json): String =>
 ```lin
 val numbers = [1, 2, 3, 4, 5]
 
-val evens = numbers.filter(n => n % 2 == 0)
+val evens   = numbers.filter(n => n % 2 == 0)
 val doubled = evens.map(n => n * 2)
-val total = doubled.reduce(0, (acc, n) => acc + n)
+val total   = doubled.reduce(0, (acc, n) => acc + n)
 
 print(toString(total))   // 12
 ```
@@ -161,6 +286,8 @@ val message = match result
 print(message)
 ```
 
+---
+
 ## Standard Library
 
 | Module | Exports |
@@ -170,7 +297,6 @@ print(message)
 | `std/number` | `parseInt32`, `parseFloat64`, `isInt32`, `toInt32`, `toFloat64` |
 | `std/array` | `map`, `filter`, `reduce`, `for`, `range`, `length`, `push`, `concat` |
 | `std/iter` | `iter`, `range`, iterator combinators |
-| `std/result` | `Result<T, E>` type and helpers |
 | `std/fs` | `readFile`, `writeFile`, `appendFile`, `readLines`, `readJson`, `writeJson`, `exists` |
 | `std/http` | `fetch`, `fetchWith`, `fetchJson`, `postJson` |
 | `std/server` | `serve`, `json`, `text`, `redirect`, `notFound`, `badRequest`, `parseBody`, `pathMatch` |
@@ -188,60 +314,27 @@ val p = async(() =>
 val value = await(p)
 print(toString(value))
 
-// Fork-join: run three tasks in parallel, collect results in order
+// Fork-join: run tasks in parallel, collect results in order
 val results = parallel(
   () => computeA(),
   () => computeB(),
   () => computeC()
 )
-
-// Thread pool
-val pool = threadPool(4)
-val promises = pool.async([() => task1(), () => task2()])
-val done = await(promises)
 ```
 
-Workers handle messages on a dedicated thread:
-
-```lin
-val counter = worker(
-  (msg) =>
-    var n = 0
-    n = n + msg
-    n
-  ,
-  () => null
-)
-counter.message(1)
-val total = counter.request(5)   // blocks until reply
-counter.close()
-```
-
-### HTTP
-
-```lin
-import { fetchJson, postJson } from "std/http"
-
-val data = fetchJson("https://api.example.com/items")
-data.for(item => print(item["name"]))
-
-val response = postJson("https://api.example.com/create", { "name": "Lin" })
-print(toString(response["status"]))
-```
-
-HTTP server:
+### HTTP server
 
 ```lin
 import { serve, json, text, pathMatch } from "std/server"
 
 serve(8080, req =>
   match pathMatch("/users/:id", req["path"])
-    is Null => text(404, "not found")
+    is Null    => text(404, "not found")
     has { id } => json(200, { "userId": id })
 )
 ```
 
-### Foreign Functions (C / Rust interop)
+### Foreign functions (C / Rust interop)
 
 Call functions from compiled C or Rust static libraries. Requires `lin build`.
 
@@ -251,10 +344,31 @@ import foreign "libmathlib.a"
   val add: (Int32, Int32) => Int32
 
 print(toString(sqrt(2.0)))   // 1.4142...
-print(toString(add(3, 4)))   // 7
 ```
 
-The C header `crates/lin-runtime/lin.h` defines `LinString` and `LinArray` for passing non-primitive types across the boundary. See `examples/ffi_c.lin` for a complete example.
+The C header `crates/lin-runtime/lin.h` defines `LinString` and `LinArray` for passing non-primitive types across the boundary. See `examples/ffi-c.lin` for a complete example.
+
+---
+
+## Building from Source
+
+**Prerequisites:** Rust toolchain, LLVM 22 (`llvm-22-dev`, `libpolly-22-dev`), a C linker.
+
+```bash
+git clone https://github.com/linusnorton/lin-lang
+cd lin-lang
+cargo build --release -p lin
+# binary is at target/release/lin
+```
+
+Running the test suite:
+
+```bash
+cargo test --workspace
+lin test stdlib/
+```
+
+---
 
 ## Project Layout
 
@@ -263,32 +377,14 @@ crates/
   lin-common/   shared Span, Diagnostic, edit-distance helpers
   lin-lex/      lexer
   lin-parse/    parser and surface AST (with error recovery)
-  lin-check/    type checker — produces TypedModule (typed IR)
+  lin-check/    type checker — produces TypedModule
   lin-ir/       flat 3-address IR, liveness analysis, RC elision pass
   lin-codegen/  LLVM backend (via inkwell)
-  lin-runtime/  runtime library linked into compiled binaries (+ lin.h FFI header)
+  lin-runtime/  runtime library linked into compiled binaries
   lin-compile/  compilation pipeline (lex → parse → check → codegen → link)
-  lin-eval/     tree-walking interpreter (lin run)
   lin/          CLI binary
   lin-lsp/      language server (in progress)
-stdlib/         standard library source files (.lin)
+stdlib/         standard library (.lin)
 examples/       example programs
-docs/           specification and design decisions
-.github/        CI workflow (cargo test + examples)
-```
-
-## Development
-
-```bash
-cargo test --workspace                        # run all tests
-cargo test -p lin-eval test_hello_world       # run a single test
-cargo run -p lin -- run examples/showcase.lin # interpret an example
-cargo run -p lin -- build examples/showcase.lin -o /tmp/showcase && /tmp/showcase
-```
-
-Set `LIN_EMIT_IR=1` to write the LLVM IR alongside the compiled binary (useful for debugging):
-
-```bash
-LIN_EMIT_IR=1 lin build myprogram.lin -o myprogram
-# produces myprogram and myprogram.ll
+docs/           language specification and design decisions
 ```

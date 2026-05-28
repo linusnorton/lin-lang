@@ -316,8 +316,7 @@ unsafe fn lin_array_eq_deep(a: *const crate::array::LinArray, b: *const crate::a
     true
 }
 
-/// Decrement refcount and free the object struct + entries buffer if zero.
-/// Does not recurse into entry values.
+/// Decrement refcount; when it reaches zero, release all keys and heap-typed values then free.
 #[no_mangle]
 pub unsafe extern "C" fn lin_object_release(obj: *mut LinObject) {
     if obj.is_null() {
@@ -325,6 +324,31 @@ pub unsafe extern "C" fn lin_object_release(obj: *mut LinObject) {
     }
     (*obj).refcount -= 1;
     if (*obj).refcount == 0 {
+        use crate::tagged::*;
+        let len = (*obj).len as usize;
+        for i in 0..len {
+            let entry = (*obj).entries.add(i);
+            // Keys are always owned LinString*.
+            crate::string::lin_string_release((*entry).key);
+            // Values: release heap-typed payloads.
+            let tag = (*entry).value.tag;
+            let payload = (*entry).value.payload;
+            match tag {
+                TAG_STR => {
+                    crate::string::lin_string_release(payload as *mut crate::string::LinString);
+                }
+                TAG_ARRAY => {
+                    crate::array::lin_array_release(payload as *mut crate::array::LinArray);
+                }
+                TAG_OBJECT => {
+                    lin_object_release(payload as *mut LinObject);
+                }
+                TAG_FUNCTION => {
+                    crate::memory::lin_closure_release(payload as *mut u8);
+                }
+                _ => {} // scalars: no heap payload
+            }
+        }
         let cap = (*obj).cap;
         std::alloc::dealloc((*obj).entries as *mut u8, entries_layout(cap));
         std::alloc::dealloc(obj as *mut u8, object_layout());

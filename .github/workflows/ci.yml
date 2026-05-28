@@ -11,11 +11,35 @@ env:
 
 jobs:
   test:
-    name: Test
-    runs-on: ubuntu-latest
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-latest]
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install LLVM 22 (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+          echo "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-22 main" \
+            | sudo tee /etc/apt/sources.list.d/llvm-22.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            llvm-22 llvm-22-dev llvm-22-runtime clang-22 libpolly-22-dev
+          echo "LLVM_SYS_221_PREFIX=/usr/lib/llvm-22" >> "$GITHUB_ENV"
+
+      - name: Install LLVM 22 (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install llvm@22 || brew install llvm
+          PREFIX=$(brew --prefix llvm@22 2>/dev/null || brew --prefix llvm)
+          echo "LLVM_SYS_221_PREFIX=${PREFIX}" >> "$GITHUB_ENV"
+          echo "${PREFIX}/bin" >> "$GITHUB_PATH"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -36,14 +60,12 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
-      - name: Run examples through lin
+      - name: Run examples through lin run
         run: |
           for f in examples/*.lin; do
-            # Skip examples that require the native compiler (lin build) or live network
             case "$f" in
-              examples/ffi_c.lin) echo "SKIP $f (requires lin build)"; continue ;;
-              examples/http-client.lin) echo "SKIP $f (requires network)"; continue ;;
+              examples/ffi_c.lin|examples/http-client.lin) echo "SKIP $f"; continue ;;
             esac
             echo "==> $f"
-            cargo run -p lin --quiet -- "$f" || exit 1
+            cargo run -p lin --quiet -- run "$f" || exit 1
           done

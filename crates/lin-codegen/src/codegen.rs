@@ -16,6 +16,7 @@ use std::path::Path;
 use lin_check::typed_ir::*;
 use lin_check::types::Type;
 use lin_parse::ast::BinOp;
+use crate::coverage::{CoverageEmitter, FnCovInfo};
 
 /// Tracks a slot: either a stack alloca (mutable) or an immutable SSA value.
 #[derive(Clone, Debug)]
@@ -95,6 +96,8 @@ pub struct Codegen<'ctx> {
     // Release functions (decrement refcount, free if zero)
     rt_string_release: FunctionValue<'ctx>,
     rt_array_release: FunctionValue<'ctx>,
+    rt_closure_release: FunctionValue<'ctx>,
+    rt_tagged_release: FunctionValue<'ctx>,
     // Cached LLVM types
     string_ptr_type: inkwell::types::PointerType<'ctx>,
     array_ptr_type: inkwell::types::PointerType<'ctx>,
@@ -116,10 +119,12 @@ pub struct Codegen<'ctx> {
     /// Module-level slot map active during register_import. Closures compiled inside
     /// imported module bodies use this to resolve sibling function calls.
     current_module_slots: HashMap<usize, FunctionValue<'ctx>>,
+    /// Coverage emitter: Some if compiling with coverage instrumentation.
+    pub coverage: Option<CoverageEmitter<'ctx>>,
 }
 
 impl<'ctx> Codegen<'ctx> {
-    pub fn new(context: &'ctx Context, module_name: &str) -> Self {
+    pub fn new(context: &'ctx Context, module_name: &str, coverage_enabled: bool) -> Self {
         let module = context.create_module(module_name);
         let builder = context.create_builder();
 
@@ -249,6 +254,8 @@ impl<'ctx> Codegen<'ctx> {
         // Release functions: decrement refcount, free if zero.
         let rt_string_release = module.add_function("lin_string_release", void_type.fn_type(&[ptr_type.into()], false), None);
         let rt_array_release = module.add_function("lin_array_release", void_type.fn_type(&[ptr_type.into()], false), None);
+        let rt_closure_release = module.add_function("lin_closure_release", void_type.fn_type(&[ptr_type.into()], false), None);
+        let rt_tagged_release = module.add_function("lin_tagged_release", void_type.fn_type(&[ptr_type.into()], false), None);
 
         Self {
             context,
@@ -292,6 +299,8 @@ impl<'ctx> Codegen<'ctx> {
             rt_string_build_n,
             rt_string_release,
             rt_array_release,
+            rt_closure_release,
+            rt_tagged_release,
             string_ptr_type,
             array_ptr_type,
             named_fns: HashMap::new(),
@@ -302,6 +311,12 @@ impl<'ctx> Codegen<'ctx> {
             foreign_lib_paths: Vec::new(),
             global_val_slots: HashMap::new(),
             current_module_slots: HashMap::new(),
+            coverage: if coverage_enabled {
+                // Source path is set by compile_module; start with empty path.
+                Some(CoverageEmitter::new(String::new()))
+            } else {
+                None
+            },
         }
     }
 
@@ -352,7 +367,7 @@ impl<'ctx> Codegen<'ctx> {
         for stmt in &module.statements {
             if let TypedStmt::Import { path: import_path, bindings, .. } = stmt {
                 let known_intrinsics = ["lin_print", "lin_to_string", "lin_length", "lin_push",
-                    "lin_array_set", "lin_keys", "lin_object_set", "lin_for", "lin_iter", "lin_range", "lin_map",
+                    "lin_array_set", "lin_keys", "lin_object_set", "lin_for", "lin_while", "lin_iter", "lin_range", "lin_map",
                     "lin_filter", "lin_reduce",
                     "lin_async", "lin_await", "lin_parallel", "lin_race", "lin_timeout", "lin_retry",
                     "lin_thread_pool", "lin_worker", "lin_request", "lin_message", "lin_close",
@@ -391,7 +406,7 @@ impl<'ctx> Codegen<'ctx> {
         // so sibling calls resolve without touching global state.
         for stmt in &module.statements {
             if let TypedStmt::Val {
-                value: TypedExpr::Function { name: Some(name), params, body, ret_type, captures, .. },
+                value: TypedExpr::Function { name: Some(name), params, body, ret_type, captures, span: _, .. },
                 ..
             } = stmt {
                 if captures.is_empty() {
@@ -405,6 +420,93 @@ impl<'ctx> Codegen<'ctx> {
         }
         // Clear current_module_slots now that this module's compilation is done.
         self.current_module_slots.clear();
+    }
+
+    /// Register an imported module with its source for coverage instrumentation.
+    /// Call this instead of register_import when coverage is enabled and the module is
+    /// a user-defined (non-stdlib) file that should be tracked.
+    pub fn register_import_with_source(
+        &mut self,
+        path: &str,
+        module: &TypedModule,
+        source_path: &str,
+        source_text: &str,
+    ) {
+        // Add the source file to coverage emitter BEFORE compiling, so we have a file_idx.
+        let file_idx = if let Some(cov) = &mut self.coverage {
+            cov.add_source_file(source_path, source_text)
+        } else {
+            0
+        };
+
+        // Register the import normally (compiles function bodies).
+        self.register_import(path, module);
+
+        // Now emit coverage globals for each named function in this module.
+        if self.coverage.is_some() {
+            for stmt in &module.statements {
+                if let lin_check::typed_ir::TypedStmt::Val {
+                    value: lin_check::typed_ir::TypedExpr::Function { name: Some(name), params: _, ret_type: _, span, .. },
+                    ..
+                } = stmt {
+                    let module_key = path.replace("/", "_").replace("-", "_");
+                    let llvm_name = format!("{}_{}", module_key, name);
+                    if let Some(&llvm_fn) = self.named_fns.get(name.as_str()) {
+                        let cov = self.coverage.as_mut().unwrap();
+                        let (start_line, start_col) = cov.offset_to_line_col_in(file_idx as usize, span.start);
+                        let (end_line, end_col) = cov.offset_to_line_col_in(file_idx as usize, span.end);
+                        let info = FnCovInfo {
+                            name: llvm_name.clone(),
+                            file_idx,
+                            start_line,
+                            start_col,
+                            end_line,
+                            end_col,
+                        };
+                        let profc = cov.emit_function_globals(self.context, &self.module, info);
+                        // Insert counter increment into the compiled function.
+                        let i64_type = self.context.i64_type();
+                        let i32_type = self.context.i32_type();
+                        if let Some(entry_bb) = llvm_fn.get_first_basic_block() {
+                            let first_inst = entry_bb.get_first_instruction();
+                            if let Some(inst) = first_inst {
+                                self.builder.position_before(&inst);
+                            } else {
+                                self.builder.position_at_end(entry_bb);
+                            }
+                            let counter_type = i64_type.array_type(1);
+                            let counter_ptr = profc.as_pointer_value();
+                            let elem_ptr = unsafe {
+                                self.builder.build_in_bounds_gep(
+                                    counter_type,
+                                    counter_ptr,
+                                    &[i32_type.const_int(0, false).into(), i32_type.const_int(0, false).into()],
+                                    "profc_ptr",
+                                ).unwrap()
+                            };
+                            let old = self.builder.build_load(i64_type, elem_ptr, "profc_old").unwrap().into_int_value();
+                            let new_val = self.builder.build_int_add(old, i64_type.const_int(1, false), "profc_inc").unwrap();
+                            self.builder.build_store(elem_ptr, new_val).unwrap();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Set source file path and text for coverage instrumentation.
+    /// Must be called before compile_module if coverage is enabled.
+    pub fn set_source(&mut self, source_path: &str, source_text: &str) {
+        if let Some(cov) = &mut self.coverage {
+            // Update the main source file (index 0).
+            if cov.source_files.is_empty() {
+                cov.source_files.push(source_path.to_string());
+                cov.source_texts.push(source_text.to_string());
+            } else {
+                cov.source_files[0] = source_path.to_string();
+                cov.source_texts[0] = source_text.to_string();
+            }
+        }
     }
 
     pub fn compile_module(&mut self, module: &TypedModule) {
@@ -465,17 +567,46 @@ impl<'ctx> Codegen<'ctx> {
 
         // Now compile the bodies of all top-level functions.
         // They were forward-declared above; we complete them here.
+        // For coverage, also collect per-function span info and emit __profc/__profd globals.
+        let mut fn_coverage_globals: HashMap<String, inkwell::values::GlobalValue<'ctx>> = HashMap::new();
         for stmt in &module.statements {
             if let TypedStmt::Val {
-                value: TypedExpr::Function { name: Some(name), params, body, ret_type, captures, .. },
+                value: TypedExpr::Function { name: Some(name), params, body, ret_type, captures, span, .. },
                 ..
             } = stmt
             {
                 if captures.is_empty() {
+                    // Emit coverage globals for this function (if coverage enabled).
+                    if self.coverage.is_some() {
+                        let cov = self.coverage.as_mut().unwrap();
+                        let file_idx = 0u32; // main module source is always index 0
+                        let (start_line, start_col) = cov.offset_to_line_col_in(file_idx as usize, span.start);
+                        let (end_line, end_col) = cov.offset_to_line_col_in(file_idx as usize, span.end);
+                        let info = FnCovInfo {
+                            name: name.clone(),
+                            file_idx,
+                            start_line,
+                            start_col,
+                            end_line,
+                            end_col,
+                        };
+                        let profc = cov.emit_function_globals(self.context, &self.module, info);
+                        fn_coverage_globals.insert(name.clone(), profc);
+                    }
+
                     let llvm_fn = *self.named_fns.get(name.as_str()).unwrap();
-                    self.compile_function_body(llvm_fn, params, body, ret_type, &[], name, &HashMap::new(), false);
+                    let profc_global = fn_coverage_globals.get(name.as_str()).copied();
+                    self.compile_function_body_with_coverage(
+                        llvm_fn, params, body, ret_type, &[], name, &HashMap::new(), false,
+                        profc_global,
+                    );
                 }
             }
+        }
+
+        // Finalize coverage globals (emit __covrec, __llvm_coverage_mapping, __llvm_prf_nm).
+        if let Some(cov) = self.coverage.take() {
+            cov.finalize(self.context, &self.module);
         }
     }
 
@@ -598,6 +729,24 @@ impl<'ctx> Codegen<'ctx> {
         matches!(ty, Type::Union(_) | Type::TypeVar(_) | Type::Named(_))
     }
 
+    /// Returns the LLVM struct type for a closure header.
+    ///
+    /// Layout (32 bytes):
+    ///   field 0: i32  refcount
+    ///   field 1: i32  _pad
+    ///   field 2: ptr  fn_ptr
+    ///   field 3: ptr  env_ptr
+    ///
+    /// A trailing u64 env_size lives at offset 24 and is written directly via GEP on the
+    /// raw allocation rather than as a struct field, because the closure struct type is
+    /// referenced in many places and keeping it to 4 fields keeps all the call-site GEPs
+    /// consistent.  The env_size write is done once at closure creation.
+    fn closure_struct_type(&self) -> inkwell::types::StructType<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let i32_ty = self.context.i32_type();
+        self.context.struct_type(&[i32_ty.into(), i32_ty.into(), ptr_ty.into(), ptr_ty.into()], false)
+    }
+
     /// True if the expression produces a freshly heap-allocated value that the caller owns.
     /// Used to decide whether to release the value after consuming it.
     fn expr_is_owned_alloc(expr: &TypedExpr) -> bool {
@@ -611,14 +760,17 @@ impl<'ctx> Codegen<'ctx> {
         let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
         let lin_alloc_fn = self.get_or_declare_fn("lin_alloc",
             ptr_ty.fn_type(&[self.context.i64_type().into()], false));
-        let cls_size = self.context.i64_type().const_int(16, false); // 2 * 8 bytes
+        let cls_size = self.context.i64_type().const_int(32, false); // {i32,i32,ptr,ptr} + u64 env_size
         let cls_mem = self.builder.build_call(lin_alloc_fn, &[cls_size.into()], "wfn_cls")
             .unwrap().try_as_basic_value().unwrap_basic().into_pointer_value();
-        let cls_ty = self.context.struct_type(&[ptr_ty.into(), ptr_ty.into()], false);
-        let fn_field = self.builder.build_struct_gep(cls_ty, cls_mem, 0, "wfn_fp").unwrap();
+        let cls_ty = self.closure_struct_type();
+        let rc_field = self.builder.build_struct_gep(cls_ty, cls_mem, 0, "wfn_rc").unwrap();
+        self.builder.build_store(rc_field, self.context.i32_type().const_int(1, false)).unwrap();
+        let fn_field = self.builder.build_struct_gep(cls_ty, cls_mem, 2, "wfn_fp").unwrap();
         self.builder.build_store(fn_field, fn_ptr).unwrap();
-        let env_field = self.builder.build_struct_gep(cls_ty, cls_mem, 1, "wfn_ep").unwrap();
+        let env_field = self.builder.build_struct_gep(cls_ty, cls_mem, 3, "wfn_ep").unwrap();
         self.builder.build_store(env_field, ptr_ty.const_null()).unwrap();
+        // env_size = 0 at offset 24 (already zeroed by lin_alloc).
         cls_mem.into()
     }
 
@@ -665,16 +817,18 @@ impl<'ctx> Codegen<'ctx> {
             wf
         };
 
-        // Build {fn_ptr, null_env} closure struct.
+        // Build {rc, _pad, fn_ptr, null_env} closure struct.
         let lin_alloc_fn = self.get_or_declare_fn("lin_alloc",
             ptr_ty.fn_type(&[self.context.i64_type().into()], false));
         let cls_mem = self.builder.build_call(lin_alloc_fn,
-            &[self.context.i64_type().const_int(16, false).into()], "wnfn_cls")
+            &[self.context.i64_type().const_int(32, false).into()], "wnfn_cls")
             .unwrap().try_as_basic_value().unwrap_basic().into_pointer_value();
-        let cls_ty = self.context.struct_type(&[ptr_ty.into(), ptr_ty.into()], false);
-        let fn_field = self.builder.build_struct_gep(cls_ty, cls_mem, 0, "wnfn_fp").unwrap();
+        let cls_ty = self.closure_struct_type();
+        let rc_field = self.builder.build_struct_gep(cls_ty, cls_mem, 0, "wnfn_rc").unwrap();
+        self.builder.build_store(rc_field, self.context.i32_type().const_int(1, false)).unwrap();
+        let fn_field = self.builder.build_struct_gep(cls_ty, cls_mem, 2, "wnfn_fp").unwrap();
         self.builder.build_store(fn_field, wrapper_fn.as_global_value().as_pointer_value()).unwrap();
-        let env_field = self.builder.build_struct_gep(cls_ty, cls_mem, 1, "wnfn_ep").unwrap();
+        let env_field = self.builder.build_struct_gep(cls_ty, cls_mem, 3, "wnfn_ep").unwrap();
         self.builder.build_store(env_field, ptr_ty.const_null()).unwrap();
         cls_mem.into()
     }
@@ -894,6 +1048,58 @@ impl<'ctx> Codegen<'ctx> {
     // Function body compilation
     // -------------------------------------------------------------------------
 
+    fn compile_function_body_with_coverage(
+        &mut self,
+        llvm_fn: FunctionValue<'ctx>,
+        params: &[TypedParam],
+        body: &TypedExpr,
+        ret_type: &Type,
+        captures: &[Capture],
+        fn_name: &str,
+        module_slots: &HashMap<usize, FunctionValue<'ctx>>,
+        is_closure: bool,
+        profc_global: Option<inkwell::values::GlobalValue<'ctx>>,
+    ) {
+        self.compile_function_body(llvm_fn, params, body, ret_type, captures, fn_name, module_slots, is_closure);
+        // Emit the coverage counter increment at function entry (after building basic blocks).
+        if let Some(profc) = profc_global {
+            // Find the entry block and insert counter increment at the very beginning.
+            if let Some(entry_bb) = llvm_fn.get_first_basic_block() {
+                let i64_type = self.context.i64_type();
+                // Position before the first instruction of the entry block.
+                if let Some(first_instr) = entry_bb.get_first_instruction() {
+                    self.builder.position_before(&first_instr);
+                } else {
+                    self.builder.position_at_end(entry_bb);
+                }
+                // Load, increment, store: __profc_fn[0]++
+                let counter_ptr = profc.as_pointer_value();
+                let counter_type = i64_type.array_type(1);
+                let elem_ptr = unsafe {
+                    self.builder
+                        .build_in_bounds_gep(
+                            counter_type,
+                            counter_ptr,
+                            &[
+                                self.context.i32_type().const_int(0, false).into(),
+                                self.context.i32_type().const_int(0, false).into(),
+                            ],
+                            "profc_ptr",
+                        )
+                        .unwrap()
+                };
+                let old_val = self.builder
+                    .build_load(i64_type, elem_ptr, "profc_old")
+                    .unwrap()
+                    .into_int_value();
+                let new_val = self.builder
+                    .build_int_add(old_val, i64_type.const_int(1, false), "profc_inc")
+                    .unwrap();
+                self.builder.build_store(elem_ptr, new_val).unwrap();
+            }
+        }
+    }
+
     fn compile_function_body(
         &mut self,
         llvm_fn: FunctionValue<'ctx>,
@@ -939,21 +1145,20 @@ impl<'ctx> Codegen<'ctx> {
             fn_ctx.env_ptr = Some(env_ptr);
 
             // Build the env struct type and load each captured field into slots.
-            let cap_types: Vec<inkwell::types::BasicTypeEnum> = captures
-                .iter()
-                .map(|c| {
-                    if c.is_mutable {
-                        self.context.ptr_type(AddressSpace::default()).into()
-                    } else {
-                        self.llvm_type(&c.ty)
-                    }
-                })
-                .collect();
+            // Env layout: { u64 size_header, cap_0, cap_1, ... } — captures start at field index 1.
+            let mut cap_types: Vec<inkwell::types::BasicTypeEnum> = vec![self.context.i64_type().into()];
+            cap_types.extend(captures.iter().map(|c| {
+                if c.is_mutable {
+                    self.context.ptr_type(AddressSpace::default()).into()
+                } else {
+                    self.llvm_type(&c.ty)
+                }
+            }));
             let env_struct_type = self.context.struct_type(&cap_types, false);
 
             for (i, cap) in captures.iter().enumerate() {
                 let field_ptr = self.builder
-                    .build_struct_gep(env_struct_type, env_ptr, i as u32, &format!("cap_{}_ptr", cap.name))
+                    .build_struct_gep(env_struct_type, env_ptr, (i + 1) as u32, &format!("cap_{}_ptr", cap.name))
                     .unwrap();
                 if cap.is_mutable {
                     // Mutable capture: the env holds a pointer to the LinCell, forward it directly.
@@ -1298,7 +1503,7 @@ impl<'ctx> Codegen<'ctx> {
                     } else {
                         // Check if it's a known intrinsic by name (e.g. `print` re-exported from std/io).
                         let known_intrinsics = ["lin_print", "lin_to_string", "lin_length", "lin_push",
-                            "lin_array_set", "lin_keys", "lin_object_set", "lin_for", "lin_iter", "lin_range",
+                            "lin_array_set", "lin_keys", "lin_object_set", "lin_for", "lin_while", "lin_iter", "lin_range",
                             "lin_map", "lin_filter", "lin_reduce",
                             "lin_async", "lin_await", "lin_parallel", "lin_race", "lin_timeout", "lin_retry",
                             "lin_thread_pool", "lin_worker", "lin_request", "lin_message", "lin_close",
@@ -1614,12 +1819,15 @@ impl<'ctx> Codegen<'ctx> {
 
         // Coerce TypeVar operands to the concrete type of the other operand.
         // When both are TypeVar, use _result_type as the coercion target.
+        // For ordering comparisons (< > <= >=) the result_type is Boolean but operands
+        // are numeric — fall back to Int32 so we unbox the numeric payload, not the bool byte.
+        let is_ordering_op = matches!(op, BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq);
         let (lv, rv, lty, rty) = if matches!(lty_orig, Type::TypeVar(_)) && matches!(rty_orig, Type::TypeVar(_)) {
             // Both TypeVar: coerce both to result_type (or Int32 as fallback).
-            let target = if !matches!(_result_type, Type::TypeVar(_)) {
-                _result_type.clone()
-            } else {
+            let target = if is_ordering_op || matches!(_result_type, Type::TypeVar(_) | Type::Bool) {
                 Type::Int32
+            } else {
+                _result_type.clone()
             };
             let lv_c = self.coerce_typevar(lv_raw, &lty_orig, &target);
             let rv_c = self.coerce_typevar(rv_raw, &rty_orig, &target);
@@ -2340,21 +2548,19 @@ impl<'ctx> Codegen<'ctx> {
         let wrapper_fn_ty = ret_llvm.fn_type(&wrapper_param_tys, false);
         let wrapper_fn = self.module.add_function(&wrapper_name, wrapper_fn_ty, None);
 
-        // Build closure struct: { fn_ptr, env_ptr }
-        let cls_struct_ty = self.context.struct_type(&[ptr_ty.into(), ptr_ty.into()], false);
-        let cls_size = cls_struct_ty.size_of().unwrap();
-        let cls_size_i64 = self.builder
-            .build_int_z_extend_or_bit_cast(cls_size, self.context.i64_type(), "papp_cls_sz")
-            .unwrap();
+        // Build closure struct: { rc, _pad, fn_ptr, env_ptr } + u64 env_size
+        let cls_struct_ty = self.closure_struct_type();
         let cls_ptr = self.builder
-            .build_call(self.rt_alloc, &[cls_size_i64.into()], "papp_cls")
+            .build_call(self.rt_alloc, &[self.context.i64_type().const_int(32, false).into()], "papp_cls")
             .unwrap()
             .try_as_basic_value()
             .unwrap_basic()
             .into_pointer_value();
-        let fn_field = self.builder.build_struct_gep(cls_struct_ty, cls_ptr, 0, "papp_cls_fn").unwrap();
+        let rc_field = self.builder.build_struct_gep(cls_struct_ty, cls_ptr, 0, "papp_cls_rc").unwrap();
+        self.builder.build_store(rc_field, self.context.i32_type().const_int(1, false)).unwrap();
+        let fn_field = self.builder.build_struct_gep(cls_struct_ty, cls_ptr, 2, "papp_cls_fn").unwrap();
         self.builder.build_store(fn_field, wrapper_fn.as_global_value().as_pointer_value()).unwrap();
-        let env_field = self.builder.build_struct_gep(cls_struct_ty, cls_ptr, 1, "papp_cls_env").unwrap();
+        let env_field = self.builder.build_struct_gep(cls_struct_ty, cls_ptr, 3, "papp_cls_env").unwrap();
         self.builder.build_store(env_field, env_ptr).unwrap();
 
         // Now compile wrapper body (deferred — save/restore builder).
@@ -2472,32 +2678,29 @@ impl<'ctx> Codegen<'ctx> {
             self.builder.build_return(Some(&inner_result)).unwrap();
             self.builder.position_at_end(saved_block);
 
-            // Build the outer closure struct { fn_ptr, env_ptr }.
-            let cls_struct_ty = self.context.struct_type(&[ptr_ty.into(), ptr_ty.into()], false);
-            let cls_size = cls_struct_ty.size_of().unwrap();
-            let cls_size_i64 = self.builder.build_int_z_extend_or_bit_cast(cls_size, self.context.i64_type(), "papp_cls_sz").unwrap();
-            let cls_ptr = self.builder.build_call(self.rt_alloc, &[cls_size_i64.into()], "papp_cls").unwrap()
+            // Build the outer closure struct { rc, _pad, fn_ptr, env_ptr } + u64 env_size
+            let cls_struct_ty = self.closure_struct_type();
+            let cls_ptr = self.builder.build_call(self.rt_alloc, &[self.context.i64_type().const_int(32, false).into()], "papp_cls").unwrap()
                 .try_as_basic_value().unwrap_basic().into_pointer_value();
-            let fn_field = self.builder.build_struct_gep(cls_struct_ty, cls_ptr, 0, "papp_cls_fn").unwrap();
+            let rc_field = self.builder.build_struct_gep(cls_struct_ty, cls_ptr, 0, "papp_cls_rc").unwrap();
+            self.builder.build_store(rc_field, self.context.i32_type().const_int(1, false)).unwrap();
+            let fn_field = self.builder.build_struct_gep(cls_struct_ty, cls_ptr, 2, "papp_cls_fn").unwrap();
             self.builder.build_store(fn_field, wrapper_fn.as_global_value().as_pointer_value()).unwrap();
-            let env_field = self.builder.build_struct_gep(cls_struct_ty, cls_ptr, 1, "papp_cls_env").unwrap();
+            let env_field = self.builder.build_struct_gep(cls_struct_ty, cls_ptr, 3, "papp_cls_env").unwrap();
             self.builder.build_store(env_field, env_ptr2).unwrap();
             return cls_ptr.into();
         }
 
-        let closure_struct_type = self.context.struct_type(
-            &[ptr_ty.into(), ptr_ty.into()],
-            false,
-        );
+        let closure_struct_type = self.closure_struct_type();
         let fn_field_ptr = self.builder
-            .build_struct_gep(closure_struct_type, closure_ptr, 0, "cls_fn_ptr")
+            .build_struct_gep(closure_struct_type, closure_ptr, 2, "cls_fn_ptr")
             .unwrap();
         let fn_ptr = self.builder
             .build_load(ptr_ty, fn_field_ptr, "cls_fn")
             .unwrap()
             .into_pointer_value();
         let env_field_ptr = self.builder
-            .build_struct_gep(closure_struct_type, closure_ptr, 1, "cls_env_ptr")
+            .build_struct_gep(closure_struct_type, closure_ptr, 3, "cls_env_ptr")
             .unwrap();
         let env_ptr = self.builder
             .build_load(ptr_ty, env_field_ptr, "cls_env")
@@ -2534,19 +2737,16 @@ impl<'ctx> Codegen<'ctx> {
         result_type: &Type,
     ) -> BasicValueEnum<'ctx> {
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
-        let closure_struct_type = self.context.struct_type(
-            &[ptr_ty.into(), ptr_ty.into()],
-            false,
-        );
+        let closure_struct_type = self.closure_struct_type();
         let fn_field_ptr = self.builder
-            .build_struct_gep(closure_struct_type, closure_ptr, 0, "cls_fn_ptr")
+            .build_struct_gep(closure_struct_type, closure_ptr, 2, "cls_fn_ptr")
             .unwrap();
         let fn_ptr = self.builder
             .build_load(ptr_ty, fn_field_ptr, "cls_fn")
             .unwrap()
             .into_pointer_value();
         let env_field_ptr = self.builder
-            .build_struct_gep(closure_struct_type, closure_ptr, 1, "cls_env_ptr")
+            .build_struct_gep(closure_struct_type, closure_ptr, 3, "cls_env_ptr")
             .unwrap();
         let env_ptr = self.builder
             .build_load(ptr_ty, env_field_ptr, "cls_env")
@@ -2678,14 +2878,19 @@ impl<'ctx> Codegen<'ctx> {
                         .build_call(self.rt_unbox_ptr, &[arr_raw.into()], "push_arr")
                         .unwrap().try_as_basic_value().unwrap_basic();
                     // Box the element into a TaggedVal* for lin_push_dyn.
-                    let elem_tagged = if matches!(elem_ty, Type::TypeVar(_) | Type::Union(_)) {
-                        elem_raw
-                    } else {
+                    let elem_is_fresh_box = !matches!(elem_ty, Type::TypeVar(_) | Type::Union(_));
+                    let elem_tagged = if elem_is_fresh_box {
                         self.box_value(elem_raw, &elem_ty)
+                    } else {
+                        elem_raw
                     };
                     let push_dyn_fn = self.get_or_declare_fn("lin_push_dyn",
                         self.context.void_type().fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
                     self.builder.build_call(push_dyn_fn, &[arr_val.into(), elem_tagged.into()], "").unwrap();
+                    // Release the TaggedVal* box we created — lin_push_dyn copies the value.
+                    if elem_is_fresh_box {
+                        self.builder.build_call(self.rt_tagged_release, &[elem_tagged.into()], "").unwrap();
+                    }
                 } else {
                     self.tagged_array_push_value(arr_raw, elem_raw, &elem_ty);
                 }
@@ -2697,10 +2902,12 @@ impl<'ctx> Codegen<'ctx> {
                 let arr_raw = self.compile_expr(&args[0], fn_ctx);
                 let arr_ty = args[0].ty();
                 let idx_raw = self.compile_expr(&args[1], fn_ctx);
+                let idx_ty = args[1].ty();
                 let elem_raw = self.compile_expr(&args[2], fn_ctx);
                 let elem_ty = args[2].ty();
 
                 let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
+                let i32_ty = self.context.i32_type();
                 let i64_ty = self.context.i64_type();
 
                 // Get the LinArray* — either unbox from TaggedVal* or use directly.
@@ -2711,9 +2918,17 @@ impl<'ctx> Codegen<'ctx> {
                     arr_raw
                 };
 
+                // Get the index as an i32 integer — unbox from TaggedVal* if needed.
+                let idx_i32 = if matches!(idx_ty, Type::TypeVar(_) | Type::Union(_)) {
+                    self.builder.build_call(self.rt_unbox_int32, &[idx_raw.into()], "set_idx_unbox")
+                        .unwrap().try_as_basic_value().unwrap_basic().into_int_value()
+                } else {
+                    idx_raw.into_int_value()
+                };
+
                 // Sign-extend index to i64.
                 let idx_i64 = self.builder
-                    .build_int_s_extend_or_bit_cast(idx_raw.into_int_value(), i64_ty, "set_idx")
+                    .build_int_s_extend_or_bit_cast(idx_i32, i64_ty, "set_idx")
                     .unwrap();
 
                 // Box the element into a TaggedVal*.
@@ -2776,6 +2991,13 @@ impl<'ctx> Codegen<'ctx> {
                     self.builder.build_call(self.rt_array_release, &[iterable_val.into()], "").unwrap();
                 }
                 result
+            }
+            "lin_while" => {
+                // while(iterable, body) — like for but stops when body returns false.
+                let iterable_ty = args[0].ty();
+                let iterable_val = self.compile_expr(&args[0], fn_ctx);
+                let body_expr = &args[1];
+                self.compile_while_loop(iterable_val, &iterable_ty, body_expr, fn_ctx)
             }
             "lin_iter" => {
                 // iter(init, cond, next, current) => Iterator<T>
@@ -2987,12 +3209,17 @@ impl<'ctx> Codegen<'ctx> {
                     self.builder.build_call(self.rt_unbox_ptr, &[key_raw.into()], "oset_key")
                         .unwrap().try_as_basic_value().unwrap_basic().into_pointer_value()
                 };
-                let val_tagged = if matches!(val_ty, Type::TypeVar(_) | Type::Union(_)) {
-                    val_raw.into_pointer_value()
-                } else {
+                let val_is_fresh_box = !matches!(val_ty, Type::TypeVar(_) | Type::Union(_));
+                let val_tagged = if val_is_fresh_box {
                     self.box_value(val_raw, &val_ty).into_pointer_value()
+                } else {
+                    val_raw.into_pointer_value()
                 };
                 self.builder.build_call(self.rt_object_set, &[obj_ptr.into(), key_ptr.into(), val_tagged.into()], "").unwrap();
+                // Release the TaggedVal* box we created — lin_object_set copies the TaggedVal inline.
+                if val_is_fresh_box {
+                    self.builder.build_call(self.rt_tagged_release, &[val_tagged.into()], "").unwrap();
+                }
                 null_val()
             }
 
@@ -3047,10 +3274,10 @@ impl<'ctx> Codegen<'ctx> {
             let tagged_ptr = thunk_val.into_pointer_value();
             let cls_ptr = self.builder.build_call(self.rt_unbox_ptr, &[tagged_ptr.into()], "thunk_cls").unwrap()
                 .try_as_basic_value().unwrap_basic().into_pointer_value();
-            let cls_ty = self.context.struct_type(&[ptr_ty.into(), ptr_ty.into()], false);
-            let fn_field = self.builder.build_struct_gep(cls_ty, cls_ptr, 0, "thunk_fn_f").unwrap();
+            let cls_ty = self.closure_struct_type();
+            let fn_field = self.builder.build_struct_gep(cls_ty, cls_ptr, 2, "thunk_fn_f").unwrap();
             let fn_ptr = self.builder.build_load(ptr_ty, fn_field, "thunk_fn").unwrap().into_pointer_value();
-            let env_field = self.builder.build_struct_gep(cls_ty, cls_ptr, 1, "thunk_env_f").unwrap();
+            let env_field = self.builder.build_struct_gep(cls_ty, cls_ptr, 3, "thunk_env_f").unwrap();
             let env_ptr = self.builder.build_load(ptr_ty, env_field, "thunk_env").unwrap();
             // Call as closure: fn(env) → ptr (result is always a tagged/boxed value)
             let fn_ty = ptr_ty.fn_type(&[ptr_ty.into()], false);
@@ -3067,11 +3294,11 @@ impl<'ctx> Codegen<'ctx> {
         let result = if is_closure && thunk_val.is_pointer_value() {
             // Try closure call first — extract fn_ptr and env_ptr from closure struct.
             let closure_ptr = thunk_val.into_pointer_value();
-            let closure_struct_ty = self.context.struct_type(&[ptr_ty.into(), ptr_ty.into()], false);
+            let closure_struct_ty = self.closure_struct_type();
             // Try to read fn_ptr field — if it fails (bare fn ptr), fall back.
-            let fn_field = self.builder.build_struct_gep(closure_struct_ty, closure_ptr, 0, "cls_fn_ptr_a").unwrap();
+            let fn_field = self.builder.build_struct_gep(closure_struct_ty, closure_ptr, 2, "cls_fn_ptr_a").unwrap();
             let fn_ptr = self.builder.build_load(ptr_ty, fn_field, "cls_fn_a").unwrap().into_pointer_value();
-            let env_field = self.builder.build_struct_gep(closure_struct_ty, closure_ptr, 1, "cls_env_ptr_a").unwrap();
+            let env_field = self.builder.build_struct_gep(closure_struct_ty, closure_ptr, 3, "cls_env_ptr_a").unwrap();
             let env_ptr = self.builder.build_load(ptr_ty, env_field, "cls_env_a").unwrap();
             let ret_llvm = self.llvm_type(&ret_type);
             let fn_ty = ret_llvm.fn_type(&[ptr_ty.into()], false);
@@ -3114,10 +3341,10 @@ impl<'ctx> Codegen<'ctx> {
                     let is_closure = !matches!(thunk_arg, TypedExpr::Function { captures, .. } if captures.is_empty());
                     let boxed_result = if is_closure && thunk_val.is_pointer_value() {
                         let cls = thunk_val.into_pointer_value();
-                        let cls_ty = self.context.struct_type(&[ptr_ty.into(), ptr_ty.into()], false);
-                        let fn_f = self.builder.build_struct_gep(cls_ty, cls, 0, "pa_fn_f").unwrap();
+                        let cls_ty = self.closure_struct_type();
+                        let fn_f = self.builder.build_struct_gep(cls_ty, cls, 2, "pa_fn_f").unwrap();
                         let fp = self.builder.build_load(ptr_ty, fn_f, "pa_fn").unwrap().into_pointer_value();
-                        let env_f = self.builder.build_struct_gep(cls_ty, cls, 1, "pa_env_f").unwrap();
+                        let env_f = self.builder.build_struct_gep(cls_ty, cls, 3, "pa_env_f").unwrap();
                         let ep = self.builder.build_load(ptr_ty, env_f, "pa_env").unwrap();
                         // Call fn(env) → ptr
                         let fn_ty = ptr_ty.fn_type(&[ptr_ty.into()], false);
@@ -3259,10 +3486,10 @@ impl<'ctx> Codegen<'ctx> {
                     // Unbox TaggedVal* → closure struct ptr.
                     let cls_ptr = self.builder.build_call(self.rt_unbox_ptr, &[elem_tv.into()], "par_cls")
                         .unwrap().try_as_basic_value().unwrap_basic().into_pointer_value();
-                    let cls_ty = self.context.struct_type(&[ptr_ty.into(), ptr_ty.into()], false);
-                    let fn_field = self.builder.build_struct_gep(cls_ty, cls_ptr, 0, "par_fn_f").unwrap();
+                    let cls_ty = self.closure_struct_type();
+                    let fn_field = self.builder.build_struct_gep(cls_ty, cls_ptr, 2, "par_fn_f").unwrap();
                     let fn_ptr = self.builder.build_load(ptr_ty, fn_field, "par_fn").unwrap().into_pointer_value();
-                    let env_field = self.builder.build_struct_gep(cls_ty, cls_ptr, 1, "par_env_f").unwrap();
+                    let env_field = self.builder.build_struct_gep(cls_ty, cls_ptr, 3, "par_env_f").unwrap();
                     let env_ptr = self.builder.build_load(ptr_ty, env_field, "par_env").unwrap();
                     // Call thunk: fn(env) → TaggedVal*
                     let thunk_fn_ty = ptr_ty.fn_type(&[ptr_ty.into()], false);
@@ -3309,10 +3536,10 @@ impl<'ctx> Codegen<'ctx> {
                     } else {
                         raw_ptr
                     };
-                    let cls_ty = self.context.struct_type(&[ptr_ty.into(), ptr_ty.into()], false);
-                    let fn_f = self.builder.build_struct_gep(cls_ty, cls_ptr, 0, "w_fn_f").unwrap();
+                    let cls_ty = self.closure_struct_type();
+                    let fn_f = self.builder.build_struct_gep(cls_ty, cls_ptr, 2, "w_fn_f").unwrap();
                     let fp = self.builder.build_load(ptr_ty, fn_f, "w_fn").unwrap().into_pointer_value();
-                    let env_f = self.builder.build_struct_gep(cls_ty, cls_ptr, 1, "w_env_f").unwrap();
+                    let env_f = self.builder.build_struct_gep(cls_ty, cls_ptr, 3, "w_env_f").unwrap();
                     let ep = self.builder.build_load(ptr_ty, env_f, "w_env").unwrap().into_pointer_value();
                     (fp, ep, self.context.i8_type().const_int(1, false))
                 } else {
@@ -3522,36 +3749,38 @@ impl<'ctx> Codegen<'ctx> {
 
         // Build the environment struct if there are captures.
         if !captures.is_empty() {
-            let cap_types: Vec<BasicTypeEnum> = captures
-                .iter()
-                .map(|c| {
-                    if c.is_mutable {
-                        self.context.ptr_type(AddressSpace::default()).into()
-                    } else {
-                        self.llvm_type(&c.ty)
-                    }
-                })
-                .collect();
+            // Env layout: { u64 size_header, cap_0, cap_1, ... }
+            // The leading u64 stores the total env allocation size so lin_closure_release
+            // can free the env without needing a separate size argument.
+            let mut cap_types: Vec<BasicTypeEnum> = vec![self.context.i64_type().into()]; // size header
+            cap_types.extend(captures.iter().map(|c| {
+                if c.is_mutable {
+                    self.context.ptr_type(AddressSpace::default()).into()
+                } else {
+                    self.llvm_type(&c.ty)
+                }
+            }));
             let env_struct_type = self.context.struct_type(&cap_types, false);
             // Heap-allocate the env so captured values survive the creating function's frame.
             let env_size = env_struct_type.size_of().unwrap();
             let env_size_i64 = self.builder
                 .build_int_z_extend_or_bit_cast(env_size, self.context.i64_type(), "env_size")
                 .unwrap();
-            let env_raw = self.builder
+            let env_alloc = self.builder
                 .build_call(self.rt_alloc, &[env_size_i64.into()], "env_raw")
                 .unwrap()
                 .try_as_basic_value()
                 .unwrap_basic()
                 .into_pointer_value();
-            // Cast raw ptr to env struct ptr (LLVM opaque pointers — just use env_raw directly).
-            let env_alloc = env_raw;
+            // Write the size header at field 0 so lin_closure_release can free the env.
+            let size_field = self.builder.build_struct_gep(env_struct_type, env_alloc, 0, "env_sz_f").unwrap();
+            self.builder.build_store(size_field, env_size_i64).unwrap();
 
-            // Store each captured value into the env struct.
+            // Store each captured value into the env struct (fields 1..=n).
             for (i, cap) in captures.iter().enumerate() {
                 let field_ptr = self
                     .builder
-                    .build_struct_gep(env_struct_type, env_alloc, i as u32, "cap_field")
+                    .build_struct_gep(env_struct_type, env_alloc, (i + 1) as u32, "cap_field")
                     .unwrap();
                 let cap_val = match fn_ctx.slots.get(&cap.outer_slot) {
                     Some(SlotStorage::Value(v)) => *v,
@@ -3583,41 +3812,45 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.build_store(field_ptr, cap_val).unwrap();
             }
 
-            // Build the closure struct: heap-allocated { fn_ptr, env_ptr }
+            // Build the closure struct: heap-allocated { rc, _pad, fn_ptr, env_ptr } + u64 env_size
             let fn_ptr = llvm_fn.as_global_value().as_pointer_value();
-            let closure_struct_type = self.context.struct_type(
-                &[
-                    self.context.ptr_type(AddressSpace::default()).into(),
-                    self.context.ptr_type(AddressSpace::default()).into(),
-                ],
-                false,
-            );
-            // Heap-allocate closure struct so it survives the creating function's stack frame.
-            let cls_size = closure_struct_type.size_of().unwrap();
-            let cls_size_i64 = self.builder
-                .build_int_z_extend_or_bit_cast(cls_size, self.context.i64_type(), "cls_size")
-                .unwrap();
+            let closure_struct_type = self.closure_struct_type();
             let closure_alloc = self.builder
-                .build_call(self.rt_alloc, &[cls_size_i64.into()], "closure")
+                .build_call(self.rt_alloc, &[self.context.i64_type().const_int(32, false).into()], "closure")
                 .unwrap()
                 .try_as_basic_value()
                 .unwrap_basic()
                 .into_pointer_value();
+            // Write refcount = 1.
+            let rc_field = self.builder
+                .build_struct_gep(closure_struct_type, closure_alloc, 0, "closure_rc").unwrap();
+            self.builder.build_store(rc_field, self.context.i32_type().const_int(1, false)).unwrap();
             let fn_field = self
                 .builder
-                .build_struct_gep(closure_struct_type, closure_alloc, 0, "closure_fn")
+                .build_struct_gep(closure_struct_type, closure_alloc, 2, "closure_fn")
                 .unwrap();
             self.builder.build_store(fn_field, fn_ptr).unwrap();
             let env_field = self
                 .builder
-                .build_struct_gep(closure_struct_type, closure_alloc, 1, "closure_env")
+                .build_struct_gep(closure_struct_type, closure_alloc, 3, "closure_env")
                 .unwrap();
             self.builder.build_store(env_field, env_alloc).unwrap();
+            // Write env_size at raw offset 24 so lin_closure_release knows how much to free.
+            let env_size_field = unsafe {
+                self.builder.build_gep(
+                    self.context.i64_type(),
+                    closure_alloc,
+                    &[self.context.i64_type().const_int(3, false)], // byte offset 24 / 8 = 3 i64s from start
+                    "closure_env_sz_ptr",
+                ).unwrap()
+            };
+            self.builder.build_store(env_size_field, env_size_i64).unwrap();
 
             // Compile the function body (deferred — save/restore builder position).
             // Pass current_module_slots so sibling stdlib functions resolve inside inner closures.
             let current_block = self.builder.get_insert_block().unwrap();
             let mod_slots = self.current_module_slots.clone();
+            // Adjust compile_function_body: captures now start at env field index 1 (after size header).
             self.compile_function_body(llvm_fn, params, body, ret_type, captures, &closure_name, &mod_slots, true);
             self.builder.position_at_end(current_block);
 
@@ -3629,24 +3862,23 @@ impl<'ctx> Codegen<'ctx> {
             self.compile_function_body(llvm_fn, params, body, ret_type, &[], &closure_name, &mod_slots, true);
             self.builder.position_at_end(current_block);
 
-            // Wrap in {fn_ptr, null_env} closure struct so callers can use uniform convention.
+            // Wrap in {rc, _pad, fn_ptr, null_env} closure struct so callers can use uniform convention.
             let fn_ptr = llvm_fn.as_global_value().as_pointer_value();
             let ptr_ty = self.context.ptr_type(AddressSpace::default());
-            let closure_struct_type = self.context.struct_type(
-                &[ptr_ty.into(), ptr_ty.into()], false);
-            let cls_size = closure_struct_type.size_of().unwrap();
-            let cls_size_i64 = self.builder
-                .build_int_z_extend_or_bit_cast(cls_size, self.context.i64_type(), "cls_size")
-                .unwrap();
+            let closure_struct_type = self.closure_struct_type();
             let closure_alloc = self.builder
-                .build_call(self.rt_alloc, &[cls_size_i64.into()], "closure")
+                .build_call(self.rt_alloc, &[self.context.i64_type().const_int(32, false).into()], "closure")
                 .unwrap().try_as_basic_value().unwrap_basic().into_pointer_value();
+            let rc_field = self.builder
+                .build_struct_gep(closure_struct_type, closure_alloc, 0, "closure_rc").unwrap();
+            self.builder.build_store(rc_field, self.context.i32_type().const_int(1, false)).unwrap();
             let fn_field = self.builder
-                .build_struct_gep(closure_struct_type, closure_alloc, 0, "closure_fn").unwrap();
+                .build_struct_gep(closure_struct_type, closure_alloc, 2, "closure_fn").unwrap();
             self.builder.build_store(fn_field, fn_ptr).unwrap();
             let env_field = self.builder
-                .build_struct_gep(closure_struct_type, closure_alloc, 1, "closure_env").unwrap();
+                .build_struct_gep(closure_struct_type, closure_alloc, 3, "closure_env").unwrap();
             self.builder.build_store(env_field, ptr_ty.const_null()).unwrap();
+            // env_size (offset 24) left as zero — lin_alloc zeroes memory.
             closure_alloc.into()
         }
     }
@@ -4207,6 +4439,85 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
+    /// while(iterable, body) — like for but stops when body returns false.
+    fn compile_while_loop(
+        &mut self,
+        iterable_val: BasicValueEnum<'ctx>,
+        iterable_ty: &Type,
+        body_expr: &TypedExpr,
+        fn_ctx: &mut FnCtx<'ctx, '_>,
+    ) -> BasicValueEnum<'ctx> {
+        let (iterable_val, iterable_ty) = if matches!(iterable_ty, Type::TypeVar(_) | Type::Union(_)) {
+            let unboxed = self.builder
+                .build_call(self.rt_unbox_ptr, &[iterable_val.into()], "whl_unbox")
+                .unwrap().try_as_basic_value().unwrap_basic();
+            (unboxed, Type::Array(Box::new(Type::TypeVar(0))))
+        } else {
+            (iterable_val, iterable_ty.clone())
+        };
+        let iterable_ty = &iterable_ty;
+
+        let null_val = || -> BasicValueEnum<'ctx> { self.context.ptr_type(AddressSpace::default()).const_null().into() };
+        let llvm_fn = fn_ctx.llvm_fn;
+
+        let elem_ty = match iterable_ty {
+            Type::Array(t) => (**t).clone(),
+            Type::Iterator(t) => (**t).clone(),
+            Type::FixedArray(ts) => ts.first().cloned().unwrap_or(Type::Null),
+            _ => {
+                let msg = self.compile_string_lit("while: unsupported iterable type");
+                let zero = self.context.i32_type().const_zero();
+                self.builder.build_call(self.rt_panic, &[msg.into(), zero.into(), zero.into()], "").unwrap();
+                return null_val();
+            }
+        };
+
+        let i_alloc = self.builder.build_alloca(self.context.i64_type(), "whl_i").unwrap();
+        self.builder.build_store(i_alloc, self.context.i64_type().const_zero()).unwrap();
+        let len = self.builder
+            .build_call(self.rt_array_length, &[iterable_val.into()], "whl_len")
+            .unwrap().try_as_basic_value().unwrap_basic().into_int_value();
+
+        let check_block = self.context.append_basic_block(llvm_fn, "whl_check");
+        let body_block  = self.context.append_basic_block(llvm_fn, "whl_body");
+        let exit_block  = self.context.append_basic_block(llvm_fn, "whl_exit");
+
+        self.builder.build_unconditional_branch(check_block).unwrap();
+        self.builder.position_at_end(check_block);
+        let cur_i = self.builder.build_load(self.context.i64_type(), i_alloc, "whl_cur").unwrap().into_int_value();
+        let bounds_ok = self.builder.build_int_compare(IntPredicate::SLT, cur_i, len, "whl_bounds").unwrap();
+        self.builder.build_conditional_branch(bounds_ok, body_block, exit_block).unwrap();
+
+        self.builder.position_at_end(body_block);
+        let elem_val = if Self::is_flat_scalar(&elem_ty) {
+            self.flat_array_get(iterable_val, cur_i, &elem_ty)
+        } else if matches!(elem_ty, Type::TypeVar(_) | Type::Union(_)) {
+            let ptr_ty = self.context.ptr_type(AddressSpace::default());
+            let i64_ty = self.context.i64_type();
+            let get_tagged_fn = self.get_or_declare_fn("lin_array_get_tagged",
+                ptr_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false));
+            self.builder
+                .build_call(get_tagged_fn, &[iterable_val.into(), cur_i.into()], "whl_elem_tv")
+                .unwrap().try_as_basic_value().unwrap_basic()
+        } else {
+            let elem_ptr_val = self.builder
+                .build_call(self.rt_array_get, &[iterable_val.into(), cur_i.into()], "whl_elem_ptr")
+                .unwrap().try_as_basic_value().unwrap_basic().into_pointer_value();
+            self.load_array_element(elem_ptr_val, &elem_ty)
+        };
+
+        // Call body; returns Boolean — false means stop.
+        let cont = self.call_body(body_expr, &[elem_val], &Type::Bool, fn_ctx);
+        let next_i = self.builder
+            .build_int_add(cur_i, self.context.i64_type().const_int(1, false), "whl_next")
+            .unwrap();
+        self.builder.build_store(i_alloc, next_i).unwrap();
+        self.builder.build_conditional_branch(cont.into_int_value(), check_block, exit_block).unwrap();
+
+        self.builder.position_at_end(exit_block);
+        null_val()
+    }
+
     /// map(iterable, fn) — iterate, call fn on each element, push into a new array.
     fn compile_map_loop(
         &mut self,
@@ -4438,11 +4749,11 @@ impl<'ctx> Codegen<'ctx> {
         match body_expr {
             TypedExpr::LocalGet { slot, .. } => {
                 if let Some(SlotStorage::Closure(cls_ptr)) = fn_ctx.slots.get(slot).cloned() {
-                    let cls_ty = self.context.struct_type(&[ptr_ty.into(), ptr_ty.into()], false);
+                    let cls_ty = self.closure_struct_type();
                     let fn_ptr = self.builder.build_load(ptr_ty,
-                        self.builder.build_struct_gep(cls_ty, cls_ptr, 0, "cb_fp").unwrap(), "cb_fn").unwrap().into_pointer_value();
+                        self.builder.build_struct_gep(cls_ty, cls_ptr, 2, "cb_fp").unwrap(), "cb_fn").unwrap().into_pointer_value();
                     let env_ptr = self.builder.build_load(ptr_ty,
-                        self.builder.build_struct_gep(cls_ty, cls_ptr, 1, "cb_ep").unwrap(), "cb_env").unwrap();
+                        self.builder.build_struct_gep(cls_ty, cls_ptr, 3, "cb_ep").unwrap(), "cb_env").unwrap();
                     let mut param_types: Vec<BasicMetadataTypeEnum> = vec![ptr_ty.into()];
                     param_types.extend_from_slice(&arg_metas);
                     let mut call_args: Vec<BasicMetadataValueEnum> = vec![env_ptr.into()];
@@ -4468,12 +4779,12 @@ impl<'ctx> Codegen<'ctx> {
                         let cls_raw = self.builder
                             .build_call(self.rt_unbox_ptr, &[raw_ptr.into()], "jcls_raw")
                             .unwrap().try_as_basic_value().unwrap_basic().into_pointer_value();
-                        let cls_ty = self.context.struct_type(&[ptr_ty.into(), ptr_ty.into()], false);
+                        let cls_ty = self.closure_struct_type();
                         let fn_ptr = self.builder.build_load(ptr_ty,
-                            self.builder.build_struct_gep(cls_ty, cls_raw, 0, "jcls_fp").unwrap(),
+                            self.builder.build_struct_gep(cls_ty, cls_raw, 2, "jcls_fp").unwrap(),
                             "jcls_fn").unwrap().into_pointer_value();
                         let env_ptr = self.builder.build_load(ptr_ty,
-                            self.builder.build_struct_gep(cls_ty, cls_raw, 1, "jcls_ep").unwrap(),
+                            self.builder.build_struct_gep(cls_ty, cls_raw, 3, "jcls_ep").unwrap(),
                             "jcls_env").unwrap();
                         let mut param_types: Vec<BasicMetadataTypeEnum> = vec![ptr_ty.into()];
                         param_types.extend_from_slice(&arg_metas);
@@ -4521,20 +4832,22 @@ impl<'ctx> Codegen<'ctx> {
                 result
             }
             TypedExpr::Function { params, body, captures, ret_type, .. } => {
-                // Capturing lambda — compile closure and call immediately.
+                // Capturing lambda — compile closure, call immediately, then release (refcount=1, single use).
                 let cls_ptr = self.compile_closure(None, params, body, ret_type, captures, fn_ctx).into_pointer_value();
-                let cls_ty = self.context.struct_type(&[ptr_ty.into(), ptr_ty.into()], false);
+                let cls_ty = self.closure_struct_type();
                 let fn_ptr = self.builder.build_load(ptr_ty,
-                    self.builder.build_struct_gep(cls_ty, cls_ptr, 0, "cbc_fp").unwrap(), "cbc_fn").unwrap().into_pointer_value();
+                    self.builder.build_struct_gep(cls_ty, cls_ptr, 2, "cbc_fp").unwrap(), "cbc_fn").unwrap().into_pointer_value();
                 let env_ptr = self.builder.build_load(ptr_ty,
-                    self.builder.build_struct_gep(cls_ty, cls_ptr, 1, "cbc_ep").unwrap(), "cbc_env").unwrap();
+                    self.builder.build_struct_gep(cls_ty, cls_ptr, 3, "cbc_ep").unwrap(), "cbc_env").unwrap();
                 let mut param_types: Vec<BasicMetadataTypeEnum> = vec![ptr_ty.into()];
                 param_types.extend_from_slice(&arg_metas);
                 let mut call_args: Vec<BasicMetadataValueEnum> = vec![env_ptr.into()];
                 call_args.extend_from_slice(&arg_vals);
                 let fn_type = ret_llvm.fn_type(&param_types, false);
-                self.builder.build_indirect_call(fn_type, fn_ptr, &call_args, "cbc_call")
-                    .unwrap().try_as_basic_value().basic().unwrap_or_else(|| ret_llvm.const_zero())
+                let result = self.builder.build_indirect_call(fn_type, fn_ptr, &call_args, "cbc_call")
+                    .unwrap().try_as_basic_value().basic().unwrap_or_else(|| ret_llvm.const_zero());
+                self.builder.build_call(self.rt_closure_release, &[cls_ptr.into()], "").unwrap();
+                result
             }
             _ => {
                 let fn_val = self.compile_expr(body_expr, fn_ctx);
@@ -4664,7 +4977,7 @@ impl<'ctx> Codegen<'ctx> {
 
         match body_expr {
             TypedExpr::LocalGet { slot, ty: body_ty, .. } => {
-                let cls_struct_type = self.context.struct_type(&[ptr_ty.into(), ptr_ty.into()], false);
+                let cls_struct_type = self.closure_struct_type();
                 // Resolve the closure struct pointer based on where the function is stored.
                 let cls_ptr_opt: Option<PointerValue<'ctx>> = match fn_ctx.slots.get(slot).cloned() {
                     Some(SlotStorage::Closure(p)) => Some(p),
@@ -4688,11 +5001,11 @@ impl<'ctx> Codegen<'ctx> {
                         // Concrete function: dispatch through {fn_ptr, env_ptr}.
                         let fn_ptr = self.builder
                             .build_load(ptr_ty,
-                                self.builder.build_struct_gep(cls_struct_type, cls_ptr, 0, "cbody_fn_p").unwrap(),
+                                self.builder.build_struct_gep(cls_struct_type, cls_ptr, 2, "cbody_fn_p").unwrap(),
                                 "cbody_fn").unwrap().into_pointer_value();
                         let env_ptr = self.builder
                             .build_load(ptr_ty,
-                                self.builder.build_struct_gep(cls_struct_type, cls_ptr, 1, "cbody_env_p").unwrap(),
+                                self.builder.build_struct_gep(cls_struct_type, cls_ptr, 3, "cbody_env_p").unwrap(),
                                 "cbody_env").unwrap();
                         let fn_type = self.context.void_type().fn_type(&[ptr_ty.into(), arg_meta], false);
                         self.builder.build_indirect_call(fn_type, fn_ptr, &[env_ptr.into(), arg.into()], "for_body").unwrap();
@@ -4705,11 +5018,11 @@ impl<'ctx> Codegen<'ctx> {
                             .unwrap().try_as_basic_value().unwrap_basic().into_pointer_value();
                         let fn_ptr = self.builder
                             .build_load(ptr_ty,
-                                self.builder.build_struct_gep(cls_struct_type, cls_raw, 0, "cbody_jfp").unwrap(),
+                                self.builder.build_struct_gep(cls_struct_type, cls_raw, 2, "cbody_jfp").unwrap(),
                                 "cbody_jfn").unwrap().into_pointer_value();
                         let env_ptr = self.builder
                             .build_load(ptr_ty,
-                                self.builder.build_struct_gep(cls_struct_type, cls_raw, 1, "cbody_jep").unwrap(),
+                                self.builder.build_struct_gep(cls_struct_type, cls_raw, 3, "cbody_jep").unwrap(),
                                 "cbody_jenv").unwrap();
                         let fn_type = self.context.void_type().fn_type(&[ptr_ty.into(), arg_meta], false);
                         self.builder.build_indirect_call(fn_type, fn_ptr, &[env_ptr.into(), arg.into()], "for_body_j").unwrap();
@@ -4745,16 +5058,16 @@ impl<'ctx> Codegen<'ctx> {
                 // Use Never (→ void) as return type since for-loop bodies are side-effect only.
                 let val = self.compile_closure(None, params, body, &Type::Never, captures, fn_ctx);
                 let cls_ptr = val.into_pointer_value();
-                let cls_struct_type = self.context.struct_type(&[ptr_ty.into(), ptr_ty.into()], false);
+                let cls_struct_type = self.closure_struct_type();
                 let fn_field = self.builder
-                    .build_struct_gep(cls_struct_type, cls_ptr, 0, "ibody_fn_p")
+                    .build_struct_gep(cls_struct_type, cls_ptr, 2, "ibody_fn_p")
                     .unwrap();
                 let fn_ptr = self.builder
                     .build_load(ptr_ty, fn_field, "ibody_fn")
                     .unwrap()
                     .into_pointer_value();
                 let env_field = self.builder
-                    .build_struct_gep(cls_struct_type, cls_ptr, 1, "ibody_env_p")
+                    .build_struct_gep(cls_struct_type, cls_ptr, 3, "ibody_env_p")
                     .unwrap();
                 let env_ptr = self.builder
                     .build_load(ptr_ty, env_field, "ibody_env")
@@ -4763,6 +5076,8 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder
                     .build_indirect_call(fn_type, fn_ptr, &[env_ptr.into(), arg.into()], "ibody_call")
                     .unwrap();
+                // Release the closure after the single call (refcount=1, inline use).
+                self.builder.build_call(self.rt_closure_release, &[cls_ptr.into()], "").unwrap();
                 return;
             }
             _ => {}

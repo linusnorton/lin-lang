@@ -74,6 +74,7 @@ This document specifies the standard library for the Lin language. All modules a
 | [`flatMap`](#flatMap) | `(Json[], (Json) -> Json[]) -> Json[]` | Map then flatten one level |
 | [`flatten`](#flatten) | `(Json[]) -> Json[]` | Flatten one level of nesting |
 | [`for`](#for) | `(Iterable, (Json) -> Json) -> Null` | Iterate over array or iterator |
+| [`while`](#while) | `(Json[], (Json) -> Boolean) -> Null` | Iterate, stopping when callback returns false |
 | [`groupBy`](#groupBy) | `(Json[], (Json) -> String) -> { ...Json[] }` | Group into object of arrays by key function |
 | [`indexOf`](#indexOf-array) | `(Json[], Json) -> Int32` | First index of value, or -1 |
 | [`iter`](#iter) | `(() -> S, (S) -> Boolean, (S) -> S, (S) -> T) -> Iterator` | Build a custom iterator |
@@ -927,6 +928,25 @@ Iterates over each element of `iterable`, calling `f` with each element. The ret
 ```txt
 [1, 2, 3].for(x => print(toString(x)))
 range(0, 5).for(i => print(toString(i)))
+```
+
+---
+
+### while
+
+```txt
+val while: (arr: Json[], f: (Json) -> Boolean) -> Null
+```
+
+Iterates over each element of `arr`, calling `f` with each element. Stops as soon as `f` returns `false`. If `f` always returns `true`, the entire array is visited. This is the primitive used to implement short-circuiting operations such as `some`, `every`, `find`, `indexOf`, and `takeWhile`.
+
+```txt
+// stop at first negative number
+[1, 2, -3, 4].while(x => x >= 0)   // visits 1, 2, stops at -3
+
+// equivalent to some — stop on first match
+var found = false
+arr.while(x => val m = x > 5; if m then found = true; !m)
 ```
 
 ---

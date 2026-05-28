@@ -9,6 +9,11 @@ lin-lex = { path = "../lin-lex" }
 lin-parse = { path = "../lin-parse" }
 lin-check = { path = "../lin-check" }
 lin-compile = { path = "../lin-compile" }
+clap = { workspace = true }
+rayon = { workspace = true }
+notify = { workspace = true }
+glob = { workspace = true }
+tempfile = { workspace = true }
 
 [dev-dependencies]
 tiny_http = { workspace = true }

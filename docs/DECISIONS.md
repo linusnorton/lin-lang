@@ -1,20 +1,20 @@
 # Architecture Decision Records
 
-## ADR-001: Dynamic typing for v0
+## ADR-001: Static typing via lin-check
 
-**Decision**: The v0 interpreter does not include a type checker. Types are parsed but not verified at compile time. Runtime type tags (on the Value enum) are used for `is`/`has` checks.
+**Decision**: All Lin programs are type-checked before codegen. The `lin-check` crate performs bidirectional inference, structural typing, union narrowing, and exhaustiveness checking. Runtime type tags still exist in the runtime for `is`/`has` pattern dispatch, but no program should reach codegen with unresolved type errors.
 
-**Rationale**: A full bidirectional type system with generics, variance, and numeric widening is a multi-week effort. Dynamic execution lets us validate the language design and build a working demo overnight. Type checking can be layered on top later without changing the runtime semantics.
+**Rationale**: A full bidirectional type system with generics, variance, and numeric widening allows LLVM to emit unboxed primitives and enables helpful compile-time error messages.
 
-**Consequence**: All type annotations are parsed and stored in the AST but ignored at runtime.
+**Consequence**: Type annotations are parsed, checked, and emitted into `TypedModule`. The `lin-check` crate owns all type inference logic.
 
 ## ADR-002: Minimal built-ins, stdlib for iteration
 
-**Decision**: Only `for` and `iter` remain as Rust built-ins. Higher-level functions (`map`, `filter`, `reduce`, `range`, `iterOf`) are implemented in .lin stdlib files (`std/array`, `std/iter`) and preloaded as globals at interpreter startup.
+**Decision**: Only `lin_for` and `lin_iter` are compiler intrinsics with special codegen. Higher-level functions (`map`, `filter`, `reduce`, `range`, `iterOf`) are implemented in `.lin` stdlib files (`std/array`) and must be explicitly imported by user code.
 
-**Rationale**: `for` needs `call_value` to drive the iterator state machine. `iter` constructs the opaque `IteratorValue` struct. All other iteration functions can be expressed in .lin using these two primitives — e.g., `map` calls `arr.for(item => ...)`. Since .lin supports higher-order functions (passing and calling function arguments), no special interpreter access is needed.
+**Rationale**: `lin_for` and `lin_iter` require special compiler treatment (inline loop emission, iterator struct construction). All other iteration functions can be expressed in Lin itself. Keeping intrinsics minimal means the runtime stays small and the stdlib is readable Lin code.
 
-**Consequence**: ~120 lines of Rust removed. `std/iter` and `std/array` are loaded during `Interpreter::new()` via `preload_stdlib()`, making their exports available as globals without explicit imports. `range()` now returns an `Iterator` (lazy) rather than an `Array` (eager), which is transparent to consumers since all use `.for()`/`.map()`/etc.
+**Consequence**: `range()` returns a lazy `Iterator`. User code imports `map`, `filter`, `reduce`, etc. from `std/array`. The compiler recognises `lin_for`/`lin_iter` by name and emits them as native loops rather than function calls.
 
 ## ADR-004: Objects suppress indentation tracking
 
@@ -48,21 +48,21 @@
 
 **Consequence**: `is_bare_lambda()` check applies only in argument position. A standalone `name => ...` at statement level would be ambiguous (could be assignment with `=>`?), but this doesn't arise in practice.
 
-## ADR-008: Environment cloning for global scope
+## ADR-008: Module-level environment isolation in the compiler
 
-**Decision**: Top-level statements evaluate by cloning `global_env`, evaluating in the clone, then writing back to `global_env`.
+**Decision**: Each module is type-checked in its own scope. Imports from other modules are resolved before the importing module is checked, with each module's public exports available as a `ModuleSignature`.
 
-**Rationale**: Rust's borrow checker prevents holding `&mut self` (needed for `call_value` and module loading) and `&mut self.global_env` simultaneously. Cloning is O(n) in bindings but avoids unsafe code or RefCell wrapping of the entire interpreter.
+**Rationale**: Modules must not pollute each other's namespaces. The compiler uses a module cache keyed by source hash so unchanged modules are not re-checked.
 
-**Consequence**: Performance cost is negligible for typical programs. A future version could use `Rc<RefCell<Env>>` for zero-copy sharing.
+**Consequence**: Circular imports within a single init chain are detected at compile time. Each module's checked `TypedModule` is cached and reused by all importers.
 
-## ADR-009: Stdlib string functions as native intrinsics
+## ADR-009: Stdlib functions as thin Lin wrappers over runtime intrinsics
 
-**Decision**: `trim`, `toUpper`, `toLower` are implemented as Rust native functions (`__stringTrim`, etc.) exposed through .lin wrapper files.
+**Decision**: String, array, object, and IO operations are implemented as C-ABI functions in `lin-runtime` (e.g. `lin_string_trim`, `lin_fs_read_file`) and declared in stdlib `.lin` files via `import foreign "lin-runtime"`. The `.lin` files provide the public API surface.
 
-**Rationale**: String manipulation requires access to Rust's `str` methods which cannot be expressed in lin itself. The .lin files provide the public API surface while the Rust code provides the implementation.
+**Rationale**: String/IO manipulation requires Rust code. The .lin wrapper layer keeps the user-facing API in Lin, making stdlib readable and testable in the same language. The compiler recognises `"lin-runtime"` as a reserved path and always links the runtime archive.
 
-**Consequence**: The stdlib is a mix of .lin re-exports and Rust intrinsics, achieving the "thin runtime, fat stdlib" goal as much as possible given the language's constraints.
+**Consequence**: The stdlib is a mix of pure-Lin logic and thin `lin-runtime` wrappers. Adding a new runtime function requires both a `#[no_mangle] pub unsafe extern "C" fn lin_xxx` in `lin-runtime/src/` and an exported wrapper in the appropriate `stdlib/*.lin` file.
 
 ## ADR-010: Multi-line if/then/else with indent consumption
 
@@ -214,21 +214,21 @@ val myFunc = () =>
 
 **Consequence**: `range(0, n).for(i => ...)` and `arr.for(x => ...)` compile to native loops. The `iter` intrinsic is supported but `map`/`filter`/`reduce` are not yet compiled (runtime panic). Bidirectional type checking was extended (`check_expr` now guides function argument inference using expected parameter types from the call site).
 
-## ADR-027: Concurrency via OS threads in the tree-walking interpreter
+## ADR-027: Concurrency via OS threads
 
-**Decision**: `async(thunk)` spawns a real OS thread (`std::thread::spawn`) with a fresh `Interpreter::new()` instance. The thunk's `Rc<Function>` is converted to a raw pointer via `Rc::into_raw` (wrapped in `SendFunction(*mut Function)` with `unsafe impl Send`) to bypass `Rc`'s `!Send` bound. Results are communicated back via `Arc<Mutex<PromiseState>>`. `await` uses a spin-wait loop with `thread::yield_now()` until the promise resolves.
+**Decision**: `async(thunk)` spawns a real OS thread. Results are communicated back via `Arc<Mutex<PromiseState>>`. `await` blocks the caller thread until the promise resolves. `ThreadPool` uses `mpsc::channel` with a fixed set of worker threads. `Worker` uses `mpsc::sync_channel` for backpressure.
 
-**Rationale**: A true async executor (tokio, async-std) would require cooperative `async/await` syntax throughout the interpreter, which conflicts with the simple tree-walking evaluation model. OS threads are heavyweight but correct: each thread gets its own interpreter state, so there is no shared mutable interpreter data between concurrent thunks. The `SendFunction` raw-pointer trick is safe because Lin's spec forbids `var` capture in async thunks (all captured values are immutable `val` bindings, deep-copied at lambda creation).
+**Rationale**: OS threads are heavyweight but correct: each thread runs independently with no shared mutable state between concurrent thunks. A true async executor (tokio) would require pervasive `async/await` in the runtime.
 
-**Consequence**: `async` thunks run on true OS threads. `await` blocks the caller thread (not a coroutine yield). The `JsonValue` bridge enum serializes results at thread boundaries since `Value` contains `Rc<...>` fields that cannot cross thread boundaries. `ThreadPool` uses `mpsc::channel` with a fixed set of worker threads. `Worker` uses `mpsc::sync_channel` for backpressure.
+**Consequence**: `async` thunks run on true OS threads. `await` blocks the caller thread (not a coroutine yield). Values must be JSON-serializable to cross thread boundaries (spec §32.4).
 
-## ADR-028: `SendFunction` raw-pointer safety invariant
+## ADR-028: Cross-thread value transfer via JSON bridge
 
-**Decision**: `SendFunction(pub *mut Function)` stores the result of `Rc::into_raw(func)`. The receiving thread calls `unsafe { Rc::from_raw(ptr) }` exactly once to reconstruct the `Rc<Function>`. No other `Rc` clone of the same allocation may exist after `SendFunction::new()` is called.
+**Decision**: Values crossing thread boundaries are serialized to a `JsonValue` bridge type (no `Rc`, no `RefCell`) and deserialized on the receiving thread. Functions, iterators, promises, workers, and thread pools cannot cross thread boundaries.
 
-**Rationale**: `Rc<T>` is `!Send` because clone/drop modify a non-atomic reference count. By consuming the `Rc` into a raw pointer (decrements no refcount, transfers ownership), and reconstructing it on exactly one other thread (where no other clones exist), we avoid all data races on the refcount. The raw pointer itself (a plain address) satisfies `Send`.
+**Rationale**: The compiled runtime uses refcounted heap pointers. Deep-copying at the thread boundary (via the bridge type) is unavoidable without adding `Arc`-based reference counting throughout.
 
-**Consequence**: Callers of `SendFunction::new` must ensure no clones of the passed `Rc<Function>` survive in the sending thread after `new()` returns. In practice, the thunk function is always obtained from a `Value::Function(rc)` match arm, and the `Value` is not retained afterward, satisfying this invariant.
+**Consequence**: Async thunk return types must be JSON-compatible (spec §32.4). The serialization is O(size) but is the correct approach given the refcount model.
 
 ## ADR-029: JSON bridge type for cross-thread value transfer
 
@@ -238,13 +238,13 @@ val myFunc = () =>
 
 **Consequence**: Closures, iterators, promises, workers, and thread pools cannot be returned from async thunks (they fail `to_json_value()` with an error). Deep copies are made at the thread boundary. For large objects this is O(size) but is unavoidable given the `Rc`-based value representation.
 
-## ADR-030: IO/FS/HTTP implemented as native intrinsics with interpreter dispatch
+## ADR-030: IO/FS/HTTP implemented as `lin-runtime` C functions
 
-**Decision**: IO (`__ioReadLine`, `__ioReadAll`, `__ioLines`), filesystem (`__fsReadFile`, `__fsWriteFile`, `__fsAppendFile`, `__fsReadLines`, `__fsExists`, `__fsReadJson`, `__fsWriteJson`), HTTP client (`__httpFetch`, `__httpFetchWith`), JSON parsing (`__parseJson`), and HTTP server (`__serverServe`, `__serverServeWithPool`, `__serverPathMatch`) are all implemented as Rust native functions registered in `register_intrinsics`. Functions that return interpreter-managed values (`__ioLines`, `__fsReadLines`, `__serverServe`, `__serverServeWithPool`) are registered as stub stubs and dispatched through `call_value`'s special-name dispatch, following the same pattern as the concurrency builtins.
+**Decision**: IO, filesystem, HTTP client, and server operations are implemented as `#[no_mangle] pub unsafe extern "C"` functions in `lin-runtime` (e.g. `lin_io_read_line`, `lin_fs_read_file`, `lin_http_fetch`). Stdlib `.lin` files declare them via `import foreign "lin-runtime"` and expose clean user-facing names.
 
-**Rationale**: The `NativeFn` type is `fn(&[Value]) -> Result<Value, String>` — a bare function pointer with no captures. IO operations that need complex state (file handles, stdin), the thread pool reference (for pool serve), or interpreter method calls (for calling the handler) cannot be expressed as a `NativeFn`. The call_value dispatch table (a `match name.as_str()` inside `NativeFunction` handling) provides a clean escape hatch for these cases, consistent with how `print`, `for`, `iter`, and the concurrency builtins work.
+**Rationale**: IO requires Rust code. Keeping implementations in `lin-runtime` means the compiler just emits `call` instructions for them. The `.lin` wrapper layer keeps user-facing APIs in Lin.
 
-**Consequence**: All IO/FS/HTTP is synchronous on the calling thread (no internal async). Programs can run IO in background threads via `async`/`threadPool`. The HTTP server blocks forever on the calling thread; typical usage is `async(() => serve(8080, handler))`. `tiny_http` was chosen as the server crate for its simplicity and zero-dependency feel (no tokio runtime needed).
+**Consequence**: All IO/FS/HTTP is synchronous on the calling thread. Programs run IO in background threads via `async`/`threadPool`. The HTTP server blocks forever; typical usage is `async(() => serve(8080, handler))`. `tiny_http` was chosen for its simplicity (no tokio required).
 
 ## ADR-031: `std/io`, `std/fs`, `std/http`, `std/server` as thin Lin wrappers
 
@@ -252,7 +252,7 @@ val myFunc = () =>
 
 **Rationale**: Following the existing pattern (ADR-009): keep the Rust intrinsics small and focused; provide the user-facing API in Lin. This means helpers like `fetchJson` (fetch + parseJson) and `pathMatch` routing can be written in Lin without touching Rust. The stdlib files are compiled once per interpreter session and cached by the module loader.
 
-**Consequence**: Users get `import { readFile, writeFile } from "std/fs"` etc. The intrinsics are not exported but are accessible as globals (registered in global env), so advanced users can call `__fsReadFile(path)` directly.
+**Consequence**: Users get `import { readFile, writeFile } from "std/fs"` etc. The `lin_*` runtime symbols are not exported from stdlib — they're implementation details behind the clean wrapper API.
 
 ## ADR-032: FFI syntax as `import foreign "<path>"` with indented type block
 
@@ -262,13 +262,13 @@ val myFunc = () =>
 
 **Consequence**: `import foreign "libmath.a"\n  val sqrt: (Float64) => Float64` parses correctly. The token `foreign` is now a reserved keyword and cannot be used as an identifier.
 
-## ADR-033: FFI interpreter stubs; full FFI requires the compiler
+## ADR-033: FFI via `import foreign` and LLVM `declare`
 
-**Decision**: In the tree-walking interpreter, each foreign binding is registered as a zero-arity `NativeFunction` stub that returns `Err("Foreign functions are not available in the interpreter; use \`lin build\` to compile")`. The codegen path emits real LLVM `declare` directives and stores the library paths in `Codegen::foreign_lib_paths` for the linker.
+**Decision**: The compiler emits an LLVM `declare` for each foreign binding using the C ABI type mapping. Library paths collected from `ForeignImport` nodes are passed to the linker step in `lin-compile`. `import foreign "lin-runtime"` is a special reserved path that is always linked and skips normal FFI type validation.
 
-**Rationale**: The interpreter cannot load `.a` or `.so` files at runtime without libffi or dlopen, which would add significant complexity. Since the primary value of FFI is in compiled binaries (for performance-critical C interop), stubs in the interpreter are sufficient for development testing. The interpreter stub gives a clear error message rather than a cryptic segfault.
+**Rationale**: LLVM IR's `declare` is the correct mechanism for external C symbol resolution. Keeping library path collection in the AST means `lin-compile` can drive the linker without a separate manifest.
 
-**Consequence**: `lin run` programs with `import foreign` can be loaded and type-checked but foreign functions will panic if called. `lin build` programs can call C functions correctly after linking. End-to-end FFI tests require the full `lin build` pipeline.
+**Consequence**: FFI requires `lin build`. End-to-end FFI tests compile a C library to `.a` and call it from Lin via `lin build`. The type checker validates that all foreign binding types are legal FFI types (numeric, Boolean, Null, or String) at compile time.
 
 ## ADR-034: `async` var-capture check via global slot tracking
 
@@ -292,21 +292,29 @@ Implementation:
 
 **Consequence**: `match x is Int32 => x + 1` correctly type-checks because `x` inside the arm body resolves to the arm-scope `x: Int32`, not the outer `x: Int32 | String`.
 
-## ADR-036: `async(array)` overload in interpreter
+## ADR-036: `async(array)` overload
 
-**Decision**: `builtin_async` detects `Value::Array` as its input and spawns one thread per element, returning an array of `Promise` values. This mirrors the type-level overload already modelled in the checker (`async` accepts `Function | Function[]`).
+**Decision**: `async` accepts either a single thunk `() => T` or an array of thunks `(() => T)[]`. The array overload spawns one thread per element and returns an array of `Promise` values in input order.
 
-**Rationale**: `await(async([thunk1, thunk2, ...]))` is the natural idiom for fork-join concurrency. Without the array overload, users would need to call `async(thunk)` individually and collect results manually. The overload also enables the `test_concurrent_async_fetchjson_no_data_races` test.
+**Rationale**: `await(async([thunk1, thunk2, ...]))` is the natural idiom for fork-join concurrency. Without the array overload, users would need to call `async(thunk)` individually and collect results manually.
 
 **Consequence**: `async([() => fetch(url1), () => fetch(url2)])` spawns two threads and returns two promises in order. `await` on the resulting array blocks until all complete.
 
-## ADR-037: FFI stub arity derived from declared type
+## ADR-037: FFI arity checked at compile time
 
-**Decision**: When the interpreter registers an `import foreign` binding as a stub, it reads the declared `TypeExpr::Function(params, ...)` to determine the arity, instead of hardcoding `arity: 0`. This allows call-site arity checks to pass during interpreter execution, so the stub's error message is reached instead of "Too many arguments".
+**Decision**: The type checker validates arity and types at every call site to foreign bindings, using the declared `TypeExpr::Function(params, ...)` signature. Arity mismatches are compile-time errors.
 
-**Rationale**: The interpreter stub is meant to give a clear diagnostic when FFI functions are called. If the arity doesn't match the declared signature, the interpreter would error before reaching the stub's message, creating confusing diagnostics.
+**Rationale**: FFI arity errors must be caught early. The type checker has all the information needed and catches them in the same pass as regular function calls.
 
-**Consequence**: `import foreign "lib.a"\n  val add: (Int32, Int32) => Int32\nadd(1, 2)` now correctly produces "Foreign functions are not available in the interpreter" rather than "Too many arguments".
+**Consequence**: `import foreign "lib.a"\n  val add: (Int32, Int32) => Int32\nadd(1)` produces a compile-time arity error rather than a link-time or runtime failure.
+
+## ADR-039: Memory management — deterministic reference counting, cycles are user responsibility
+
+**Decision**: Lin uses deterministic reference counting (RC) for all heap-allocated values (strings, arrays, objects, closures). RC operations are inserted by the compiler; the runtime provides `lin_string_release`, `lin_array_release`, `lin_object_release`, and `lin_closure_release`. Release functions recurse into heap-typed elements/values so that nested structures are freed correctly. Reference cycles between heap objects are **not** detected and will leak — this is a documented limitation.
+
+**Rationale**: RC is deterministic (no GC pauses), predictable, and systems-friendly. The Perceus approach (Reinking et al., PLDI 2021, used in Koka and Lean 4) shows that compile-time linearity analysis can elide most RC operations, making the overhead negligible for common functional-style code. Cycle detection requires either programmer annotations (`Weak<T>`, as in Swift/Rust) or a runtime trial-deletion pass (as in Nim ORC). Both add complexity. Cycles are uncommon in the data pipeline / request handler patterns Lin targets. The tradeoff is acceptable: correctness for acyclic data (the common case), documentation for the cycle edge case.
+
+**Consequence**: Programs must not create reference cycles between long-lived heap objects if they care about memory usage. The typical fix is to break cycles by setting a field to `Null` before the data becomes unreachable. Future work: `Weak<T>` type (Option B) or ORC-style trial deletion (Option C) can be layered on top without changing the base RC contract.
 
 ## ADR-038: Optional `else` in `if` expressions — implicit `else null`
 

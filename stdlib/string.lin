@@ -110,7 +110,7 @@ export val repeat = (s: String, count: Int32): String =>
   lin_string_repeat(s, count)
 
 export val at = (s: String, index: Int32): String =>
-  val i = if index < 0 then lin_string_length(s) + index else index
+  val i = if index < 0 then _length(s) + index else index
   lin_string_char_at(s, i)
 
 export val charCode = (s: String, index: Int32): Int32 =>

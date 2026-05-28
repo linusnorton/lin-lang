@@ -59,7 +59,7 @@ pub unsafe extern "C" fn lin_array_free(arr: *mut LinArray) {
     dealloc(arr as *mut u8, array_layout());
 }
 
-/// Decrement refcount and free if zero (does not recurse into elements).
+/// Decrement refcount; when it reaches zero, release all heap-typed elements then free.
 #[no_mangle]
 pub unsafe extern "C" fn lin_array_release(arr: *mut LinArray) {
     if arr.is_null() {
@@ -67,6 +67,30 @@ pub unsafe extern "C" fn lin_array_release(arr: *mut LinArray) {
     }
     (*arr).refcount -= 1;
     if (*arr).refcount == 0 {
+        // For tagged arrays (elem_tag == 0xFF), release any heap-typed elements before
+        // freeing the backing buffer.  Flat scalar arrays hold no pointers.
+        if (*arr).elem_tag == 0xFF {
+            let len = (*arr).len as usize;
+            for i in 0..len {
+                let elem = (*arr).data.add(i);
+                let payload = (*elem).payload;
+                match (*elem).tag {
+                    crate::tagged::TAG_STR => {
+                        crate::string::lin_string_release(payload as *mut crate::string::LinString);
+                    }
+                    crate::tagged::TAG_ARRAY => {
+                        lin_array_release(payload as *mut LinArray);
+                    }
+                    crate::tagged::TAG_OBJECT => {
+                        crate::object::lin_object_release(payload as *mut crate::object::LinObject);
+                    }
+                    crate::tagged::TAG_FUNCTION => {
+                        crate::memory::lin_closure_release(payload as *mut u8);
+                    }
+                    _ => {} // scalars: no heap payload
+                }
+            }
+        }
         lin_array_free(arr);
     }
 }

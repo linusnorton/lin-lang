@@ -1540,15 +1540,18 @@ lin-lang/
     lin-common/              shared types: Span, Diagnostic, intern table
     lin-lex/                 lexer, indentation tokenizer
     lin-parse/               parser, surface AST
-    lin-check/               desugaring, type checker, core AST
-    lin-eval/                tree-walking interpreter (v1 backend)
-    lin-stdlib/              built-in stdlib functions
+    lin-check/               type checker, typed IR
+    lin-ir/                  flat 3-address IR, liveness, RC elision
+    lin-codegen/             LLVM backend via inkwell
+    lin-runtime/             static library linked into every binary
+    lin-compile/             compilation pipeline orchestration
     lin/                     the CLI binary
+  stdlib/                    stdlib .lin files
   docs/
   examples/
 ```
 
-The interpreter in `lin-eval` is the v1 backend. A native codegen target is deferred (§30).
+The backend is the LLVM native-code compiler in `lin-codegen`. Source compiles to a standalone native binary via `lin build`.
 
 ### 28.2 Diagnostics
 
@@ -1580,7 +1583,7 @@ Iterator construction is not desugared to JSON object construction — it create
 
 Deferred — not required to begin implementation:
 
-1. **Native compilation target.** v1 uses a tree-walking interpreter (§28.1). A native or bytecode target is deferred.
+1. **Bytecode or JIT target.** v1 compiles to native code via LLVM (§28.1). A bytecode or JIT target is deferred.
 2. **Exact stdlib API.** Module layout is fixed (§20.6); precise signatures within each module are still being filled in incrementally.
 4. **Tooling.** Formatter, LSP, test runner as a first-class command are deferred.
 5. **Object rest destructuring iteration order.** Specified — see §4.3 and §27.5. Spread inserts source entries in source-iteration order; repeated keys keep their first-occurrence position.
@@ -1604,7 +1607,7 @@ Decided:
 12. Array types are `T[]` (unbounded) and `[T1, T2, ...]` (fixed-length).
 13. Strings use `"..."` with `${expr}` interpolation and standard escapes; UTF-8, length-prefixed; codepoint-aware indexing via stdlib (`at`).
 14. Source files use the `.lin` extension; LF line endings only.
-15. The language is compiled; the v1 backend is a tree-walking Rust interpreter.
+15. The language is compiled to native code via LLVM (`lin build`).
 16. `for` is a built-in function; `map`, `filter`, `reduce`, `range`, `iter`, `iterOf` are library functions.
 17. `else` is the catch-all in `match`; arms each take their own indented line; no `_` wildcard.
 18. Over-application of a function is a compile-time error.

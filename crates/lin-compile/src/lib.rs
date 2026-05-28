@@ -20,6 +20,7 @@ pub struct CompileOptions {
     pub output_path: PathBuf,
     pub emit_ir: bool,
     pub optimize: bool,
+    pub coverage: bool,
 }
 
 #[derive(Debug)]
@@ -67,7 +68,9 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
 
     // 3a. Pre-resolve imports so we know real export types before checking the main module.
     let mut imported_modules: HashMap<String, TypedModule> = HashMap::new();
-    pre_resolve_imports_from_ast(&ast_module, &base_dir, &mut imported_modules)?;
+    // import_sources holds (abs_source_path, source_text) for user-defined (non-stdlib) imports only.
+    let mut import_sources: HashMap<String, (String, String)> = HashMap::new();
+    pre_resolve_imports_from_ast(&ast_module, &base_dir, &mut imported_modules, &mut import_sources)?;
 
     // 3b. Type check main module with pre-resolved import types.
     let typed_module = check_module_with_imports(&ast_module, &imported_modules)
@@ -75,10 +78,23 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
 
     // 4. LLVM codegen
     let context = Context::create();
-    let mut cg = Codegen::new(&context, &module_name);
+    let mut cg = Codegen::new(&context, &module_name, opts.coverage);
+
+    // Set source path and text for coverage instrumentation (no-op when coverage=false).
+    let source_path_abs = opts.source_path.canonicalize()
+        .unwrap_or_else(|_| opts.source_path.clone());
+    cg.set_source(&source_path_abs.to_string_lossy(), &source);
 
     // Register imported modules with codegen so import slots get correct function pointers.
+    // When coverage is enabled, use register_import_with_source for user modules so their
+    // functions are instrumented and appear in the lcov report.
     for (path, imp_module) in &imported_modules {
+        if opts.coverage {
+            if let Some((src_path, src_text)) = import_sources.get(path) {
+                cg.register_import_with_source(path, imp_module, src_path, src_text);
+                continue;
+            }
+        }
         cg.register_import(path, imp_module);
     }
 
@@ -113,7 +129,7 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
     }
 
     // 8. Link with runtime and any foreign libraries
-    link(&obj_path, &opts.output_path, &foreign_libs)?;
+    link(&obj_path, &opts.output_path, &foreign_libs, opts.coverage)?;
 
     // Clean up the .o file.
     let _ = std::fs::remove_file(&obj_path);
@@ -237,10 +253,12 @@ fn stdlib_source(path: &str) -> Option<&'static str> {
 }
 
 /// Recursively type-check all imported modules, populating `cache` in dependency order.
+/// `import_sources` is populated with (abs_path, source_text) for user-defined (non-stdlib) imports.
 fn pre_resolve_imports_from_ast(
     ast_module: &Module,
     base_dir: &Path,
     cache: &mut HashMap<String, TypedModule>,
+    import_sources: &mut HashMap<String, (String, String)>,
 ) -> Result<(), CompileError> {
     for stmt in &ast_module.statements {
         let Stmt::Import { path, .. } = stmt else { continue };
@@ -248,17 +266,18 @@ fn pre_resolve_imports_from_ast(
             continue;
         }
 
-        let (ast_mod, src_text, imported_base) = if let Some(src) = stdlib_source(path.as_str()) {
+        let (ast_mod, src_text, imported_base, abs_path) = if let Some(src) = stdlib_source(path.as_str()) {
             let ast = parse_source(src).map_err(CompileError::TypeCheck)?;
-            pre_resolve_imports_from_ast(&ast, base_dir, cache)?;
-            (ast, src.to_string(), base_dir.to_path_buf())
+            pre_resolve_imports_from_ast(&ast, base_dir, cache, import_sources)?;
+            (ast, src.to_string(), base_dir.to_path_buf(), None)
         } else {
             let file_path = base_dir.join(format!("{}.lin", path));
             let src = std::fs::read_to_string(&file_path)?;
             let ast = parse_source(&src).map_err(CompileError::TypeCheck)?;
             let imported_base = file_path.parent().unwrap_or(base_dir).to_path_buf();
-            pre_resolve_imports_from_ast(&ast, &imported_base, cache)?;
-            (ast, src, imported_base)
+            pre_resolve_imports_from_ast(&ast, &imported_base, cache, import_sources)?;
+            let abs = file_path.canonicalize().unwrap_or(file_path);
+            (ast, src, imported_base, Some(abs.to_string_lossy().to_string()))
         };
 
         // Try cache hit first (skip re-checking if source unchanged).
@@ -267,6 +286,9 @@ fn pre_resolve_imports_from_ast(
             if load_signature(&src_text, &imported_base).is_none() {
                 let sig = ModuleSignature::from_module(&cached);
                 save_signature(&src_text, &sig, &imported_base);
+            }
+            if let Some(ap) = abs_path {
+                import_sources.entry(path.clone()).or_insert((ap, src_text));
             }
             cache.insert(path.clone(), cached);
             continue;
@@ -277,12 +299,15 @@ fn pre_resolve_imports_from_ast(
         let sig = ModuleSignature::from_module(&typed);
         save_cache(&src_text, &typed, &imported_base);
         save_signature(&src_text, &sig, &imported_base);
+        if let Some(ap) = abs_path {
+            import_sources.entry(path.clone()).or_insert((ap, src_text.clone()));
+        }
         cache.insert(path.clone(), typed);
     }
     Ok(())
 }
 
-fn link(obj_path: &Path, output_path: &Path, foreign_libs: &[String]) -> Result<(), CompileError> {
+fn link(obj_path: &Path, output_path: &Path, foreign_libs: &[String], coverage: bool) -> Result<(), CompileError> {
     // Find the lin-runtime static library.
     let runtime_lib = find_runtime_lib();
 
@@ -301,10 +326,8 @@ fn link(obj_path: &Path, output_path: &Path, foreign_libs: &[String]) -> Result<
     for lib in foreign_libs {
         let lib_path = Path::new(lib);
         if lib.ends_with(".a") || lib.ends_with(".o") {
-            // Static archive or object: pass as positional argument
             cmd.arg(lib_path);
         } else if lib.ends_with(".so") || lib.ends_with(".dylib") {
-            // Shared library: extract stem and add -L + -l flags
             let parent = lib_path.parent().unwrap_or(Path::new("."));
             let stem = lib_path.file_stem()
                 .and_then(|s| s.to_str())
@@ -313,9 +336,19 @@ fn link(obj_path: &Path, output_path: &Path, foreign_libs: &[String]) -> Result<
             cmd.arg(format!("-L{}", parent.display()))
                .arg(format!("-l{}", lib_name));
         } else {
-            // Unknown — pass as-is
             cmd.arg(lib_path);
         }
+    }
+
+    // Link clang_rt.profile when coverage instrumentation is enabled.
+    // Use --whole-archive so the profile runtime's constructor and atexit handlers are linked in.
+    if coverage {
+        let profile_lib = "/usr/lib/llvm-22/lib/clang/22/lib/linux/libclang_rt.profile-x86_64.a";
+        cmd.arg("-Wl,--whole-archive")
+           .arg(profile_lib)
+           .arg("-Wl,--no-whole-archive");
+        // profile runtime needs pthread and dl on Linux
+        cmd.arg("-lpthread").arg("-ldl").arg("-lrt");
     }
 
     // Link system libraries needed by lin-runtime (libc via cc, libm for math).

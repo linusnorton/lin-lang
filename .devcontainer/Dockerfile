@@ -15,6 +15,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     llvm-22-tools \
     llvm-22-linker-tools \
     clang-22 \
+    libclang-rt-22-dev \
+    libpolly-22-dev \
     lld-22 \
     lldb-22 \
     pkg-config \

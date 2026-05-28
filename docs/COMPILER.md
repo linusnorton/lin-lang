@@ -452,7 +452,7 @@ The `.o` file is deleted after a successful link. `LIN_EMIT_IR=1` writes the `.l
 |---------|-------|
 | `lin build file.lin [-o out]` | `lin_compile::compile(&CompileOptions)` |
 | `lin check file.lin` | `lin_check::Checker::check_module` |
-| `lin run file.lin` | `lin_eval::Interpreter::run_file` |
+| `lin test [dir]` | `lin` — runs `*.test.lin` fixtures via `lin build` |
 
 `CompileOptions`:
 ```rust

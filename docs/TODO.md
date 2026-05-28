@@ -4,7 +4,7 @@
 
 We build the compiler in **vertical slices**: each milestone ends with a runnable end-to-end pipeline (lex → parse → check → execute) for a subset of the language. Each subsequent milestone widens the subset. This avoids "all parser, no semantics" purgatory and produces something demonstrable at every step.
 
-The backend is a **tree-walking interpreter** in `lin-eval`. A native or bytecode target is deferred (spec §30).
+The backend is the **LLVM native-code compiler** in `lin-codegen`.
 
 Host language: **Rust**. Layout: Cargo workspace.
 
@@ -17,10 +17,14 @@ lin-lang/
     lin-common/              shared types: Span, Diagnostic, intern table
     lin-lex/                 lexer, indentation tokenizer
     lin-parse/               parser, surface AST
-    lin-check/               desugaring, type checker, core AST
-    lin-eval/                tree-walking interpreter (v1 backend)
-    lin-stdlib/              built-in stdlib functions
+    lin-check/               type checker, typed IR
+    lin-ir/                  flat 3-address IR, liveness, RC elision
+    lin-codegen/             LLVM backend via inkwell
+    lin-runtime/             static library linked into every binary
+    lin-compile/             compilation pipeline orchestration
     lin/                     the CLI binary (cargo install entry point)
+    lin-lsp/                 language server (in progress)
+  stdlib/                    stdlib .lin files
   docs/
   examples/
 ```
@@ -53,7 +57,7 @@ End state: `print("hello")` runs and prints `hello`.
 - [x] Function call expressions: `f(arg, arg, ...)`.
 - [x] String and integer literal expressions.
 
-### `lin-eval` (M1 subset)
+### `lin-codegen` (M1 subset)
 - [x] Module loading from a single entry file (no transitive imports yet).
 - [x] Built-in `print` registered directly as a host function.
 - [x] Evaluate `val` declarations top-to-bottom in module scope.
@@ -77,7 +81,7 @@ End state: arithmetic, `var` mutation, assignment-as-expression, multi-statement
 - [x] `var` declarations and assignment-as-expression.
 - [x] `val x: Type = expr` with optional type annotation (annotation recorded but not yet checked).
 
-### `lin-eval`
+### `lin-codegen`
 - [x] Internal numeric representation per family (tagged enum).
 - [x] Literal-to-type assignment using suffix or default (`Int32` / `Float64`).
 - [x] Integer division/modulo by zero → runtime error.
@@ -127,7 +131,7 @@ End state: object/array literals, bracket access (safe-by-default), destructurin
 ### `lin-check` (initial desugaring)
 - [x] Destructuring → primitive bindings (`val { name } = p` ⇒ `val name = p["name"]`).
 
-### `lin-eval`
+### `lin-codegen`
 - [x] JSON object as insertion-ordered key/value map.
 - [x] Object equality: order-independent, structural, deep.
 - [x] Array equality: order-sensitive, deep.
@@ -156,7 +160,7 @@ End state: escapes, multi-line strings, `${...}` interpolation.
 ### `lin-parse`
 - [x] String interpolation expression as a concatenation of parts and embedded expressions.
 
-### `lin-eval`
+### `lin-codegen`
 - [x] Strings stored UTF-8 length-prefixed.
 - [x] `toString` for every primitive (formats per spec §27.8).
 
@@ -181,7 +185,7 @@ End state: full call semantics including chains and partial application.
 - [x] `x.f` → `f(x)` (partial).
 - [x] `(x, y).f` → `f(x, y)` (partial).
 
-### `lin-eval`
+### `lin-codegen`
 - [x] Partial application: dedicated value with `(fn_ptr, accumulated_args)`. Further application appends; arity match invokes (spec §27.7).
 - [x] Over-application: compile-time error.
 - [x] Argument evaluation: left-to-right.
@@ -252,7 +256,7 @@ End state: full `match` with all arm forms.
   - Error for closed unions of primitives / literals / `Null` not covered by `is`/literal arms.
   - Warning otherwise.
 
-### `lin-eval`
+### `lin-codegen`
 - [x] Sequential arm matching; on guard-false, continue to next arm.
 - [x] No matching arm and no `else` → runtime error (with span and call stack).
 
@@ -274,7 +278,7 @@ End state: `[1,2,3].map(i => i * i)` type-checks without annotations.
 - [x] **Numeric widening everywhere safe** (operators, returns, calls, assignments); never implicit narrowing.
 
 ### Tests
-- [x] Inference on `map`, `filter`, `reduce` — covered by interpreter integration tests.
+- [x] Inference on `map`, `filter`, `reduce` — covered by compiler integration tests.
 - [x] Widening across signed+unsigned and integer+float.
 - [x] `Person[]` assignable to `Json[]`.
 
@@ -288,14 +292,14 @@ End state: multi-file programs with `import` and `export`.
 - [x] `export` modifier on `val`, `var`, `type`.
 - [x] `import { a, b as c } from "path"` (single-line and multi-line).
 
-### `lin-eval` (module loader)
+### `lin-compile` (module loader)
 - [x] Resolve `"a/b/c"` → `a/b/c.lin` relative to the importing file's directory.
 - [x] Recognise `std/...` prefix → resolve into `lin-stdlib`.
 - [x] Lazy init: first read of any export forces module init; cycles inside a single init chain are a runtime error.
 
 ### Tests
 - [x] Multi-file fixture.
-- [x] Cyclic-import success: mutual recursion via forward-declaration tested. File-level cyclic import runtime error covered by interpreter's `init_chain` guard.
+- [x] Cyclic-import success: mutual recursion via forward-declaration tested. File-level cyclic import is a compile-time error.
 
 ---
 
@@ -303,7 +307,7 @@ End state: multi-file programs with `import` and `export`.
 
 End state: `range(0, 10).for(i => print(i))` runs.
 
-### `lin-eval`
+### `lin-codegen`
 - [x] Opaque `Iterator` value carrying four closures + state cell (spec §27.6).
 - [x] `iter` built-in constructs an iterator from the four functions.
 - [x] Restartability: re-invoking the initial-state thunk yields a fresh logical start.
@@ -324,7 +328,7 @@ End state: `range(0, 10).for(i => print(i))` runs.
 
 End state: stateful counters work; deep self-recursion runs in constant stack.
 
-### `lin-eval`
+### `lin-codegen`
 - [x] Closure capture: `val` by value, `var` as shared mutable cell (JS-style).
 - [x] Two closures over the same `var` share storage.
 - [x] Detect **direct self-recursive tail calls** and rewrite to a loop. Mutual TCO not required.
@@ -407,7 +411,7 @@ End state: thunks run on OS threads; `parallel` fork-joins; workers handle messa
 
 See spec §32 for the full design.
 
-### New runtime value types (`lin-eval` / `lin-runtime`)
+### New runtime value types (`lin-runtime`)
 
 - [x] `Promise<T>` — opaque value wrapping `Arc<Mutex<PromiseState<T>>>` where state is `Pending | Resolved(Value) | Failed(String)`. Carries the join handle from `std::thread::spawn`.
 - [x] `ThreadPool` — opaque value wrapping a fixed-size Rayon or manual thread-pool. Holds a sender end of a task channel.
@@ -560,10 +564,40 @@ See spec §34 for the full design.
 
 ### Tests
 
-- [x] Interpreter stub: `import foreign "..."` bindings error at call time with a clear message.
+- [x] Compile-time check: `import foreign "..."` bindings are validated at compile time; illegal types produce a clear error.
 - [x] Compile-time error: using `Json` in a foreign signature produces an "illegal FFI type" error.
 - [x] End-to-end test: compile a C library to `.a`, call from Lin via `lin build`. (Requires compiler pipeline to be fully functional.)
 - [x] `examples/ffi_c.lin` — end-to-end fixture calling a C test library.
+
+---
+
+---
+
+## Milestone 20 — Stdlib Performance
+
+End state: O(n log n) sort, O(n) string building, O(n) unique/omit, constant-factor improvements across map/zip/reverse/append.
+
+### Critical fixes (algorithmic complexity)
+
+- [ ] **`lin_array_sort` intrinsic** — delegate to Rust `sort_unstable_by` with a Lin function pointer as comparator. Transforms `sort` and `sortBy` from O(n²) selection sort to O(n log n). Add to `lin-runtime`, wire in codegen as a new intrinsic.
+- [ ] **`lin_string_join` intrinsic** — compute total output length in one pass, allocate a single buffer, fill it. Transforms `string.join`, `string.fromCodePoints`, and `string.replaceAll` accumulation from O(n²) string copies to O(n). Add to `lin-runtime`.
+- [ ] **`unique` hash set** — `unique` and `omit` both suffer O(n²) membership tests. Add a `lin_hash_set` opaque type (or reuse a plain object as a boolean map) so membership is O(1). Transforms `unique` from O(n²) to O(n); transforms `omit` from O(|obj|×|ks|) to O(|obj|+|ks|).
+- [ ] **`replaceAll` loop bound** — outer loop runs `_length(s)` iterations regardless of how many replacements remain. Rewrite using `lin_while` so the loop exits as soon as no more pattern matches exist.
+
+### Significant fixes (double key evaluations)
+
+- [ ] **Schwartzian transform for `sortBy` / `minBy` / `maxBy`** — current comparators call `keyFn(a)` and `keyFn(b)` on every comparison, so `keyFn` is called O(n²) times. Map to `[key, value]` pairs once (O(n) calls), sort/reduce by `pair[0]`, then extract values. Alternatively add `lin_sort_by_key(arr, keyFn)` intrinsic that caches keys internally.
+- [ ] **`string.isBlank` allocation** — calls `lin_string_trim(s) == ""` which allocates a trimmed copy just to check emptiness. Add `lin_string_is_blank` intrinsic that scans bytes directly.
+- [ ] **`string.startsWith` / `string.endsWith` allocation** — each extracts a substring copy for comparison. Add `lin_string_starts_with(s, prefix)` and `lin_string_ends_with(s, suffix)` intrinsics that compare in-place without allocation.
+
+### Minor fixes (constant-factor and allocation)
+
+- [ ] **`lin_array_alloc_sized(n)` intrinsic** — for `map`, `zip`, `take`, `reverse` the output size is known before the loop. Preallocate to eliminate all intermediate `push`-driven reallocations.
+- [ ] **`lin_array_concat` intrinsic** — current `concat` calls `push` per element; a bulk `memcpy`-based copy would be a large constant-factor improvement, especially for flat scalar arrays.
+- [ ] **`append` / `prepend` intermediate alloc** — both construct a 1-element `[item]` literal before calling `concat`. A `lin_array_append` / `lin_array_prepend` intrinsic would skip that allocation.
+- [ ] **`object.values` / `object.entries` two-pass** — both call `lin_keys` then iterate the key array; a `lin_object_values` / `lin_object_entries` intrinsic would traverse the internal hash map in a single pass without the intermediate key array.
+- [ ] **`countBy` two passes** — currently calls `groupBy` (allocates all groups) then counts lengths. A single-pass accumulation directly into integer counts would use less memory and fewer allocations.
+- [ ] **`groupBy` double key lookup** — `result[key]` is accessed twice per element (once for null check, once for the push). A `lin_object_get_or_insert` intrinsic would do a single hash lookup.
 
 ---
 
