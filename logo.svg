@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="hexGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#6b3fa0"/>
+      <stop offset="100%" style="stop-color:#2d6be4"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Flat-top hexagon, centred at 64,64, radius 56 -->
+  <polygon
+    points="92,13.5 120,64 92,114.5 36,114.5 8,64 36,13.5"
+    fill="url(#hexGrad)"
+  />
+
+  <!-- "L" drawn as a path: vertical stroke + horizontal foot -->
+  <!-- Stem: x=43-57, y=30-90  Foot: x=43-85, y=76-90 -->
+  <rect x="43" y="30" width="14" height="60" rx="3" ry="3" fill="white" stroke="none"/>
+  <rect x="43" y="76" width="42" height="14" rx="3" ry="3" fill="white" stroke="none"/>
+</svg>
