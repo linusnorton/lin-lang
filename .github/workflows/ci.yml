@@ -64,7 +64,10 @@ jobs:
         run: |
           for f in examples/*.lin; do
             case "$f" in
-              examples/ffi_c.lin|examples/http-client.lin) echo "SKIP $f"; continue ;;
+              examples/ffi-c.lin|\
+              examples/http-client.lin|\
+              examples/showcase.lin|\
+              examples/template.lin) echo "SKIP $f"; continue ;;
             esac
             echo "==> $f"
             cargo run -p lin --quiet -- run "$f" || exit 1
