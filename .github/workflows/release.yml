@@ -131,6 +131,9 @@ jobs:
           merge-multiple: true
           path: dist/
 
+      - name: List dist contents
+        run: ls -lh dist/
+
       - name: Delete existing "latest" tag
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
