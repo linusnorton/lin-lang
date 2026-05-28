@@ -151,8 +151,7 @@ impl LanguageServer for Backend {
 
         // Detect whether cursor is in a dot-completion context and resolve
         // the receiver's type category (e.g. "array", "string", "object").
-        let receiver_category = dot_receiver_category(&source, offset, &analysis.span_type_map);
-        let in_dot_context = receiver_category.is_some();
+        let (in_dot_context, receiver_category) = dot_receiver_category(&source, offset, &analysis.span_type_map);
 
         let mut items: Vec<CompletionItem> = Vec::new();
 
@@ -217,7 +216,14 @@ impl LanguageServer for Backend {
         }
 
         // 4. Stdlib exports — with auto-import edits and optional dot-filtering.
-        for item in stdlib_completion_items(&source, prefix, receiver_category.as_deref()) {
+        // In dot context with no category, pass Some("any") so all stdlib items show
+        // but keywords/types/bindings are still suppressed.
+        let filter_cat = if in_dot_context {
+            Some(receiver_category.as_deref().unwrap_or("any"))
+        } else {
+            None
+        };
+        for item in stdlib_completion_items(&source, prefix, filter_cat) {
             items.push(item);
         }
 
@@ -375,28 +381,41 @@ fn extract_exports(module: &TypedModule) -> Vec<(String, Type)> {
 
 // ── dot-completion helpers ────────────────────────────────────────────────────
 
-/// Returns the receiver type category if the cursor is in a dot-completion context,
-/// or `None` if we're not immediately after a `.`.
+/// Returns `(in_dot_context, category)`.
+/// `in_dot_context` is true when the cursor is immediately after a `.`.
+/// `category` is Some("array"|"string"|"number"|"object") when the receiver type is known,
+/// or None when in dot context but the type couldn't be resolved (show all stdlib items).
 fn dot_receiver_category(
     source: &str,
     offset: usize,
     span_type_map: &[(lin_common::Span, String, Option<lin_common::Span>)],
-) -> Option<String> {
+) -> (bool, Option<String>) {
     let prefix_len = word_before(source, offset).len();
-    let dot_offset = offset.checked_sub(prefix_len + 1)?;
+    let dot_offset = match offset.checked_sub(prefix_len + 1) {
+        Some(o) => o,
+        None => return (false, None),
+    };
 
     let src_bytes = source.as_bytes();
     if src_bytes.get(dot_offset) != Some(&b'.') {
-        return None;
+        return (false, None);
     }
 
     // Find the type of the expression to the left of the dot.
-    let receiver_offset = dot_offset.checked_sub(1)?;
+    let receiver_offset = match dot_offset.checked_sub(1) {
+        Some(o) => o,
+        None => return (true, None),
+    };
     let ty_str = tightest_span(span_type_map, receiver_offset)
         .map(|(_, s, _)| s.as_str())
         .unwrap_or("");
 
-    Some(type_to_category(ty_str).to_string())
+    if ty_str.is_empty() {
+        // In dot context but type unknown — show all stdlib items.
+        return (true, None);
+    }
+
+    (true, Some(type_to_category(ty_str).to_string()))
 }
 
 /// Maps a Lin type string to a broad category used for dot-completion filtering.
@@ -570,11 +589,14 @@ fn stdlib_completion_items(
             }
             // In dot context, filter by receiver type compatibility.
             if let Some(cat) = receiver_category {
-                // "any" items (like `print`) are not useful in dot context.
-                if *category == "any" {
-                    return false;
+                if cat == "any" {
+                    // Unknown receiver type — show everything.
+                    true
+                } else {
+                    // Known type — filter to matching category only.
+                    // Items categorised "any" (like print) don't belong in dot context.
+                    *category != "any" && *category == cat
                 }
-                *category == cat
             } else {
                 true
             }
