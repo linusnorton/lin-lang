@@ -15,6 +15,9 @@ import foreign "lin-runtime"
   val lin_string_last_index_of: (String, String) => Int32
   val lin_string_join_arr: (String[], String) => String
   val lin_string_replace_all: (String, String, String) => String
+  val lin_string_starts_with: (String, String) => Boolean
+  val lin_string_ends_with: (String, String) => Boolean
+  val lin_string_is_blank: (String) => Boolean
 
 export val trim = (s: String): String =>
   lin_string_trim(s)
@@ -47,20 +50,16 @@ export val lastIndexOf = (s: String, needle: String): Int32 =>
   lin_string_last_index_of(s, needle)
 
 export val isBlank = (s: String): Boolean =>
-  lin_string_trim(s) == ""
+  lin_string_is_blank(s)
 
 export val contains = (s: String, needle: String): Boolean =>
   lin_string_index_of(s, needle) != -1
 
 export val startsWith = (s: String, prefix: String): Boolean =>
-  _substring(s, 0, _length(prefix)) == prefix
+  lin_string_starts_with(s, prefix)
 
 export val endsWith = (s: String, suffix: String): Boolean =>
-  val sl = _length(s)
-  val pl = _length(suffix)
-  if pl > sl
-    then false
-    else _substring(s, sl - pl, sl) == suffix
+  lin_string_ends_with(s, suffix)
 
 export val split = (s: String, delimiter: String): String[] =>
   lin_string_split(s, delimiter)

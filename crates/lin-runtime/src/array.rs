@@ -1,4 +1,4 @@
-use std::alloc::{alloc, dealloc, realloc, Layout};
+use std::alloc::{alloc, alloc_zeroed, dealloc, realloc, Layout};
 
 /// Heap-allocated growable array.
 /// Layout: refcount (u32) | elem_tag (u8) | _pad3 ([u8;3]) | len (u64) | cap (u64) | data (*mut LinArrayElem)
@@ -759,4 +759,111 @@ pub unsafe extern "C" fn lin_flat_array_free_f64(arr: *mut LinArray) {
     );
     dealloc((*arr).data as *mut u8, layout);
     dealloc(arr as *mut u8, array_layout());
+}
+
+// --- Sized allocation helpers ---
+// These allocate an array of exactly `len` elements with len==cap and populate
+// it immediately, avoiding all push/realloc overhead.
+
+/// Allocate a tagged array of `len` null elements (TAG_NULL, payload=0).
+/// All slots are pre-filled; no push calls needed. len is also the capacity.
+#[no_mangle]
+pub unsafe extern "C" fn lin_array_alloc_null(len: u64) -> *mut LinArray {
+    let cap = len.max(1);
+    let arr_layout = array_layout();
+    let ptr = alloc(arr_layout) as *mut LinArray;
+    (*ptr).refcount = 1;
+    (*ptr).elem_tag = 0xFF;
+    (*ptr)._pad3 = [0; 3];
+    (*ptr).len = len;
+    (*ptr).cap = cap;
+    let elem_layout = array_elem_layout(cap);
+    let data = alloc_zeroed(elem_layout) as *mut LinArrayElem;
+    (*ptr).data = data;
+    // alloc_zeroed fills with 0; tag=0 is TAG_NULL and payload=0 — already correct.
+    ptr
+}
+
+/// Allocate a flat i32 array of `len` elements all set to `val`.
+#[no_mangle]
+pub unsafe extern "C" fn lin_flat_array_alloc_filled_i32(len: u64, val: i32) -> *mut LinArray {
+    let cap = len.max(1);
+    let arr_layout = array_layout();
+    let ptr = alloc(arr_layout) as *mut LinArray;
+    (*ptr).refcount = 1;
+    (*ptr).elem_tag = crate::tagged::TAG_INT32;
+    (*ptr)._pad3 = [0; 3];
+    (*ptr).len = len;
+    (*ptr).cap = cap;
+    let data_layout = Layout::from_size_align_unchecked(
+        std::mem::size_of::<i32>() * cap as usize,
+        std::mem::align_of::<i32>(),
+    );
+    let data = alloc(data_layout) as *mut i32;
+    for i in 0..len as usize { *data.add(i) = val; }
+    (*ptr).data = data as *mut LinArrayElem;
+    ptr
+}
+
+/// Allocate a flat i64 array of `len` elements all set to `val`.
+#[no_mangle]
+pub unsafe extern "C" fn lin_flat_array_alloc_filled_i64(len: u64, val: i64) -> *mut LinArray {
+    let cap = len.max(1);
+    let arr_layout = array_layout();
+    let ptr = alloc(arr_layout) as *mut LinArray;
+    (*ptr).refcount = 1;
+    (*ptr).elem_tag = crate::tagged::TAG_INT64;
+    (*ptr)._pad3 = [0; 3];
+    (*ptr).len = len;
+    (*ptr).cap = cap;
+    let data_layout = Layout::from_size_align_unchecked(
+        std::mem::size_of::<i64>() * cap as usize,
+        std::mem::align_of::<i64>(),
+    );
+    let data = alloc(data_layout) as *mut i64;
+    for i in 0..len as usize { *data.add(i) = val; }
+    (*ptr).data = data as *mut LinArrayElem;
+    ptr
+}
+
+/// Allocate a flat f32 array of `len` elements all set to `val`.
+#[no_mangle]
+pub unsafe extern "C" fn lin_flat_array_alloc_filled_f32(len: u64, val: f32) -> *mut LinArray {
+    let cap = len.max(1);
+    let arr_layout = array_layout();
+    let ptr = alloc(arr_layout) as *mut LinArray;
+    (*ptr).refcount = 1;
+    (*ptr).elem_tag = crate::tagged::TAG_FLOAT32;
+    (*ptr)._pad3 = [0; 3];
+    (*ptr).len = len;
+    (*ptr).cap = cap;
+    let data_layout = Layout::from_size_align_unchecked(
+        std::mem::size_of::<f32>() * cap as usize,
+        std::mem::align_of::<f32>(),
+    );
+    let data = alloc(data_layout) as *mut f32;
+    for i in 0..len as usize { *data.add(i) = val; }
+    (*ptr).data = data as *mut LinArrayElem;
+    ptr
+}
+
+/// Allocate a flat f64 array of `len` elements all set to `val`.
+#[no_mangle]
+pub unsafe extern "C" fn lin_flat_array_alloc_filled_f64(len: u64, val: f64) -> *mut LinArray {
+    let cap = len.max(1);
+    let arr_layout = array_layout();
+    let ptr = alloc(arr_layout) as *mut LinArray;
+    (*ptr).refcount = 1;
+    (*ptr).elem_tag = crate::tagged::TAG_FLOAT64;
+    (*ptr)._pad3 = [0; 3];
+    (*ptr).len = len;
+    (*ptr).cap = cap;
+    let data_layout = Layout::from_size_align_unchecked(
+        std::mem::size_of::<f64>() * cap as usize,
+        std::mem::align_of::<f64>(),
+    );
+    let data = alloc(data_layout) as *mut f64;
+    for i in 0..len as usize { *data.add(i) = val; }
+    (*ptr).data = data as *mut LinArrayElem;
+    ptr
 }

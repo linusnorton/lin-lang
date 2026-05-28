@@ -255,6 +255,12 @@ pub unsafe extern "C" fn lin_string_last_index_of(s: *const LinString, needle: *
     }
 }
 
+/// Returns true if the string is empty or contains only whitespace. No allocation.
+#[no_mangle]
+pub unsafe extern "C" fn lin_string_is_blank(s: *const LinString) -> bool {
+    (*s).as_str().chars().all(|c| c.is_whitespace())
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn lin_string_contains(s: *const LinString, needle: *const LinString) -> bool {
     let st = (*s).as_str();

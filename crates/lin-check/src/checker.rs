@@ -2041,6 +2041,19 @@ impl Checker {
             params: vec![Type::TypeVar(u32::MAX)],
             ret: Box::new(Type::Str),
         });
+
+        // arrayAllocate(n) => Json[] — null-filled tagged array of length n
+        self.define_intrinsic("lin_array_allocate", Type::Function {
+            params: vec![Type::Int32],
+            ret: Box::new(Type::Array(Box::new(Type::TypeVar(u32::MAX)))),
+        });
+
+        // arrayAllocateFilled(n, val) => T[] — flat scalar array of length n filled with val
+        // Uses TypeVar(u32::MAX) for val so any scalar can be passed; returns Json[] (TypeVar).
+        self.define_intrinsic("lin_array_allocate_filled", Type::Function {
+            params: vec![Type::Int32, Type::TypeVar(u32::MAX)],
+            ret: Box::new(Type::Array(Box::new(Type::TypeVar(u32::MAX)))),
+        });
     }
 }
 

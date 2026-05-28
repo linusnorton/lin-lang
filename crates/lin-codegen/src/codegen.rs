@@ -382,7 +382,7 @@ impl<'ctx> Codegen<'ctx> {
                     "lin_filter", "lin_reduce",
                     "lin_async", "lin_await", "lin_parallel", "lin_race", "lin_timeout", "lin_retry",
                     "lin_thread_pool", "lin_worker", "lin_request", "lin_message", "lin_close",
-                    "lin_exit", "lin_value_key"];
+                    "lin_exit", "lin_value_key", "lin_array_allocate", "lin_array_allocate_filled"];
                 for binding in bindings.iter() {
                     let key = (import_path.clone(), binding.name.clone());
                     if let Some(&llvm_fn) = self.imported_fns.get(&key) {
@@ -1639,7 +1639,7 @@ impl<'ctx> Codegen<'ctx> {
                             "lin_map", "lin_filter", "lin_reduce",
                             "lin_async", "lin_await", "lin_parallel", "lin_race", "lin_timeout", "lin_retry",
                             "lin_thread_pool", "lin_worker", "lin_request", "lin_message", "lin_close",
-                            "lin_exit", "lin_value_key"];
+                            "lin_exit", "lin_value_key", "lin_array_allocate", "lin_array_allocate_filled"];
                         if known_intrinsics.contains(&binding.name.as_str()) {
                             self.intrinsic_slots.insert(binding.slot, binding.name.clone());
                         } else {
@@ -2994,6 +2994,86 @@ impl<'ctx> Codegen<'ctx> {
                     .unwrap()
                     .try_as_basic_value()
                     .unwrap_basic()
+            }
+            "lin_array_allocate" => {
+                // arrayAllocate(n: Int32) => Json[] — null-filled tagged array of length n
+                let n_val = self.compile_expr(&args[0], fn_ctx);
+                let n_i64 = self.builder.build_int_s_extend(
+                    n_val.into_int_value(),
+                    self.context.i64_type(),
+                    "alloc_n",
+                ).unwrap();
+                let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
+                let alloc_fn = self.get_or_declare_fn(
+                    "lin_array_alloc_null",
+                    ptr_ty.fn_type(&[self.context.i64_type().into()], false),
+                );
+                self.builder
+                    .build_call(alloc_fn, &[n_i64.into()], "alloc_arr")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_basic()
+            }
+            "lin_array_allocate_filled" => {
+                // arrayAllocateFilled(n: Int32, val: T) => T[]
+                // Dispatches to the appropriate flat or tagged runtime function based on val type.
+                let n_val = self.compile_expr(&args[0], fn_ctx);
+                let n_i64 = self.builder.build_int_s_extend(
+                    n_val.into_int_value(),
+                    self.context.i64_type(),
+                    "fillalloc_n",
+                ).unwrap();
+                let fill_val = self.compile_expr(&args[1], fn_ctx);
+                let fill_ty = args[1].ty();
+                let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
+                if Self::is_flat_scalar(&fill_ty) {
+                    let suffix = Self::flat_suffix(&fill_ty);
+                    let fn_name = format!("lin_flat_array_alloc_filled_{}", suffix);
+                    let llvm_elem_ty = self.llvm_type(&fill_ty);
+                    let alloc_fn = self.get_or_declare_fn(
+                        &fn_name,
+                        ptr_ty.fn_type(&[self.context.i64_type().into(), llvm_elem_ty.into()], false),
+                    );
+                    self.builder
+                        .build_call(alloc_fn, &[n_i64.into(), fill_val.into()], "fillflat_arr")
+                        .unwrap()
+                        .try_as_basic_value()
+                        .unwrap_basic()
+                } else {
+                    // Non-scalar fill: allocate null-filled tagged array then set each slot.
+                    // This is correct but not as fast as the scalar path.
+                    let alloc_fn = self.get_or_declare_fn(
+                        "lin_array_alloc_null",
+                        ptr_ty.fn_type(&[self.context.i64_type().into()], false),
+                    );
+                    let arr = self.builder
+                        .build_call(alloc_fn, &[n_i64.into()], "fillgen_arr")
+                        .unwrap()
+                        .try_as_basic_value()
+                        .unwrap_basic();
+                    // Overwrite every slot with the fill value.
+                    let i_alloc = self.builder.build_alloca(self.context.i64_type(), "fi").unwrap();
+                    self.builder.build_store(i_alloc, self.context.i64_type().const_zero()).unwrap();
+                    let llvm_fn = fn_ctx.llvm_fn;
+                    let fill_check = self.context.append_basic_block(llvm_fn, "fill_check");
+                    let fill_body = self.context.append_basic_block(llvm_fn, "fill_body");
+                    let fill_exit = self.context.append_basic_block(llvm_fn, "fill_exit");
+                    self.builder.build_unconditional_branch(fill_check).unwrap();
+                    self.builder.position_at_end(fill_check);
+                    let cur = self.builder.build_load(self.context.i64_type(), i_alloc, "fi").unwrap().into_int_value();
+                    let cond = self.builder.build_int_compare(inkwell::IntPredicate::SLT, cur, n_i64, "fill_cond").unwrap();
+                    self.builder.build_conditional_branch(cond, fill_body, fill_exit).unwrap();
+                    self.builder.position_at_end(fill_body);
+                    let tagged_fill = self.box_value(fill_val, &fill_ty);
+                    let set_fn = self.get_or_declare_fn("lin_array_set",
+                        self.context.void_type().fn_type(&[ptr_ty.into(), self.context.i64_type().into(), ptr_ty.into()], false));
+                    self.builder.build_call(set_fn, &[arr.into(), cur.into(), tagged_fill.into()], "").unwrap();
+                    let next = self.builder.build_int_add(cur, self.context.i64_type().const_int(1, false), "fi_next").unwrap();
+                    self.builder.build_store(i_alloc, next).unwrap();
+                    self.builder.build_unconditional_branch(fill_check).unwrap();
+                    self.builder.position_at_end(fill_exit);
+                    arr
+                }
             }
             "lin_length" => {
                 let arg_val = self.compile_expr(&args[0], fn_ctx);
@@ -5332,6 +5412,11 @@ impl<'ctx> Codegen<'ctx> {
                 let arr_ptr = obj_val;
                 let idx = if key_val.is_int_value() {
                     self.builder.build_int_s_extend_or_bit_cast(key_val.into_int_value(), self.context.i64_type(), "idx").unwrap()
+                } else if key_val.is_pointer_value() {
+                    // TaggedVal* key — unbox to i32 then extend to i64.
+                    let i32_key = self.builder.build_call(self.rt_unbox_int32, &[key_val.into()], "skey_i32")
+                        .unwrap().try_as_basic_value().unwrap_basic().into_int_value();
+                    self.builder.build_int_s_extend(i32_key, self.context.i64_type(), "skey_i64").unwrap()
                 } else { self.context.i64_type().const_int(0, false) };
                 let tagged = self.build_tagged_val_alloca(&val_val, &val_ty);
                 let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
@@ -5561,6 +5646,16 @@ impl<'ctx> Codegen<'ctx> {
                     self.builder
                         .build_int_s_extend_or_bit_cast(key_val.into_int_value(), self.context.i64_type(), "idx")
                         .unwrap()
+                } else if key_val.is_pointer_value() {
+                    // Key is a TaggedVal* (e.g. when passed through a Json/Function callback).
+                    // Unbox to i32 then sign-extend to i64 for array indexing.
+                    let i32_key = self.builder
+                        .build_call(self.rt_unbox_int32, &[key_val.into()], "key_i32")
+                        .unwrap()
+                        .try_as_basic_value()
+                        .unwrap_basic()
+                        .into_int_value();
+                    self.builder.build_int_s_extend(i32_key, self.context.i64_type(), "key_i64").unwrap()
                 } else {
                     self.context.i64_type().const_int(0, false)
                 };
@@ -5625,7 +5720,116 @@ impl<'ctx> Codegen<'ctx> {
                     return self.llvm_type(result_type).const_zero();
                 };
                 // Integer key → array indexing. Check tag is TAG_ARRAY before unboxing.
-                if key_val.is_int_value() {
+                // Also handle TaggedVal* keys (passed through Json/Function callbacks) that
+                // contain integer values (e.g. from for(range(...), i => obj[i])).
+                let int_key_opt: Option<inkwell::values::IntValue<'ctx>> = if key_val.is_int_value() {
+                    Some(self.builder
+                        .build_int_s_extend_or_bit_cast(key_val.into_int_value(), self.context.i64_type(), "tv_idx_raw")
+                        .unwrap())
+                } else {
+                    None
+                };
+                // Pointer-key case: check key tag at runtime to distinguish int from string.
+                if key_val.is_pointer_value() && int_key_opt.is_none() {
+                    let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
+                    let i64_ty = self.context.i64_type();
+                    let llvm_fn = fn_ctx.llvm_fn;
+                    // Read key tag to determine int vs string.
+                    let k_tag = self.builder
+                        .build_call(self.rt_get_tag, &[key_val.into()], "kv_tag")
+                        .unwrap().try_as_basic_value().unwrap_basic().into_int_value();
+                    let is_int32 = self.builder
+                        .build_int_compare(IntPredicate::EQ, k_tag,
+                            self.context.i8_type().const_int(2, false), "kv_is_i32").unwrap();
+                    let is_int64 = self.builder
+                        .build_int_compare(IntPredicate::EQ, k_tag,
+                            self.context.i8_type().const_int(3, false), "kv_is_i64").unwrap();
+                    let is_int_key = self.builder.build_or(is_int32, is_int64, "kv_is_int").unwrap();
+                    let int_key_block  = self.context.append_basic_block(llvm_fn, "tv_int_key");
+                    let str_key_block  = self.context.append_basic_block(llvm_fn, "tv_str_key");
+                    let int_merge      = self.context.append_basic_block(llvm_fn, "tv_int_mrg");
+                    let str_merge      = self.context.append_basic_block(llvm_fn, "tv_str_mrg");
+                    let final_block    = self.context.append_basic_block(llvm_fn, "tv_final");
+                    self.builder.build_conditional_branch(is_int_key, int_key_block, str_key_block).unwrap();
+
+                    // ── int key branch ──────────────────────────────────────────
+                    self.builder.position_at_end(int_key_block);
+                    let raw_i32 = self.builder
+                        .build_call(self.rt_unbox_int32, &[key_val.into()], "kv_i32")
+                        .unwrap().try_as_basic_value().unwrap_basic().into_int_value();
+                    let idx_i64 = self.builder.build_int_s_extend(raw_i32, i64_ty, "kv_i64").unwrap();
+                    let arr_tag = self.builder
+                        .build_call(self.rt_get_tag, &[tagged_ptr.into()], "tv_arr_tag")
+                        .unwrap().try_as_basic_value().unwrap_basic().into_int_value();
+                    let is_arr = self.builder
+                        .build_int_compare(IntPredicate::EQ, arr_tag,
+                            self.context.i8_type().const_int(8, false), "tv_is_arr").unwrap();
+                    let arr_ok  = self.context.append_basic_block(llvm_fn, "tv_arr_ok");
+                    let arr_no  = self.context.append_basic_block(llvm_fn, "tv_arr_no");
+                    self.builder.build_conditional_branch(is_arr, arr_ok, arr_no).unwrap();
+
+                    self.builder.position_at_end(arr_ok);
+                    let arr_inner = self.builder
+                        .build_call(self.rt_unbox_ptr, &[tagged_ptr.into()], "tv_arr_p")
+                        .unwrap().try_as_basic_value().unwrap_basic();
+                    let get_tagged_fn = self.get_or_declare_fn("lin_array_get_tagged",
+                        ptr_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false));
+                    let elem_tv = self.builder
+                        .build_call(get_tagged_fn, &[arr_inner.into(), idx_i64.into()], "tv_elem")
+                        .unwrap().try_as_basic_value().unwrap_basic();
+                    self.builder.build_unconditional_branch(int_merge).unwrap();
+
+                    self.builder.position_at_end(arr_no);
+                    let null_int = ptr_ty.const_null();
+                    self.builder.build_unconditional_branch(int_merge).unwrap();
+
+                    self.builder.position_at_end(int_merge);
+                    let int_phi = self.builder.build_phi(ptr_ty, "tv_int_res").unwrap();
+                    int_phi.add_incoming(&[(&elem_tv, arr_ok), (&null_int, arr_no)]);
+                    let int_res = int_phi.as_basic_value();
+                    self.builder.build_unconditional_branch(final_block).unwrap();
+
+                    // ── string key branch ───────────────────────────────────────
+                    self.builder.position_at_end(str_key_block);
+                    let obj_tag = self.builder
+                        .build_call(self.rt_get_tag, &[tagged_ptr.into()], "tv_obj_tag")
+                        .unwrap().try_as_basic_value().unwrap_basic().into_int_value();
+                    let is_obj = self.builder
+                        .build_int_compare(IntPredicate::EQ, obj_tag,
+                            self.context.i8_type().const_int(7, false), "tv_is_obj").unwrap();
+                    let obj_ok  = self.context.append_basic_block(llvm_fn, "tv_obj_ok");
+                    let obj_no  = self.context.append_basic_block(llvm_fn, "tv_obj_no");
+                    self.builder.build_conditional_branch(is_obj, obj_ok, obj_no).unwrap();
+
+                    self.builder.position_at_end(obj_ok);
+                    let obj_ptr = self.builder.build_call(self.rt_unbox_ptr, &[tagged_ptr.into()], "tv_obj_p")
+                        .unwrap().try_as_basic_value().unwrap_basic().into_pointer_value();
+                    let str_entry = self.builder
+                        .build_call(self.rt_object_get, &[obj_ptr.into(), key_val.into()], "tv_sentry")
+                        .unwrap().try_as_basic_value().unwrap_basic().into_pointer_value();
+                    self.builder.build_unconditional_branch(str_merge).unwrap();
+
+                    self.builder.position_at_end(obj_no);
+                    let null_str = ptr_ty.const_null();
+                    self.builder.build_unconditional_branch(str_merge).unwrap();
+
+                    self.builder.position_at_end(str_merge);
+                    let str_phi = self.builder.build_phi(ptr_ty, "tv_str_res").unwrap();
+                    str_phi.add_incoming(&[(&str_entry, obj_ok), (&null_str, obj_no)]);
+                    let str_res = str_phi.as_basic_value();
+                    self.builder.build_unconditional_branch(final_block).unwrap();
+
+                    // ── final merge ─────────────────────────────────────────────
+                    self.builder.position_at_end(final_block);
+                    let final_phi = self.builder.build_phi(ptr_ty, "tv_res").unwrap();
+                    final_phi.add_incoming(&[(&int_res, int_merge), (&str_res, str_merge)]);
+                    let result_ptr: PointerValue<'ctx> = final_phi.as_basic_value().into_pointer_value();
+                    if matches!(result_type, Type::TypeVar(_) | Type::Union(_)) {
+                        return result_ptr.into();
+                    }
+                    return self.load_tagged_val_payload(result_ptr, result_type, &obj_ty);
+                }
+                if let Some(int_key) = int_key_opt {
                     let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
                     let i64_ty = self.context.i64_type();
                     // Guard: if not TAG_ARRAY (8), return null rather than UB.
@@ -5646,9 +5850,7 @@ impl<'ctx> Codegen<'ctx> {
                     let arr_ptr = self.builder
                         .build_call(self.rt_unbox_ptr, &[tagged_ptr.into()], "tv_arr")
                         .unwrap().try_as_basic_value().unwrap_basic();
-                    let idx = self.builder
-                        .build_int_s_extend_or_bit_cast(key_val.into_int_value(), i64_ty, "tv_idx")
-                        .unwrap();
+                    let idx = int_key;
                     let get_tagged_fn = self.get_or_declare_fn("lin_array_get_tagged",
                         ptr_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false));
                     let elem_tv = self.builder
