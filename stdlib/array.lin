@@ -56,9 +56,18 @@ export val iter = (init: Json, hasNext: Json, next: Json, value: Json) =>
   lin_iter(init, hasNext, next, value)
 
 export val concat = (a: Json, b: Json): Json =>
-  val result = []
-  for(a, x => push(result, x))
-  for(b, x => push(result, x))
+  val n = length(a)
+  val m = length(b)
+  val result = lin_array_allocate(n + m)
+  var i = 0
+  for(a, x =>
+    lin_array_set(result, i, x)
+    i = i + 1
+  )
+  for(b, x =>
+    lin_array_set(result, i, x)
+    i = i + 1
+  )
   result
 
 export val map = (arr: Json, f: Function): Json =>
@@ -289,10 +298,26 @@ export val maxBy = (arr: Json[], keyFn: (Json) => Json): Json =>
   )[1]
 
 export val append = (arr: Json[], item: Json): Json[] =>
-  concat(arr, [item])
+  val n = length(arr)
+  val result = lin_array_allocate(n + 1)
+  var i = 0
+  for(arr, x =>
+    lin_array_set(result, i, x)
+    i = i + 1
+  )
+  lin_array_set(result, n, item)
+  result
 
 export val prepend = (arr: Json[], item: Json): Json[] =>
-  concat([item], arr)
+  val n = length(arr)
+  val result = lin_array_allocate(n + 1)
+  lin_array_set(result, 0, item)
+  var i = 1
+  for(arr, x =>
+    lin_array_set(result, i, x)
+    i = i + 1
+  )
+  result
 
 export val scan = (arr: Json[], init: Json, f: (Json, Json) => Json): Json[] =>
   val result = [init]
@@ -307,14 +332,17 @@ export val groupBy = (arr: Json, keyFn: (Json) => String): Json =>
   var result = {}
   for(arr, item =>
     val key = keyFn(item)
-    if result[key] == null then lin_object_set(result, key, [item])
-    else push(result[key], item)
+    val group = result[key]
+    if group == null then lin_object_set(result, key, [item])
+    else push(group, item)
   )
   result
 
 export val countBy = (arr: Json, keyFn: (Json) => String): Json =>
-  val groups = groupBy(arr, keyFn)
-  val ks = lin_keys(groups)
   var result = {}
-  lin_for(ks, k => lin_object_set(result, k, length(groups[k])))
+  for(arr, item =>
+    val key = keyFn(item)
+    if result[key] == null then lin_object_set(result, key, 1)
+    else lin_object_set(result, key, result[key] + 1)
+  )
   result
