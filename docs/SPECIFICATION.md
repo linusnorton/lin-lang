@@ -416,9 +416,8 @@ A `val` whose right-hand side is a function literal may reference itself by name
 
 ```txt
 val factorial = (n: Int32): Int32 =>
-  if n == 0
-    then 1
-    else n * factorial(n - 1)
+  if n == 0 then 1
+  else n * factorial(n - 1)
 ```
 
 A `val` whose right-hand side is *not* a function literal may **not** reference itself.
@@ -778,18 +777,15 @@ The inner `if`'s `else` is at the same indent as the `if` itself; the outer `mat
 
 ```txt
 val describe = (input: String | Int32 | Null): String =>
-  if input is Null
-    then "No value"
-    else if input is Int32
-      then "Int32"
-      else "String"
+  if input is Null then "No value"
+  else if input is Int32 then "Int32"
+  else "String"
 ```
 
 ```txt
 val isDave = (input: String): Boolean =>
-  if input is "Dave"
-    then true
-    else false
+  if input is "Dave" then true
+  else false
 ```
 
 `is` is not supported against generic type applications in v1. Writing `value is Result<Int32, String>` is a compile-time error. Match the underlying tagged shape instead (see §18).
@@ -813,9 +809,8 @@ A single `match` arm may not combine `is` and `has` patterns — each arm uses o
 
 ```txt
 val describeNamed = (input: Json): String =>
-  if input has { name }
-    then "Named: ${input["name"]}"
-    else "Unnamed"
+  if input has { name } then "Named: ${input["name"]}"
+  else "Unnamed"
 ```
 
 For unions and generics, `is` and `has` apply only to concrete shapes, not to compound types. To inspect a tagged-union value, match against the underlying tag shape:
@@ -1207,15 +1202,14 @@ type Result<T, E> =
 
 ```txt
 val divide = (a: Float64, b: Float64): Result<Float64, String> =>
-  if b == 0.0
-    then {
-      "type": "failure",
-      "error": "Cannot divide by zero"
-    }
-    else {
-      "type": "success",
-      "value": a / b
-    }
+  if b == 0.0 then {
+    "type": "failure",
+    "error": "Cannot divide by zero"
+  }
+  else {
+    "type": "success",
+    "value": a / b
+  }
 ```
 
 Consuming the result:
@@ -1397,9 +1391,8 @@ All binary arithmetic and comparison operators are left-associative. `&&` and `|
 
 ```txt
 val display = (input: String | Null): String =>
-  if input is Null
-    then "missing"
-    else input
+  if input is Null then "missing"
+  else input
 ```
 
 Inside the `else` branch, `input` is narrowed to `String`.
@@ -1954,15 +1947,14 @@ val describeName = (input: String | Person | Null): String =>
       "Name: ${input}"
 
 val parseAge = (input: String): Result<Int32, String> =>
-  if input.isInt32()
-    then {
-      "type": "success",
-      "value": input.toInt32()
-    }
-    else {
-      "type": "failure",
-      "error": "Invalid age"
-    }
+  if input.isInt32() then {
+    "type": "success",
+    "value": input.toInt32()
+  }
+  else {
+    "type": "failure",
+    "error": "Invalid age"
+  }
 ```
 
 ## 33. IO, Filesystem, and HTTP Intrinsics
@@ -2054,9 +2046,10 @@ export val fetchJson = (url: String): Json | Error =>
   match __httpFetch(url)
     is { "type": "failure", "error": e } => { "type": "failure", "error": e }
     is { "type": "success", "value": resp } =>
-      if resp["status"] >= 200 && resp["status"] < 300
-        then parseJson(resp["body"])
-        else { "type": "failure", "error": "HTTP ${resp["status"]}" }
+      if resp["status"] >= 200 && resp["status"] < 300 then
+        parseJson(resp["body"])
+      else
+        { "type": "failure", "error": "HTTP ${resp["status"]}" }
 
 export val postJson = (url: String, body: Json): HttpResponse | Error =>
   __httpFetchWith(url, {

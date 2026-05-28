@@ -243,9 +243,8 @@ val maybeName: String | Null = null
 val maybeOtherName: String | Null = "Jane"
 
 val displayName = (input: String | Null): String =>
-  if input is Null
-    then "Anonymous"
-    else input
+  if input is Null then "Anonymous"
+  else input
 
 val displayed = displayName(maybeName)
 
@@ -258,28 +257,27 @@ val displayed = displayName(maybeName)
 
 val l1 = if person["age"] >= 18 then "adult" else "child"
 
-// Multi-line then/else form
+// Multi-line form
 
-val l2 = if person["age"] >= 18
-  then "adult"
-  else "child"
+val l2 = if person["age"] >= 18 then
+  "adult"
+else
+  "child"
 
 // Block branches
 
-val l3 = if person["age"] >= 18
-  then
-    val prefix = "ad"
-    "${prefix}ult"
-  else
-    val prefix = "ch"
-    "${prefix}ild"
+val l3 = if person["age"] >= 18 then
+  val prefix = "ad"
+  "${prefix}ult"
+else
+  val prefix = "ch"
+  "${prefix}ild"
 
 // Continuation with && or || on the next line
 
 val l4 = if person["age"] >= 18
-  && person["name"] != "something"
-  then "adult"
-  else "child"
+  && person["name"] != "something" then "adult"
+else "child"
 
 
 // ------------------------------------------------------------
@@ -289,34 +287,28 @@ val l4 = if person["age"] >= 18
 // is checks exact type, exact literal, or exact shape
 
 val describePrimitive = (input: String | Int32 | Null): String =>
-  if input is Null
-    then "Null"
-    else if input is Int32
-      then "Int32"
-      else "String"
+  if input is Null then "Null"
+  else if input is Int32 then "Int32"
+  else "String"
 
 val isBigDave = (input: String): Boolean =>
-  if input is "Dave"
-    then true
-    else false
+  if input is "Dave" then true
+  else false
 
 // has checks whether a value structurally contains a shape
 
 val hasName = (input: Json): Boolean =>
-  if input has { name }
-    then true
-    else false
+  if input has { name } then true
+  else false
 
 val describeNamedThing = (input: Json): String =>
-  if input has { name }
-    then "Named thing: ${input["name"]}"
-    else "Unnamed thing"
+  if input has { name } then "Named thing: ${input["name"]}"
+  else "Unnamed thing"
 
 val describeOlderNamedThing = (input: Json): String =>
   if input has { name, age }
-  && input["age"] > 30
-    then "Older named thing: ${input["name"]}"
-    else "Something else"
+  && input["age"] > 30 then "Older named thing: ${input["name"]}"
+  else "Something else"
 
 
 // ------------------------------------------------------------
@@ -519,9 +511,8 @@ val three = counter()
 // ------------------------------------------------------------
 
 val factorial = (n: Int32): Int32 =>
-  if n == 0
-    then 1
-    else n * factorial(n - 1)
+  if n == 0 then 1
+  else n * factorial(n - 1)
 
 val factorialFive = factorial(5)
 
@@ -662,15 +653,14 @@ val classifyPerson = (input: Json): String =>
 // ------------------------------------------------------------
 
 val divide = (a: Float64, b: Float64): Result<Float64, String> =>
-  if b == 0.0
-    then {
-      "type": "failure",
-      "error": "Cannot divide by zero"
-    }
-    else {
-      "type": "success",
-      "value": a / b
-    }
+  if b == 0.0 then {
+    "type": "failure",
+    "error": "Cannot divide by zero"
+  }
+  else {
+    "type": "success",
+    "value": a / b
+  }
 
 val division = divide(10.0, 2.0)
 
@@ -682,15 +672,14 @@ val divisionMessage = match division
     "Failure: ${error}"
 
 val parseAge = (input: String): Result<Int32, String> =>
-  if input.isInt32()
-    then {
-      "type": "success",
-      "value": input.toInt32()
-    }
-    else {
-      "type": "failure",
-      "error": "Invalid age"
-    }
+  if input.isInt32() then {
+    "type": "success",
+    "value": input.toInt32()
+  }
+  else {
+    "type": "failure",
+    "error": "Invalid age"
+  }
 
 val parsedAge = parseAge("42")
 
