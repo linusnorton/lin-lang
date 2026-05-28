@@ -131,42 +131,34 @@ jobs:
           merge-multiple: true
           path: dist/
 
-      - name: List dist contents
-        run: ls -lh dist/
-
-      - name: Delete existing "latest" tag
+      - name: Publish "latest" release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh api repos/${{ github.repository }}/git/refs/tags/latest \
-            -X DELETE || true
+          # Delete old release and tag, then recreate.
+          gh release delete latest --repo ${{ github.repository }} --yes || true
           sleep 3
+          gh release create latest dist/* \
+            --repo ${{ github.repository }} \
+            --title "Latest build" \
+            --prerelease \
+            --notes "Automated build from \`master\`.
 
-      - name: Create rolling "latest" pre-release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: latest
-          name: "Latest build"
-          prerelease: true
-          body: |
-            Automated build from `master`.
+**Commit:** ${{ github.sha }}
+**Built:** ${{ github.event.head_commit.timestamp }}
 
-            **Commit:** ${{ github.sha }}
-            **Built:** ${{ github.event.head_commit.timestamp }}
+## Installation
 
-            ## Installation
+Download the archive for your platform, extract, and place \`lin\` on your \`\$PATH\`.
 
-            Download the archive for your platform, extract, and place `lin` on your `$PATH`.
+> **Note:** The Linux binary requires \`clang\` (or any C linker) to link compiled programs.
+> No LLVM installation needed — LLVM is bundled inside \`lin\`.
 
-            > **Note:** The Linux binary requires `clang` (or any C linker) to link compiled programs.
-            > No LLVM installation needed — LLVM is bundled inside `lin`.
+## VS Code Extension
 
-            ## VS Code Extension
+Download the \`.vsix\` for your platform and install with:
+\`\`\`bash
+code --install-extension lin-lang-<platform>.vsix
+\`\`\`
 
-            Download the `.vsix` for your platform and install with:
-            ```bash
-            code --install-extension lin-lang-<platform>.vsix
-            ```
-
-            Or install directly from the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=linusnorton.lin-lang).
-          files: dist/*
+Or install directly from the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=linusnorton.lin-lang)."
