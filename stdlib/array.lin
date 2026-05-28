@@ -146,9 +146,14 @@ export val zip = (a: Json, b: Json): Json =>
   result
 
 export val unique = (arr: Json): Json =>
+  val seen = {}
   val result = []
   for(arr, item =>
-    if some(result, existing => existing == item) == false then push(result, item)
+    val key = lin_value_key(item)
+    if seen[key] == null
+      then
+        seen[key] = true
+        push(result, item)
   )
   result
 
@@ -202,22 +207,35 @@ export val chunk = (arr: Json, size: Int32): Json =>
 export val compact = (arr: Json): Json =>
   filter(arr, x => x != null)
 
+val _qsort = (arr: Json, cmp: (Json, Json) => Int32, lo: Int32, hi: Int32): Null =>
+  if lo < hi
+    then
+      val pivot = arr[hi]
+      var i = lo - 1
+      var j = lo
+      lin_while(lin_range(lo, hi), _ =>
+        if cmp(arr[j], pivot) <= 0
+          then
+            i = i + 1
+            val tmp = arr[i]
+            set(arr, i, arr[j])
+            set(arr, j, tmp)
+        j = j + 1
+        j < hi
+      )
+      i = i + 1
+      val tmp2 = arr[i]
+      set(arr, i, arr[hi])
+      set(arr, hi, tmp2)
+      val p = i
+      _qsort(arr, cmp, lo, p - 1)
+      _qsort(arr, cmp, p + 1, hi)
+
 export val sort = (arr: Json, cmp: (Json, Json) => Int32): Json =>
   val result = concat(arr, [])
   val n = length(result)
-  var i = 0
-  lin_for(lin_range(0, n - 1), _ =>
-    var minIdx = i
-    var j = i + 1
-    lin_for(lin_range(i + 1, n), _ =>
-      if cmp(result[j], result[minIdx]) < 0 then minIdx = j
-      j = j + 1
-    )
-    val tmp = result[i]
-    set(result, i, result[minIdx])
-    set(result, minIdx, tmp)
-    i = i + 1
-  )
+  if n > 1
+    then _qsort(result, cmp, 0, n - 1)
   result
 
 export val sortBy = (arr: Json, keyFn: (Json) => Json): Json =>

@@ -371,7 +371,7 @@ impl<'ctx> Codegen<'ctx> {
                     "lin_filter", "lin_reduce",
                     "lin_async", "lin_await", "lin_parallel", "lin_race", "lin_timeout", "lin_retry",
                     "lin_thread_pool", "lin_worker", "lin_request", "lin_message", "lin_close",
-                    "lin_exit"];
+                    "lin_exit", "lin_value_key"];
                 for binding in bindings.iter() {
                     let key = (import_path.clone(), binding.name.clone());
                     if let Some(&llvm_fn) = self.imported_fns.get(&key) {
@@ -1507,7 +1507,7 @@ impl<'ctx> Codegen<'ctx> {
                             "lin_map", "lin_filter", "lin_reduce",
                             "lin_async", "lin_await", "lin_parallel", "lin_race", "lin_timeout", "lin_retry",
                             "lin_thread_pool", "lin_worker", "lin_request", "lin_message", "lin_close",
-                            "lin_exit"];
+                            "lin_exit", "lin_value_key"];
                         if known_intrinsics.contains(&binding.name.as_str()) {
                             self.intrinsic_slots.insert(binding.slot, binding.name.clone());
                         } else {
@@ -2812,6 +2812,23 @@ impl<'ctx> Codegen<'ctx> {
                 let arg_val = self.compile_expr(&args[0], fn_ctx);
                 let arg_ty = args[0].ty();
                 self.value_to_string(arg_val, &arg_ty, fn_ctx)
+            }
+            "lin_value_key" => {
+                let arg_val = self.compile_expr(&args[0], fn_ctx);
+                let arg_ty = args[0].ty();
+                // Box the value to a TaggedVal* then call lin_value_key(tagged) -> LinString*.
+                let tagged = self.box_value(arg_val, &arg_ty);
+                let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
+                let str_ty = self.context.ptr_type(inkwell::AddressSpace::default());
+                let vk_fn = self.get_or_declare_fn(
+                    "lin_value_key",
+                    str_ty.fn_type(&[ptr_ty.into()], false),
+                );
+                self.builder
+                    .build_call(vk_fn, &[tagged.into()], "vkey")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_basic()
             }
             "lin_length" => {
                 let arg_val = self.compile_expr(&args[0], fn_ctx);

@@ -2035,6 +2035,12 @@ impl Checker {
             params: vec![Type::Int32],
             ret: Box::new(Type::Null),
         });
+
+        // value_key: (any) => String — canonical type-tagged key for any value
+        self.define_intrinsic("lin_value_key", Type::Function {
+            params: vec![Type::TypeVar(u32::MAX)],
+            ret: Box::new(Type::Str),
+        });
     }
 }
 

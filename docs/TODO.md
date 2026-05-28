@@ -579,10 +579,12 @@ End state: O(n log n) sort, O(n) string building, O(n) unique/omit, constant-fac
 
 ### Critical fixes (algorithmic complexity)
 
-- [ ] **`lin_array_sort` intrinsic** — delegate to Rust `sort_unstable_by` with a Lin function pointer as comparator. Transforms `sort` and `sortBy` from O(n²) selection sort to O(n log n). Add to `lin-runtime`, wire in codegen as a new intrinsic.
-- [ ] **`lin_string_join` intrinsic** — compute total output length in one pass, allocate a single buffer, fill it. Transforms `string.join`, `string.fromCodePoints`, and `string.replaceAll` accumulation from O(n²) string copies to O(n). Add to `lin-runtime`.
-- [ ] **`unique` hash set** — `unique` and `omit` both suffer O(n²) membership tests. Add a `lin_hash_set` opaque type (or reuse a plain object as a boolean map) so membership is O(1). Transforms `unique` from O(n²) to O(n); transforms `omit` from O(|obj|×|ks|) to O(|obj|+|ks|).
-- [ ] **`replaceAll` loop bound** — outer loop runs `_length(s)` iterations regardless of how many replacements remain. Rewrite using `lin_while` so the loop exits as soon as no more pattern matches exist.
+- [x] **`sort` quicksort** — replaced O(n²) selection sort with in-place quicksort written in Lin using `lin_while` for partition. O(n log n).
+- [x] **`lin_string_join_arr` intrinsic** — single-pass allocation in Rust. Transforms `string.join` and `string.fromCodePoints` from O(n²) to O(n).
+- [x] **`lin_string_replace_all` intrinsic** — delegates to Rust's `str::replace`. Removes the O(n²) loop and wrong iteration bound.
+- [x] **`lin_value_key` intrinsic + `std/hash`** — canonical type-tagged key for any value. Used by `unique` (O(n²) → O(n)) and `omit` (O(|obj|×|ks|) → O(|obj|+|ks|)). Exposed via `std/hash.hash(val)`.
+- [x] **`unique` O(n) rewrite** — uses `lin_value_key` + plain object as seen-set.
+- [x] **`omit` O(n) rewrite** — builds a skip-set from `ks` first, then single pass over object keys.
 
 ### Significant fixes (double key evaluations)
 

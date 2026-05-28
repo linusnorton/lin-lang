@@ -405,6 +405,139 @@ pub unsafe extern "C" fn lin_object_to_string(obj: *const crate::object::LinObje
     lin_string_from_bytes(s.as_ptr(), s.len() as u32)
 }
 
+/// Produce a canonical, type-tagged key string for any value, suitable for use as an object key.
+/// This allows using a plain {} object as a hash set keyed on arbitrary Lin values.
+///
+/// Format (type-prefixed to avoid cross-type collisions):
+///   null      → "N"
+///   bool      → "b:true" / "b:false"
+///   int32     → "i:<n>"
+///   int64     → "I:<n>"
+///   float32   → "f:<n>"
+///   float64   → "F:<n>"
+///   string    → "s:<content>"
+///   array     → "a:[<elem>,...]"  (elements recursively keyed)
+///   object    → "o:{<k1>:<v1>,...}" (keys sorted for order-independence)
+///   function  → "fn:<pointer>"  (identity — consistent with no function equality)
+///   iterator  → "it:<pointer>"
+#[no_mangle]
+pub unsafe extern "C" fn lin_value_key(tagged: *const TaggedVal) -> *mut LinString {
+    let s = tagged_to_key_string(tagged);
+    lin_string_from_bytes(s.as_ptr(), s.len() as u32)
+}
+
+unsafe fn tagged_to_key_string(tagged: *const TaggedVal) -> String {
+    if tagged.is_null() {
+        return "N".to_string();
+    }
+    let tag = (*tagged).tag;
+    let payload = (*tagged).payload;
+    match tag {
+        TAG_NULL => "N".to_string(),
+        TAG_BOOL => format!("b:{}", if payload != 0 { "true" } else { "false" }),
+        TAG_INT32 => format!("i:{}", payload as i32),
+        TAG_INT64 => format!("I:{}", payload as i64),
+        TAG_FLOAT32 => format!("f:{}", f32::from_bits(payload as u32)),
+        TAG_FLOAT64 => format!("F:{}", f64::from_bits(payload)),
+        TAG_STR => {
+            let s = payload as *const LinString;
+            if s.is_null() { return "s:".to_string(); }
+            format!("s:{}", (*s).as_str())
+        }
+        TAG_ARRAY => {
+            let arr = payload as *const crate::array::LinArray;
+            if arr.is_null() { return "a:[]".to_string(); }
+            let len = (*arr).len as usize;
+            let mut parts = Vec::with_capacity(len);
+            for i in 0..len {
+                let elem = (*arr).data.add(i) as *const TaggedVal;
+                parts.push(tagged_to_key_string(elem));
+            }
+            format!("a:[{}]", parts.join(","))
+        }
+        TAG_OBJECT => {
+            let obj = payload as *const crate::object::LinObject;
+            if obj.is_null() { return "o:{}".to_string(); }
+            let len = (*obj).len as usize;
+            let mut pairs: Vec<(String, String)> = Vec::with_capacity(len);
+            for i in 0..len {
+                let entry = (*obj).entries.add(i);
+                let key_str = if (*entry).key.is_null() {
+                    String::new()
+                } else {
+                    (*(*entry).key).as_str().to_string()
+                };
+                let val_str = tagged_to_key_string(&(*entry).value as *const TaggedVal);
+                pairs.push((key_str, val_str));
+            }
+            pairs.sort_by(|a, b| a.0.cmp(&b.0));
+            let inner: Vec<String> = pairs.into_iter().map(|(k, v)| format!("{}:{}", k, v)).collect();
+            format!("o:{{{}}}", inner.join(","))
+        }
+        crate::tagged::TAG_FUNCTION => format!("fn:{:#x}", payload),
+        _ => format!("?:{}", payload),
+    }
+}
+
+/// Join an array of strings with a separator in a single allocation.
+/// `arr` must be a LinArray* of LinString* elements (TAG_STR).
+#[no_mangle]
+pub unsafe extern "C" fn lin_string_join_arr(arr: *const crate::array::LinArray, separator: *const LinString) -> *mut LinString {
+    use crate::array::lin_array_length;
+    let n = lin_array_length(arr) as usize;
+    if n == 0 {
+        return lin_string_from_bytes(b"".as_ptr(), 0);
+    }
+    let sep = (*separator).as_str();
+    let sep_len = sep.len();
+
+    // Collect element string slices.
+    // Elements in a String[] array have the LinString* stored in the payload field
+    // (8 bytes after the tag byte). Read payload directly regardless of tag.
+    let mut strs: Vec<&str> = Vec::with_capacity(n);
+    for i in 0..n {
+        let elem = (*arr).data.add(i);
+        let s = (*elem).payload as *const LinString;
+        if !s.is_null() {
+            strs.push((*s).as_str());
+        } else {
+            strs.push("");
+        }
+    }
+
+    // Compute total length in one pass.
+    let total_len: usize = strs.iter().map(|s| s.len()).sum::<usize>()
+        + sep_len * (n - 1);
+    let result = lin_string_alloc(total_len as u32);
+    let mut dst = (*result).data.as_mut_ptr();
+    for (idx, s) in strs.iter().enumerate() {
+        std::ptr::copy_nonoverlapping(s.as_ptr(), dst, s.len());
+        dst = dst.add(s.len());
+        if idx + 1 < n {
+            std::ptr::copy_nonoverlapping(sep.as_ptr(), dst, sep_len);
+            dst = dst.add(sep_len);
+        }
+    }
+    result
+}
+
+/// Replace all occurrences of `pattern` in `s` with `replacement` in a single allocation.
+#[no_mangle]
+pub unsafe extern "C" fn lin_string_replace_all(
+    s: *const LinString,
+    pattern: *const LinString,
+    replacement: *const LinString,
+) -> *mut LinString {
+    let src = (*s).as_str();
+    let pat = (*pattern).as_str();
+    let rep = (*replacement).as_str();
+    if pat.is_empty() {
+        return lin_string_from_bytes(src.as_ptr(), src.len() as u32);
+    }
+    let result = src.replace(pat, rep);
+    lin_string_from_bytes(result.as_ptr(), result.len() as u32)
+}
+
 /// Convert a TaggedVal* to a string, dispatching on the runtime tag.
 /// `tagged` may be null (treated as Null) or a pointer to a TaggedVal.
 #[no_mangle]
