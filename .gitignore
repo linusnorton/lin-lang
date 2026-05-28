@@ -2,3 +2,4 @@
 .vscode/lin-lang/node_modules/
 /build
 .lin-cache/
+.claude/worktrees/
