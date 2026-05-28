@@ -137,6 +137,7 @@ jobs:
         run: |
           gh api repos/${{ github.repository }}/git/refs/tags/latest \
             -X DELETE || true
+          sleep 3
 
       - name: Create rolling "latest" pre-release
         uses: softprops/action-gh-release@v2
