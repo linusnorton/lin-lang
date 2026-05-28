@@ -163,7 +163,7 @@ jobs:
           # Substitute env vars into the notes file
           sed -i "s|\${COMMIT_SHA}|${COMMIT_SHA}|g; s|\${BUILT_AT}|${BUILT_AT}|g" /tmp/release-notes.md
 
-          gh release delete latest --repo ${{ github.repository }} --yes || true
+          gh release delete latest --repo ${{ github.repository }} --yes --cleanup-tag || true
           sleep 3
           gh release create latest dist/* \
             --repo ${{ github.repository }} \
