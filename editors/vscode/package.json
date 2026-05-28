@@ -3,7 +3,7 @@
   "displayName": "Lin Language",
   "description": "Syntax highlighting, diagnostics, and type-aware completion for the Lin programming language",
   "version": "0.3.0",
-  "publisher": "linusnorton",
+  "publisher": "LinusN",
   "license": "MIT",
   "repository": {
     "type": "git",

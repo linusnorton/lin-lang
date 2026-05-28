@@ -157,7 +157,7 @@ jobs:
           code --install-extension lin-lang-<platform>.vsix
           ```
 
-          Or install directly from the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=linusnorton.lin-lang).
+          Or install directly from the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=LinusN.lin-lang).
           NOTES
 
           # Substitute env vars into the notes file
