@@ -109,7 +109,6 @@ jobs:
         working-directory: editors/vscode
         run: |
           npx @vscode/vsce publish \
-            --target ${{ matrix.vsix_platform }} \
             --no-dependencies \
             --packagePath ../../lin-lang-${{ matrix.vsix_platform }}.vsix
       - uses: actions/upload-artifact@v4
