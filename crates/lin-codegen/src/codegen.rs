@@ -8243,6 +8243,20 @@ impl<'ctx> Codegen<'ctx> {
     }
 
     /// Compile a binary operation given already-compiled LLVM values (used by LinIR path).
+    /// Infer a concrete Lin type from an LLVM value's kind, for boxing a value whose
+    /// static type isn't otherwise available (e.g. a binary-op rhs).
+    fn llvm_value_concrete_type(&self, v: BasicValueEnum<'ctx>) -> Type {
+        if v.is_int_value() {
+            match v.into_int_value().get_type().get_bit_width() {
+                1 => Type::Bool, 8 => Type::Int8, 16 => Type::Int16, 64 => Type::Int64, _ => Type::Int32,
+            }
+        } else if v.is_float_value() {
+            if v.into_float_value().get_type() == self.context.f32_type() { Type::Float32 } else { Type::Float64 }
+        } else {
+            Type::TypeVar(u32::MAX)
+        }
+    }
+
     fn compile_binary_op_values(
         &mut self,
         lv: BasicValueEnum<'ctx>,
@@ -8302,7 +8316,14 @@ impl<'ctx> Codegen<'ctx> {
                         i8_ty.fn_type(
                             &[self.context.ptr_type(AddressSpace::default()).into(),
                               self.context.ptr_type(AddressSpace::default()).into()], false));
-                    let rv_tagged = if rv.is_pointer_value() { rv } else { self.box_value(rv, result_ty) };
+                    // Box the rhs by its ACTUAL value kind (not result_ty, which is Bool):
+                    // `x == 3` with x:Json must box 3 as an int, not a bool.
+                    let rv_tagged = if rv.is_pointer_value() {
+                        rv
+                    } else {
+                        let rty = self.llvm_value_concrete_type(rv);
+                        self.box_value(rv, &rty)
+                    };
                     let eq_u8 = self.builder.build_call(eq_fn, &[lv.into(), rv_tagged.into()], "ir_teq")
                         .unwrap().try_as_basic_value().unwrap_basic().into_int_value();
                     let eq = self.builder.build_int_truncate(eq_u8, self.context.bool_type(), "ir_teq_b").unwrap();
