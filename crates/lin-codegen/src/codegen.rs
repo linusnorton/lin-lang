@@ -7381,7 +7381,9 @@ impl<'ctx> Codegen<'ctx> {
                                     self.builder.build_call(self.rt_panic, &[msg_v.into(), zero.into(), zero.into()], "").unwrap();
                                 }
                             }
-                            self.builder.build_unreachable().unwrap();
+                            // Note: no terminator here — the block's IR Terminator (an
+                            // Unreachable) is emitted after the instruction loop. Emitting
+                            // build_unreachable here would double-terminate the block.
                         }
                         Instruction::Box { dst, val, ty } => {
                             if let Some(&v) = temp_map.get(val) {
@@ -7850,13 +7852,17 @@ impl<'ctx> Codegen<'ctx> {
         if Self::is_union_type(lty) && lv.is_pointer_value() {
             match op {
                 BinOp::Eq | BinOp::NotEq => {
+                    // lin_tagged_eq returns u8 (i8), not i1 — declare it as i8 and
+                    // truncate, else the call reads garbage bits and compares as always-true.
+                    let i8_ty = self.context.i8_type();
                     let eq_fn = self.get_or_declare_fn("lin_tagged_eq",
-                        self.context.bool_type().fn_type(
+                        i8_ty.fn_type(
                             &[self.context.ptr_type(AddressSpace::default()).into(),
                               self.context.ptr_type(AddressSpace::default()).into()], false));
                     let rv_tagged = if rv.is_pointer_value() { rv } else { self.box_value(rv, result_ty) };
-                    let eq = self.builder.build_call(eq_fn, &[lv.into(), rv_tagged.into()], "ir_teq")
+                    let eq_u8 = self.builder.build_call(eq_fn, &[lv.into(), rv_tagged.into()], "ir_teq")
                         .unwrap().try_as_basic_value().unwrap_basic().into_int_value();
+                    let eq = self.builder.build_int_truncate(eq_u8, self.context.bool_type(), "ir_teq_b").unwrap();
                     return if matches!(op, BinOp::NotEq) {
                         self.builder.build_not(eq, "ir_tne").unwrap().into()
                     } else { eq.into() };

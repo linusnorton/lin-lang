@@ -1486,10 +1486,29 @@ fn lower_match_pattern(
     scrut: Temp,
     _body: &TypedExpr,
     builder: &mut FuncBuilder,
-    _ctx: &mut LowerCtx,
+    ctx: &mut LowerCtx,
 ) -> PatternTest {
     match pattern {
         TypedMatchPattern::Else => PatternTest::Always,
+        // A literal pattern matches by VALUE, not type: compare the scrutinee to the
+        // literal (e.g. `"yes" => ...` must only match the string "yes", not every string).
+        TypedMatchPattern::Is(TypedPattern::Literal(lit)) => {
+            let lit_ty = lit.ty();
+            let lit_raw = lower_expr(lit, builder, ctx);
+            // Box the literal to Json so both operands are TaggedVal* for lin_tagged_eq
+            // (the scrutinee is already boxed).
+            let lit_temp = box_to_json(lit_raw, &lit_ty, builder);
+            let dst = builder.alloc_temp(Type::Bool);
+            builder.emit(Instruction::Binary {
+                dst,
+                op: BinOp::Eq,
+                lhs: scrut,
+                rhs: lit_temp,
+                operand_ty: Type::TypeVar(u32::MAX),
+                ty: Type::Bool,
+            });
+            PatternTest::Cond(dst)
+        }
         TypedMatchPattern::Is(tp) => {
             let (check_ty, _) = pattern_type_check(tp);
             let dst = builder.alloc_temp(Type::Bool);
