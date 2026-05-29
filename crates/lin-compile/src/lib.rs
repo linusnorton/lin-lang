@@ -79,42 +79,26 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
     let typed_module = check_module_with_imports(&ast_module, &imported_modules)
         .map_err(CompileError::TypeCheck)?;
 
-    // 4. LLVM codegen
+    // 4. LLVM codegen via the LinIR pipeline (the sole compilation backend).
+    // `opts.coverage` is always false here — `lin test --coverage` is rejected at the CLI
+    // until coverage instrumentation is ported to the IR path — but the field is threaded
+    // through so the CoverageEmitter scaffolding stays in place for that future work.
     let context = Context::create();
     let mut cg = Codegen::new(&context, &module_name, opts.coverage);
 
-    // Set source path and text for coverage instrumentation (no-op when coverage=false).
-    let source_path_abs = opts.source_path.canonicalize()
-        .unwrap_or_else(|_| opts.source_path.clone());
-    cg.set_source(&source_path_abs.to_string_lossy(), &source);
-
     // Register imported modules with codegen in dependency order so cross-module slot
-    // resolution works correctly (dependencies must be registered before dependents).
-    // The LinIR pipeline is the default compilation path; imports go through it too
-    // (compile_import_from_ir). The legacy TypedAST path remains as a temporary escape hatch
-    // behind LIN_USE_AST=1 (for bisection during the one-release deprecation window) and is
-    // also used when coverage is requested, since coverage instrumentation is AST-only.
-    let use_ir = std::env::var("LIN_USE_AST").as_deref() != Ok("1") && !opts.coverage;
+    // resolution works correctly (dependencies must be registered before dependents). Each
+    // imported module is lowered and compiled through the same LinIR pipeline as the main
+    // module (compile_import_from_ir).
     for path in &import_order {
         let imp_module = imported_modules.get(path).unwrap();
-        if opts.coverage {
-            if let Some((src_path, src_text)) = import_sources.get(path) {
-                cg.register_import_with_source(path, imp_module, src_path, src_text);
-                continue;
-            }
-        }
-        if use_ir {
-            cg.compile_import_from_ir(path, imp_module);
-        } else {
-            cg.register_import(path, imp_module);
-        }
+        cg.compile_import_from_ir(path, imp_module);
     }
 
-    // Compile the main module through LinIR by default; the legacy TypedAST path is the
-    // LIN_USE_AST=1 escape hatch (and the coverage path). See the `use_ir` definition above.
-    if use_ir {
-        // Collect foreign-library link paths from the main module's ForeignImport stmts —
-        // the AST path does this in compile_stmt, which the IR path doesn't run.
+    // Compile the main module through LinIR.
+    {
+        // Collect foreign-library link paths from the main module's ForeignImport stmts so
+        // the linker receives them.
         for stmt in &typed_module.statements {
             if let lin_check::typed_ir::TypedStmt::ForeignImport { path, .. } = stmt {
                 if path != "lin-runtime" && !cg.foreign_lib_paths.contains(path) {
@@ -125,8 +109,6 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
         let mut ir_module = lower_module(&typed_module);
         rc_elide::elide_rc(&mut ir_module);
         cg.compile_module_from_ir(&ir_module);
-    } else {
-        cg.compile_module(&typed_module);
     }
 
     // 5. Emit LLVM IR if requested (before verify so we can inspect broken IR)
