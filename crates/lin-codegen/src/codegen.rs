@@ -7906,12 +7906,20 @@ impl<'ctx> Codegen<'ctx> {
         if !val.is_pointer_value() { return self.context.bool_type().const_zero(); }
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         let i8_ty = self.context.i8_type();
+        // The value is a boxed TaggedVal*; `lin_object_has` needs a tag check + the raw
+        // LinObject*. If it's not an object, `has` is false. Guard then unbox.
+        let tag = self.builder.build_call(self.rt_get_tag, &[val.into()], "ir_has_tag")
+            .unwrap().try_as_basic_value().unwrap_basic().into_int_value();
+        let is_obj = self.builder.build_int_compare(IntPredicate::EQ, tag,
+            i8_ty.const_int(7, false), "ir_has_isobj").unwrap();
+        let obj_ptr = self.builder.build_call(self.rt_unbox_ptr, &[val.into()], "ir_has_unbox")
+            .unwrap().try_as_basic_value().unwrap_basic();
         let obj_has_fn = self.get_or_declare_fn("lin_object_has",
             i8_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
-        let mut result = self.context.bool_type().const_int(1, false);
+        let mut result = is_obj;
         for field in &pattern.required_fields {
             let key_str = self.compile_string_lit(field).into_pointer_value();
-            let has_i8 = self.builder.build_call(obj_has_fn, &[val.into(), key_str.into()], "ir_has")
+            let has_i8 = self.builder.build_call(obj_has_fn, &[obj_ptr.into(), key_str.into()], "ir_has")
                 .unwrap().try_as_basic_value().unwrap_basic().into_int_value();
             self.builder.build_call(self.rt_string_release, &[key_str.into()], "").unwrap();
             let has_bool = self.builder.build_int_truncate_or_bit_cast(has_i8, self.context.bool_type(), "has_b").unwrap();

@@ -353,6 +353,21 @@ fn lower_box_for_param(arg: Temp, arg_ty: &Type, param_ty: Option<&Type>, builde
     }
 }
 
+/// Coerce a value temp to a slot's declared type when their runtime representations
+/// differ (box concrete → union, or unbox union → concrete). Returns the (possibly new)
+/// temp; a no-op when representations match.
+fn coerce_to_slot_type(t: Temp, value_ty: &Type, slot_ty: &Type, builder: &mut FuncBuilder) -> Temp {
+    if type_repr_differs(value_ty, slot_ty) {
+        let dst = builder.alloc_temp(slot_ty.clone());
+        builder.emit(Instruction::Coerce {
+            dst, src: t, from_ty: value_ty.clone(), to_ty: slot_ty.clone(),
+        });
+        dst
+    } else {
+        t
+    }
+}
+
 fn const_type(c: &Const) -> Type {
     match c {
         Const::Int(_, t) => t.clone(),
@@ -369,7 +384,7 @@ fn const_type(c: &Const) -> Type {
 
 fn lower_stmt(stmt: &TypedStmt, builder: &mut FuncBuilder, ctx: &mut LowerCtx) {
     match stmt {
-        TypedStmt::Val { slot, value, .. } => {
+        TypedStmt::Val { slot, value, ty, .. } => {
             // A top-level function val was pre-assigned a FuncId in `global_fn_slots`
             // during the module pre-scan (so `CallTarget::Direct` references resolve).
             // Reuse that id when lowering the function body, otherwise a fresh id is
@@ -383,16 +398,20 @@ fn lower_stmt(stmt: &TypedStmt, builder: &mut FuncBuilder, ctx: &mut LowerCtx) {
                 builder.slots.insert(*slot, t);
             } else {
                 let t = lower_expr(value, builder, ctx);
+                // Store the value in the slot's declared representation: a concrete value
+                // bound to a Json/union slot must be boxed so later reads (LocalGet, is/has)
+                // see a TaggedVal*.
+                let t = coerce_to_slot_type(t, &value.ty(), ty, builder);
                 builder.slots.insert(*slot, t);
             }
         }
         TypedStmt::Var { slot, value, ty, .. } => {
             let t = lower_expr(value, builder, ctx);
+            let t = coerce_to_slot_type(t, &value.ty(), ty, builder);
             // Var slots are represented as mutable temps. The "cell" indirection
             // used in codegen (Alloca) is handled by codegen consuming LinIR, not here.
             // We track the current temp for each var slot, updated on LocalSet.
             builder.slots.insert(*slot, t);
-            let _ = ty; // type is in temp_types
         }
         TypedStmt::Import { path, bindings, .. } => {
             // Imported modules are compiled by codegen's AST `register_import` even on
@@ -695,7 +714,10 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
         }
 
         TypedExpr::Is { expr, pattern, .. } => {
-            let val_temp = lower_expr(expr, builder, ctx);
+            let val_ty = expr.ty();
+            let raw = lower_expr(expr, builder, ctx);
+            // The tag check needs a boxed TaggedVal*; box a concrete value first.
+            let val_temp = box_to_json(raw, &val_ty, builder);
             let dst = builder.alloc_temp(Type::Bool);
             let (check_ty, _span) = pattern_type_check(pattern);
             builder.emit(Instruction::IsType {
@@ -707,7 +729,10 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
         }
 
         TypedExpr::Has { expr, pattern, .. } => {
-            let val_temp = lower_expr(expr, builder, ctx);
+            let val_ty = expr.ty();
+            let raw = lower_expr(expr, builder, ctx);
+            // HasPattern inspects an object via a boxed TaggedVal*; box a concrete object.
+            let val_temp = box_to_json(raw, &val_ty, builder);
             let dst = builder.alloc_temp(Type::Bool);
             let required_fields = pattern_required_fields(pattern);
             builder.emit(Instruction::HasPattern {
