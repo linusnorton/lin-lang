@@ -7468,9 +7468,8 @@ impl<'ctx> Codegen<'ctx> {
                                                 fn_param_types.push(self.llvm_param_type(&arg_ty));
                                                 call_args.push((*av).into());
                                             }
-                                            // Closures use the uniform boxed ABI: they always
-                                            // return a TaggedVal* (ptr), except Null/void.
-                                            // Call with a ptr return, then unbox to ret_ty.
+                                            // Closures use the uniform boxed ABI (return ptr,
+                                            // except void). Call with ptr return, then unbox to ret_ty.
                                             let returns_void = matches!(ret_ty, Type::Null | Type::Never);
                                             let fn_ty = if returns_void {
                                                 void_ty.fn_type(&fn_param_types, false)
@@ -7482,12 +7481,8 @@ impl<'ctx> Codegen<'ctx> {
                                                 ptr_ty.const_null().into()
                                             } else {
                                                 let boxed = call.try_as_basic_value().unwrap_basic();
-                                                // Unbox to the expected concrete type; leave union/Json as the TaggedVal*.
-                                                if Self::is_union_type(ret_ty) {
-                                                    boxed
-                                                } else {
-                                                    self.unbox_tagged_val_to_type(boxed, ret_ty)
-                                                }
+                                                if Self::is_union_type(ret_ty) { boxed }
+                                                else { self.unbox_tagged_val_to_type(boxed, ret_ty) }
                                             }
                                         } else { ptr_ty.const_null().into() }
                                     } else { ptr_ty.const_null().into() }
@@ -8367,10 +8362,26 @@ impl<'ctx> Codegen<'ctx> {
                     } else { eq.into() };
                 }
                 BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq => {
-                    // Unbox both operands to the numeric type of the other side / Int32, then compare.
-                    let lconc = self.unbox_tagged_val_to_type(lv, &Type::Int32);
-                    let rconc = if rv.is_pointer_value() { self.unbox_tagged_val_to_type(rv, &Type::Int32) } else { rv };
-                    return self.compile_binary_op_values(lconc, rconc, op, &Type::Int32, result_ty);
+                    // Boxed operands may be strings or numbers — use lin_tagged_cmp (returns
+                    // -1/0/1) which dispatches on the runtime tag, then compare to 0.
+                    let i32_ty = self.context.i32_type();
+                    let ptr_t = self.context.ptr_type(AddressSpace::default());
+                    let cmp_fn = self.get_or_declare_fn("lin_tagged_cmp",
+                        i32_ty.fn_type(&[ptr_t.into(), ptr_t.into()], false));
+                    let rv_tagged = if rv.is_pointer_value() {
+                        rv
+                    } else {
+                        let rty = self.llvm_value_concrete_type(rv);
+                        self.box_value(rv, &rty)
+                    };
+                    let ord = self.builder.build_call(cmp_fn, &[lv.into(), rv_tagged.into()], "ir_tcmp")
+                        .unwrap().try_as_basic_value().unwrap_basic().into_int_value();
+                    let zero = i32_ty.const_zero();
+                    let pred = match op {
+                        BinOp::Lt => IntPredicate::SLT, BinOp::LtEq => IntPredicate::SLE,
+                        BinOp::Gt => IntPredicate::SGT, _ => IntPredicate::SGE,
+                    };
+                    return self.builder.build_int_compare(pred, ord, zero, "ir_tcmp_b").unwrap().into();
                 }
                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
                     let lconc = self.unbox_tagged_val_to_type(lv, &Type::Int32);

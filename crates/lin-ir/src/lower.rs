@@ -532,7 +532,7 @@ fn lower_stmt(stmt: &TypedStmt, builder: &mut FuncBuilder, ctx: &mut LowerCtx) {
                 (value, ctx.global_fn_slots.get(slot))
             {
                 let t = lower_function_expr_with_id(
-                    Some(fid), name.as_deref(), params, body, ret_type, captures, builder, ctx,
+                    Some(fid), None, name.as_deref(), params, body, ret_type, captures, builder, ctx,
                 );
                 builder.slots.insert(*slot, t);
             } else {
@@ -985,6 +985,23 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
 // Call lowering
 // -------------------------------------------------------------------------
 
+/// Lower a single call argument, coercing it to the callee's parameter type. When the
+/// argument is a closure literal and the parameter declares a callback with a concrete
+/// (non-union, non-void) return type, the closure is compiled to return that concrete type
+/// (so an AST-compiled higher-order callee receives a raw value), bypassing the uniform
+/// boxed-return ABI.
+fn lower_call_arg(a: &TypedExpr, param_ty: Option<&Type>, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
+    if let (TypedExpr::Function { name, params, body, ret_type, captures, .. },
+            Some(Type::Function { ret: cb_ret, .. })) = (a, param_ty)
+    {
+        if !is_union_ty(cb_ret) && !matches!(**cb_ret, Type::Null | Type::Never) {
+            return lower_callback_arg(cb_ret, name.as_deref(), params, body, ret_type, captures, builder, ctx);
+        }
+    }
+    let t = lower_expr(a, builder, ctx);
+    lower_coerce_arg(t, &a.ty(), param_ty, builder)
+}
+
 fn lower_call(
     func: &TypedExpr,
     args: &[TypedExpr],
@@ -1005,8 +1022,7 @@ fn lower_call(
                 .iter()
                 .enumerate()
                 .map(|(i, a)| {
-                    let t = lower_expr(a, builder, ctx);
-                    let arg = lower_coerce_arg(t, &a.ty(), param_tys.get(i), builder);
+                    let arg = lower_call_arg(a, param_tys.get(i), builder, ctx);
                     retain_call_arg(arg, &a.ty(), expr_is_fresh_alloc(a), builder);
                     arg
                 })
@@ -1033,8 +1049,7 @@ fn lower_call(
                 .iter()
                 .enumerate()
                 .map(|(i, a)| {
-                    let t = lower_expr(a, builder, ctx);
-                    let arg = lower_coerce_arg(t, &a.ty(), param_tys.get(i), builder);
+                    let arg = lower_call_arg(a, param_tys.get(i), builder, ctx);
                     retain_call_arg(arg, &a.ty(), expr_is_fresh_alloc(a), builder);
                     arg
                 })
@@ -2056,15 +2071,14 @@ fn lower_function_expr(
     builder: &mut FuncBuilder,
     ctx: &mut LowerCtx,
 ) -> Temp {
-    lower_function_expr_with_id(None, name, params, body, ret_type, captures, builder, ctx)
+    lower_function_expr_with_id(None, None, name, params, body, ret_type, captures, builder, ctx)
 }
 
-/// Lower a function literal. `forced_fid` reuses a pre-assigned FuncId (for top-level
-/// named functions registered in `global_fn_slots` during the pre-scan, so that
-/// `CallTarget::Direct` references resolve to the actually-emitted function); pass
-/// None to allocate a fresh id (anonymous/nested closures).
-fn lower_function_expr_with_id(
-    forced_fid: Option<FuncId>,
+/// Lower a closure that is being passed as a callback argument, forcing its return type to
+/// the parameter's declared callback return (so AST-compiled higher-order callees receive a
+/// raw value). Only used when that return is a concrete (non-union, non-void) type.
+fn lower_callback_arg(
+    forced_ret: &Type,
     name: Option<&str>,
     params: &[TypedParam],
     body: &TypedExpr,
@@ -2073,6 +2087,25 @@ fn lower_function_expr_with_id(
     builder: &mut FuncBuilder,
     ctx: &mut LowerCtx,
 ) -> Temp {
+    lower_function_expr_with_id(None, Some(forced_ret.clone()), name, params, body, ret_type, captures, builder, ctx)
+}
+
+/// Lower a function literal. `forced_fid` reuses a pre-assigned FuncId (for top-level
+/// named functions registered in `global_fn_slots` during the pre-scan, so that
+/// `CallTarget::Direct` references resolve to the actually-emitted function); pass
+/// None to allocate a fresh id (anonymous/nested closures).
+fn lower_function_expr_with_id(
+    forced_fid: Option<FuncId>,
+    forced_ret: Option<Type>,
+    name: Option<&str>,
+    params: &[TypedParam],
+    body: &TypedExpr,
+    ret_type: &Type,
+    captures: &[Capture],
+    builder: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+) -> Temp {
+    let forced_ret = forced_ret.as_ref();
     let fid = forced_fid.unwrap_or_else(|| ctx.alloc_func_id());
 
     // Build param temps for the inner function.
@@ -2158,15 +2191,22 @@ fn lower_function_expr_with_id(
     inner_builder.push_scope();
     let body_ty = body.ty();
     let raw_ret = lower_expr(body, &mut inner_builder, ctx);
-    // Closures use a UNIFORM boxed ABI: they always return Json (TaggedVal*), so a closure
-    // value can be called through an opaque `Function` type without knowing its concrete
-    // return type (the indirect call site unboxes). Non-closure top-level functions keep
-    // their declared concrete return (they are only called Direct, with exact signatures).
-    // A closure that yields no value keeps a void (Null/Never) return; other closures use
-    // the uniform boxed (Json) ABI so any Function value is callable without its concrete
-    // return type. Non-closure top-level functions keep their declared return.
+    // Closure return ABI:
+    // - `forced_ret` (set when this closure is a callback argument whose parameter declares
+    //   a concrete return, e.g. groupBy's `keyFn: (Json) => String`): return exactly that
+    //   type so AST-compiled higher-order callees, which call back with the declared
+    //   signature, get a raw (unboxed) value.
+    // - otherwise closures use the uniform boxed (Json) ABI so a Function value is callable
+    //   through an opaque type without its concrete return (IR indirect calls unbox).
+    // - void (Null/Never) returns stay void.
     let void_ret = matches!(ret_type, Type::Null | Type::Never);
-    let effective_ret = if is_closure && !void_ret { Type::TypeVar(u32::MAX) } else { ret_type.clone() };
+    let effective_ret = if let Some(fr) = forced_ret {
+        fr.clone()
+    } else if is_closure && !void_ret {
+        Type::TypeVar(u32::MAX)
+    } else {
+        ret_type.clone()
+    };
     let ret_temp = if !inner_builder.is_current_block_terminated()
         && type_repr_differs(&body_ty, &effective_ret)
     {
