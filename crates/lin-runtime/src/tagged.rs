@@ -31,10 +31,79 @@ pub const TAG_UINT16: u8 = 12;
 pub const TAG_INT16: u8 = 13;
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct TaggedVal {
     pub tag: u8,
     pub _pad: [u8; 7],
     pub payload: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Cached scalar boxes (CPython-style small-value interning).
+//
+// Boxing a scalar (`lin_box_int32`/`_int64`/`_bool`) is on the hot path of every
+// map/filter/reduce callback — `(acc, x) => acc + x` heap-allocates a TaggedVal per
+// element. The vast majority of those scalars are small integers (loop indices, counts) and
+// booleans. We pre-allocate immutable TaggedVals for those and return pointers into the
+// table instead of calling the allocator, eliminating ~one malloc per element.
+//
+// SAFETY CONTRACT: cached boxes are immutable and must never be freed. The pointer is only
+// ever read, copied wholesale (e.g. lin_array_push_tagged copies the 16 bytes), or released
+// — and `lin_tagged_release` skips any pointer that lies inside `CACHE` (see is_cached_box).
+// Scalar TaggedVals carry no heap payload, so skipping their free leaks nothing.
+//
+// The table is a compile-time-initialized `static` (TaggedVal is plain data), so it needs no
+// runtime/lazy init and is trivially shared across threads (workers/async).
+
+/// Smallest cached integer (inclusive). Covers common loop/index values.
+pub const SMALL_INT_MIN: i64 = -16;
+/// One past the largest cached integer.
+pub const SMALL_INT_MAX: i64 = 256;
+const SMALL_INT_LEN: usize = (SMALL_INT_MAX - SMALL_INT_MIN) as usize;
+
+const fn tv(tag: u8, payload: u64) -> TaggedVal {
+    TaggedVal { tag, _pad: [0; 7], payload }
+}
+
+const fn build_int_cache() -> [TaggedVal; SMALL_INT_LEN] {
+    let mut arr = [tv(TAG_INT32, 0); SMALL_INT_LEN];
+    let mut i = 0;
+    while i < SMALL_INT_LEN {
+        arr[i] = tv(TAG_INT32, (SMALL_INT_MIN + i as i64) as u64);
+        i += 1;
+    }
+    arr
+}
+
+// Int32 cache for [SMALL_INT_MIN, SMALL_INT_MAX).
+static INT32_CACHE: [TaggedVal; SMALL_INT_LEN] = build_int_cache();
+// Int64 cache (separate so the tag is TAG_INT64).
+static INT64_CACHE: [TaggedVal; SMALL_INT_LEN] = {
+    let mut arr = [tv(TAG_INT64, 0); SMALL_INT_LEN];
+    let mut i = 0;
+    while i < SMALL_INT_LEN {
+        arr[i] = tv(TAG_INT64, (SMALL_INT_MIN + i as i64) as u64);
+        i += 1;
+    }
+    arr
+};
+// Bool cache: [false, true].
+static BOOL_CACHE: [TaggedVal; 2] = [tv(TAG_BOOL, 0), tv(TAG_BOOL, 1)];
+// Null is represented as a null pointer, so no cache entry is needed.
+
+/// True if `p` points into one of the immutable cached-box tables and therefore must not be
+/// freed. Checked by `lin_tagged_release`.
+#[inline]
+unsafe fn is_cached_box(p: *const u8) -> bool {
+    let in_range = |base: *const TaggedVal, len: usize| {
+        let lo = base as usize;
+        let hi = lo + len * core::mem::size_of::<TaggedVal>();
+        let q = p as usize;
+        q >= lo && q < hi
+    };
+    in_range(INT32_CACHE.as_ptr(), SMALL_INT_LEN)
+        || in_range(INT64_CACHE.as_ptr(), SMALL_INT_LEN)
+        || in_range(BOOL_CACHE.as_ptr(), 2)
 }
 
 pub unsafe fn alloc_tagged(tag: u8, payload: u64) -> *mut u8 {
@@ -56,16 +125,24 @@ pub unsafe extern "C" fn lin_box_null() -> *mut u8 {
 
 #[no_mangle]
 pub unsafe extern "C" fn lin_box_bool(v: u8) -> *mut u8 {
-    alloc_tagged(TAG_BOOL, v as u64)
+    // Always cached: only two possible values.
+    &BOOL_CACHE[(v != 0) as usize] as *const TaggedVal as *mut u8
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn lin_box_int32(v: i32) -> *mut u8 {
+    let n = v as i64;
+    if n >= SMALL_INT_MIN && n < SMALL_INT_MAX {
+        return &INT32_CACHE[(n - SMALL_INT_MIN) as usize] as *const TaggedVal as *mut u8;
+    }
     alloc_tagged(TAG_INT32, v as i64 as u64)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn lin_box_int64(v: i64) -> *mut u8 {
+    if v >= SMALL_INT_MIN && v < SMALL_INT_MAX {
+        return &INT64_CACHE[(v - SMALL_INT_MIN) as usize] as *const TaggedVal as *mut u8;
+    }
     alloc_tagged(TAG_INT64, v as u64)
 }
 
@@ -272,6 +349,67 @@ pub unsafe extern "C" fn lin_tagged_release(p: *mut u8) {
         TAG_OBJECT => crate::object::lin_object_release(payload as *mut crate::object::LinObject),
         _ => {} // Scalars (null, bool, int, float) have no heap payload.
     }
+    // Cached scalar boxes (small ints, bools) are immutable statics — never free them.
+    if is_cached_box(p) {
+        return;
+    }
     // Free the TaggedVal box itself.
     std::alloc::dealloc(p, std::alloc::Layout::new::<TaggedVal>());
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    #[test]
+    fn small_ints_are_cached_and_roundtrip() {
+        unsafe {
+            for v in [SMALL_INT_MIN as i32, -1, 0, 1, 42, (SMALL_INT_MAX - 1) as i32] {
+                let p = lin_box_int32(v);
+                assert_eq!(lin_get_tag(p), TAG_INT32);
+                assert_eq!(lin_unbox_int32(p), v);
+                assert!(is_cached_box(p), "in-range int {v} should be cached");
+                // Boxing the same value twice returns the identical cached pointer.
+                assert_eq!(p, lin_box_int32(v));
+                // Releasing a cached box must be a harmless no-op (no free).
+                lin_tagged_release(p);
+                assert_eq!(lin_unbox_int32(p), v, "cached box survived release");
+            }
+        }
+    }
+
+    #[test]
+    fn out_of_range_ints_allocate_fresh() {
+        unsafe {
+            let v = SMALL_INT_MAX as i32; // one past the cache
+            let p = lin_box_int32(v);
+            assert_eq!(lin_unbox_int32(p), v);
+            assert!(!is_cached_box(p), "out-of-range int should be heap-allocated");
+            lin_tagged_release(p); // frees the heap box
+        }
+    }
+
+    #[test]
+    fn bools_are_cached() {
+        unsafe {
+            let t = lin_box_bool(1);
+            let f = lin_box_bool(0);
+            assert!(is_cached_box(t) && is_cached_box(f));
+            assert_ne!(t, f);
+            assert_eq!(lin_get_tag(t), TAG_BOOL);
+            assert_eq!(t, lin_box_bool(7)); // any non-zero → the `true` cache entry
+            lin_tagged_release(t);
+            lin_tagged_release(f);
+        }
+    }
+
+    #[test]
+    fn int64_cache_uses_int64_tag() {
+        unsafe {
+            let p = lin_box_int64(5);
+            assert_eq!(lin_get_tag(p), TAG_INT64);
+            assert_eq!(lin_unbox_int64(p), 5);
+            assert!(is_cached_box(p));
+        }
+    }
 }
