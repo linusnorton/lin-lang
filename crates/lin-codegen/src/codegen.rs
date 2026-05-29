@@ -7345,9 +7345,9 @@ impl<'ctx> Codegen<'ctx> {
                                 self.compile_ir_index_set(obj_v, key_v, val_v, obj_ty, key_ty, val_ty);
                             }
                         }
-                        Instruction::FieldGet { dst, object, field, result_ty } => {
+                        Instruction::FieldGet { dst, object, field, obj_ty, result_ty } => {
                             if let Some(&obj_v) = temp_map.get(object) {
-                                let result = self.compile_ir_field_get(obj_v, field, result_ty);
+                                let result = self.compile_ir_field_get(obj_v, field, obj_ty, result_ty);
                                 temp_map.insert(*dst, result);
                             }
                         }
@@ -7665,11 +7665,18 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
-    fn compile_ir_field_get(&mut self, obj: BasicValueEnum<'ctx>, field: &str, result_ty: &Type) -> BasicValueEnum<'ctx> {
+    fn compile_ir_field_get(&mut self, obj: BasicValueEnum<'ctx>, field: &str, obj_ty: &Type, result_ty: &Type) -> BasicValueEnum<'ctx> {
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         if obj.is_pointer_value() {
+            // A Json/union object arrives as a boxed TaggedVal*; unbox to the raw LinObject*.
+            let container = if Self::is_union_type(obj_ty) {
+                self.builder.build_call(self.rt_unbox_ptr, &[obj.into()], "ir_fget_unbox")
+                    .unwrap().try_as_basic_value().unwrap_basic()
+            } else {
+                obj
+            };
             let key_str = self.compile_string_lit(field).into_pointer_value();
-            let tagged = self.builder.build_call(self.rt_object_get, &[obj.into(), key_str.into()], "ir_fget")
+            let tagged = self.builder.build_call(self.rt_object_get, &[container.into(), key_str.into()], "ir_fget")
                 .unwrap().try_as_basic_value().unwrap_basic();
             self.builder.build_call(self.rt_string_release, &[key_str.into()], "").unwrap();
             self.unbox_tagged_val_to_type(tagged, result_ty)

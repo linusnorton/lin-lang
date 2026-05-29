@@ -147,7 +147,7 @@ pub enum Instruction {
     /// object[key] = value  — in-place array/object element assignment (no result).
     IndexSet { object: Temp, key: Temp, value: Temp, obj_ty: Type, key_ty: Type, val_ty: Type },
     /// result = object.field  — known-shape field access
-    FieldGet { dst: Temp, object: Temp, field: String, result_ty: Type },
+    FieldGet { dst: Temp, object: Temp, field: String, obj_ty: Type, result_ty: Type },
     /// Increment refcount of a heap value (string, array, object, closure env).
     Retain { val: Temp, ty: Type },
     /// Decrement refcount; free if zero. Only emitted for owned values.

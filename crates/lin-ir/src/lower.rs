@@ -419,6 +419,7 @@ fn lower_stmt(stmt: &TypedStmt, builder: &mut FuncBuilder, ctx: &mut LowerCtx) {
             obj_ty,
             ..
         } => {
+            let dobj_ty = value.ty();
             let obj_temp = lower_expr(value, builder, ctx);
             builder.slots.insert(*obj_slot, obj_temp);
             for (field_name, binding_slot, field_ty) in fields {
@@ -428,6 +429,7 @@ fn lower_stmt(stmt: &TypedStmt, builder: &mut FuncBuilder, ctx: &mut LowerCtx) {
                     dst,
                     object: obj_temp,
                     field: field_name.clone(),
+                    obj_ty: dobj_ty.clone(),
                     result_ty: field_ty.clone(),
                 });
                 builder.slots.insert(*binding_slot, dst);
@@ -653,12 +655,14 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
         }
 
         TypedExpr::FieldGet { object, field, result_type, .. } => {
+            let obj_ty = object.ty();
             let obj_temp = lower_expr(object, builder, ctx);
             let dst = builder.alloc_temp(result_type.clone());
             builder.emit(Instruction::FieldGet {
                 dst,
                 object: obj_temp,
                 field: field.clone(),
+                obj_ty,
                 result_ty: result_type.clone(),
             });
             dst
@@ -755,7 +759,23 @@ fn lower_call(
         }
         // Check global function slots.
         if let Some(&fid) = ctx.global_fn_slots.get(slot) {
-            let lowered_args: Vec<Temp> = args.iter().map(|a| lower_expr(a, builder, ctx)).collect();
+            // Box concrete args to Json/union params and retain Function-typed args,
+            // matching the callee's compiled signature (see imported-function path).
+            let param_tys: Vec<Type> = match func.ty() {
+                Type::Function { params, .. } => params,
+                _ => vec![],
+            };
+            let lowered_args: Vec<Temp> = args
+                .iter()
+                .enumerate()
+                .map(|(i, a)| {
+                    let t = lower_expr(a, builder, ctx);
+                    let param_ty = param_tys.get(i);
+                    let boxed = lower_box_for_param(t, &a.ty(), param_ty, builder);
+                    retain_call_arg(boxed, &a.ty(), expr_is_fresh_alloc(a), builder);
+                    boxed
+                })
+                .collect();
             if is_tail {
                 builder.terminate(Terminator::TailCall { args: lowered_args.clone() });
                 // Dead block to keep IR valid.
@@ -1372,9 +1392,16 @@ fn lower_match(
     builder: &mut FuncBuilder,
     ctx: &mut LowerCtx,
 ) -> Temp {
-    let scrut_temp = lower_expr(scrutinee, builder, ctx);
+    let scrut_ty = scrutinee.ty();
+    let raw_scrut = lower_expr(scrutinee, builder, ctx);
+    // `is`/`has` pattern tests use runtime tag dispatch (lin_get_tag), which needs a
+    // boxed TaggedVal*. Box a concrete scrutinee so type checks see a real tag.
+    let scrut_temp = box_to_json(raw_scrut, &scrut_ty, builder);
     let merge_block = builder.alloc_block("match_merge");
     let result_dst = builder.alloc_temp(result_type.clone());
+    // Collect (arm_result, predecessor_block) for a Phi in the merge block — a shared
+    // Copy target would be overwritten per-arm by the single-pass codegen.
+    let mut incomings: Vec<(Temp, BlockId)> = Vec::new();
 
     for (i, arm) in arms.iter().enumerate() {
         let is_last = i == arms.len() - 1;
@@ -1423,7 +1450,7 @@ fn lower_match(
 
         let arm_val = lower_expr(&arm.body, builder, ctx);
         if !builder.is_current_block_terminated() {
-            builder.emit(Instruction::Copy { dst: result_dst, src: arm_val });
+            incomings.push((arm_val, builder.current_block));
             builder.terminate(Terminator::Jump(merge_block));
         }
 
@@ -1436,6 +1463,16 @@ fn lower_match(
     builder.terminate(Terminator::Unreachable);
 
     builder.switch_to(merge_block);
+    // Merge the arm results via a Phi (see lower_if). If no arm fell through to the merge
+    // (all diverged), the phi has no incomings — still valid as the merge is unreachable.
+    builder.emit(Instruction::Phi {
+        dst: result_dst,
+        ty: result_type.clone(),
+        incomings,
+    });
+    if is_rc_type(result_type) {
+        builder.register_owned(result_dst, result_type.clone());
+    }
     result_dst
 }
 
@@ -1502,6 +1539,7 @@ fn lower_typed_pattern_bindings(
             builder.slots.insert(*slot, t);
         }
         TypedPattern::Object { fields, .. } => {
+            let scrut_ty = builder.temp_types.get(&scrut).cloned().unwrap_or(Type::TypeVar(u32::MAX));
             for field in fields {
                 if let Some(slot) = field.binding_slot {
                     let t = builder.alloc_temp(field.ty.clone());
@@ -1509,6 +1547,7 @@ fn lower_typed_pattern_bindings(
                         dst: t,
                         object: scrut,
                         field: field.key.clone(),
+                        obj_ty: scrut_ty.clone(),
                         result_ty: field.ty.clone(),
                     });
                     builder.slots.insert(slot, t);
@@ -1642,10 +1681,13 @@ fn lower_function_expr_with_id(
         for (i, cap) in captures.iter().enumerate() {
             let cap_ty = cap.ty.clone();
             let cap_t = inner_builder.alloc_temp(cap_ty.clone());
+            // Env access is a raw struct load by index, NOT a Lin object field — use a
+            // concrete obj_ty so codegen does not attempt to unbox it as Json.
             inner_builder.emit(Instruction::FieldGet {
                 dst: cap_t,
                 object: env_temp,
                 field: i.to_string(), // env field by index
+                obj_ty: Type::Null, // non-union sentinel: codegen must not unbox env
                 result_ty: cap_ty,
             });
             inner_builder.slots.insert(cap.outer_slot, cap_t);
