@@ -248,6 +248,35 @@ pub unsafe extern "C" fn lin_object_has(obj: *const LinObject, key: *const LinSt
     0
 }
 
+/// Check if a boxed value (TaggedVal*) is an object that has `key`. Returns 0 for null
+/// or non-object values. Does the tag check + unbox internally so callers need no
+/// branching (used by the IR `has`-pattern lowering).
+#[no_mangle]
+pub unsafe extern "C" fn lin_value_has_field(tagged: *const u8, key: *const LinString) -> u8 {
+    use crate::tagged::{TaggedVal, TAG_OBJECT};
+    if tagged.is_null() { return 0; }
+    let tv = &*(tagged as *const TaggedVal);
+    if tv.tag != TAG_OBJECT { return 0; }
+    let obj = tv.payload as *const LinObject;
+    lin_object_has(obj, key)
+}
+
+/// Check if a boxed value (TaggedVal*) is an array of length `n` (exact) or `>= n` when
+/// `at_least != 0`. Returns 0 for null/non-array values. Branchless helper for the IR
+/// array-pattern lowering.
+#[no_mangle]
+pub unsafe extern "C" fn lin_value_array_len_check(tagged: *const u8, n: u64, at_least: u8) -> u8 {
+    use crate::tagged::{TaggedVal, TAG_ARRAY};
+    if tagged.is_null() { return 0; }
+    let tv = &*(tagged as *const TaggedVal);
+    if tv.tag != TAG_ARRAY { return 0; }
+    let arr = tv.payload as *const crate::array::LinArray;
+    if arr.is_null() { return 0; }
+    let len = (*arr).len as u64;
+    let ok = if at_least != 0 { len >= n } else { len == n };
+    ok as u8
+}
+
 /// Deep structural equality for two objects: same keys and values, order-independent.
 /// Returns 1 if equal, 0 if not.
 #[no_mangle]

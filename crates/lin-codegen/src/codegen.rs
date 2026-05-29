@@ -7322,6 +7322,12 @@ impl<'ctx> Codegen<'ctx> {
             // after the header) are available in temp_map when we wire up the edges.
             let mut pending_phis: Vec<(inkwell::values::PhiValue<'ctx>, Vec<(lir::Temp, lir::BlockId)>)> = Vec::new();
 
+            // The LLVM block an IR block's control flow actually EXITS from. Some
+            // instructions (HasPattern, ArrayLenCheck) emit internal branches and leave the
+            // builder in a fresh block; the IR block's terminator and any phi that names this
+            // IR block as a predecessor must use that exit block, not the entry block.
+            let mut ir_block_exit: StdMap<lir::BlockId, inkwell::basic_block::BasicBlock<'ctx>> = StdMap::new();
+
             // Compile each block
             for block in &func.blocks {
                 let bb = ir_block_to_llvm[&block.id];
@@ -7619,33 +7625,16 @@ impl<'ctx> Codegen<'ctx> {
                         Instruction::ArrayLenCheck { dst, val, n, at_least } => {
                             if let Some(&v) = temp_map.get(val) {
                                 let result = if v.is_pointer_value() {
-                                    // is-array (tag 8)?
-                                    let tag = self.builder.build_call(self.rt_get_tag, &[v.into()], "alc_tag")
+                                    // BRANCHLESS via runtime helper (tag check + length test),
+                                    // so this stays in one basic block (SSA dominance).
+                                    let i8t = self.context.i8_type();
+                                    let check_fn = self.get_or_declare_fn("lin_value_array_len_check",
+                                        i8t.fn_type(&[ptr_ty.into(), i64_ty.into(), i8t.into()], false));
+                                    let n_v = i64_ty.const_int(*n, false);
+                                    let at_v = i8t.const_int(*at_least as u64, false);
+                                    let r = self.builder.build_call(check_fn, &[v.into(), n_v.into(), at_v.into()], "alc")
                                         .unwrap().try_as_basic_value().unwrap_basic().into_int_value();
-                                    let is_arr = self.builder.build_int_compare(IntPredicate::EQ, tag,
-                                        self.context.i8_type().const_int(8, false), "alc_isarr").unwrap();
-                                    // length(unbox(v)) <op> n. Safe to compute even if not an array
-                                    // (unbox of a non-array would be junk), so guard with a select:
-                                    // only call length when is_arr — use a branch to avoid bad reads.
-                                    let cont = self.context.append_basic_block(llvm_fn, "alc_arr");
-                                    let merge = self.context.append_basic_block(llvm_fn, "alc_merge");
-                                    let entry_bb = self.builder.get_insert_block().unwrap();
-                                    self.builder.build_conditional_branch(is_arr, cont, merge).unwrap();
-                                    self.builder.position_at_end(cont);
-                                    let arr = self.builder.build_call(self.rt_unbox_ptr, &[v.into()], "alc_arr_ptr")
-                                        .unwrap().try_as_basic_value().unwrap_basic();
-                                    let len = self.builder.build_call(self.rt_array_length, &[arr.into()], "alc_len")
-                                        .unwrap().try_as_basic_value().unwrap_basic().into_int_value();
-                                    let nconst = i64_ty.const_int(*n, false);
-                                    let pred = if *at_least { IntPredicate::SGE } else { IntPredicate::EQ };
-                                    let len_ok = self.builder.build_int_compare(pred, len, nconst, "alc_lenok").unwrap();
-                                    self.builder.build_unconditional_branch(merge).unwrap();
-                                    let cont_end = self.builder.get_insert_block().unwrap();
-                                    self.builder.position_at_end(merge);
-                                    let phi = self.builder.build_phi(self.context.bool_type(), "alc_res").unwrap();
-                                    let f = self.context.bool_type().const_zero();
-                                    phi.add_incoming(&[(&f, entry_bb), (&len_ok, cont_end)]);
-                                    phi.as_basic_value()
+                                    self.builder.build_int_truncate_or_bit_cast(r, self.context.bool_type(), "alc_b").unwrap().into()
                                 } else {
                                     self.context.bool_type().const_zero().into()
                                 };
@@ -7755,6 +7744,11 @@ impl<'ctx> Codegen<'ctx> {
                     }
                 }
 
+                // Record the block's actual exit LLVM block (may differ from its entry if
+                // an instruction emitted internal branches). The terminator below is emitted
+                // here, at the current position.
+                ir_block_exit.insert(block.id, self.builder.get_insert_block().unwrap());
+
                 // Emit terminator
                 match &block.terminator {
                     Terminator::Return(Some(t)) => {
@@ -7826,9 +7820,10 @@ impl<'ctx> Codegen<'ctx> {
             // sources) has been compiled and all temps are in temp_map.
             for (phi, incomings) in &pending_phis {
                 for (val_temp, pred_block) in incomings {
-                    if let (Some(&v), Some(&pred_bb)) =
-                        (temp_map.get(val_temp), ir_block_to_llvm.get(pred_block))
-                    {
+                    // Use the predecessor's EXIT block (where its branch to the merge was
+                    // actually emitted), not its entry block.
+                    let pred_bb = ir_block_exit.get(pred_block).or_else(|| ir_block_to_llvm.get(pred_block));
+                    if let (Some(&v), Some(&pred_bb)) = (temp_map.get(val_temp), pred_bb) {
                         phi.add_incoming(&[(&v, pred_bb)]);
                     }
                 }
@@ -8107,41 +8102,22 @@ impl<'ctx> Codegen<'ctx> {
         if !val.is_pointer_value() { return bool_ty.const_zero(); }
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         let i8_ty = self.context.i8_type();
-        // The value is a boxed TaggedVal*. Only objects can match; for non-objects, `has`
-        // is false. Branch on the tag so we never call lin_object_has on a non-object
-        // (which would deref a non-LinObject pointer and crash).
-        let tag = self.builder.build_call(self.rt_get_tag, &[val.into()], "ir_has_tag")
-            .unwrap().try_as_basic_value().unwrap_basic().into_int_value();
-        let is_obj = self.builder.build_int_compare(IntPredicate::EQ, tag,
-            i8_ty.const_int(7, false), "ir_has_isobj").unwrap();
-        let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
-        let entry_bb = self.builder.get_insert_block().unwrap();
-        let obj_bb = self.context.append_basic_block(llvm_fn, "has_obj");
-        let merge_bb = self.context.append_basic_block(llvm_fn, "has_merge");
-        self.builder.build_conditional_branch(is_obj, obj_bb, merge_bb).unwrap();
-
-        self.builder.position_at_end(obj_bb);
-        let obj_ptr = self.builder.build_call(self.rt_unbox_ptr, &[val.into()], "ir_has_unbox")
-            .unwrap().try_as_basic_value().unwrap_basic();
-        let obj_has_fn = self.get_or_declare_fn("lin_object_has",
+        // BRANCHLESS: lin_value_has_field does the tag check + unbox + presence test in the
+        // runtime, returning 0 for null/non-object values. Emitting no LLVM branches keeps
+        // this IR instruction within a single basic block (avoids out-of-order block
+        // creation that breaks SSA dominance when used inside match arms).
+        let has_fn = self.get_or_declare_fn("lin_value_has_field",
             i8_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
         let mut all_present = bool_ty.const_int(1, false);
         for field in &pattern.required_fields {
             let key_str = self.compile_string_lit(field).into_pointer_value();
-            let has_i8 = self.builder.build_call(obj_has_fn, &[obj_ptr.into(), key_str.into()], "ir_has")
+            let has_i8 = self.builder.build_call(has_fn, &[val.into(), key_str.into()], "ir_has")
                 .unwrap().try_as_basic_value().unwrap_basic().into_int_value();
             self.builder.build_call(self.rt_string_release, &[key_str.into()], "").unwrap();
             let has_bool = self.builder.build_int_truncate_or_bit_cast(has_i8, bool_ty, "has_b").unwrap();
             all_present = self.builder.build_and(all_present, has_bool, "has_acc").unwrap();
         }
-        let obj_end = self.builder.get_insert_block().unwrap();
-        self.builder.build_unconditional_branch(merge_bb).unwrap();
-
-        self.builder.position_at_end(merge_bb);
-        let phi = self.builder.build_phi(bool_ty, "has_res").unwrap();
-        let f = bool_ty.const_zero();
-        phi.add_incoming(&[(&f, entry_bb), (&all_present, obj_end)]);
-        phi.as_basic_value().into_int_value()
+        all_present
     }
 
     fn compile_ir_coerce(&mut self, val: BasicValueEnum<'ctx>, from_ty: &Type, to_ty: &Type) -> BasicValueEnum<'ctx> {

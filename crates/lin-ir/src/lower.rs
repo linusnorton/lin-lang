@@ -1734,29 +1734,42 @@ fn lower_match(
             }
         }
 
-        // Emit body.
+        // Emit body. Each arm gets its own ownership scope so heap temps it allocates
+        // (bindings, body intermediates) are released within the arm — not at the
+        // enclosing scope exit, where only one arm actually executed (releasing another
+        // arm's temps there frees an undefined value / breaks SSA dominance).
         builder.switch_to(body_block);
+        builder.push_scope();
 
         // Bind pattern variables BEFORE the guard — the guard may reference them
         // (e.g. `has { name, age } when age > 30`).
         lower_match_bindings(&arm.pattern, scrut_temp, builder, ctx);
 
-        // If there's a guard, test it.
+        // If there's a guard, test it. On failure, discard this arm's scope (its bindings
+        // are unused) and fall through to the next arm.
         if let Some(guard) = &arm.guard {
             let guard_val = lower_expr(guard, builder, ctx);
             let guard_then = builder.alloc_block(format!("arm_{}_guard_ok", i));
+            let guard_fail = builder.alloc_block(format!("arm_{}_guard_fail", i));
             builder.terminate(Terminator::CondJump {
                 cond: guard_val,
                 then_block: guard_then,
-                else_block: next_block,
+                else_block: guard_fail,
             });
+            builder.switch_to(guard_fail);
+            builder.terminate(Terminator::Jump(next_block));
             builder.switch_to(guard_then);
         }
 
-        let arm_val = lower_expr(&arm.body, builder, ctx);
+        let arm_raw = lower_expr(&arm.body, builder, ctx);
         if !builder.is_current_block_terminated() {
+            let arm_val = coerce_to_slot_type(arm_raw, &arm.body.ty(), result_type, builder);
+            // Release this arm's owned temps, keeping the result and its raw pre-coercion temp.
+            builder.pop_scope_releasing_keep(&[arm_val, arm_raw]);
             incomings.push((arm_val, builder.current_block));
             builder.terminate(Terminator::Jump(merge_block));
+        } else {
+            builder.discard_scope();
         }
 
         builder.switch_to(next_block);
