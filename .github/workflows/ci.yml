@@ -11,15 +11,12 @@ env:
 
 jobs:
   test:
-    name: Test (${{ matrix.os }}, backend=${{ matrix.backend }})
+    name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-22.04, macos-latest]
-        # LinIR is the default backend. We still exercise the legacy TypedAST path via the
-        # LIN_USE_AST=1 escape hatch during its one-release deprecation window. Both green.
-        backend: [ir, ast]
 
     steps:
       - uses: actions/checkout@v4
@@ -46,15 +43,6 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Select compilation backend
-        run: |
-          if [ "${{ matrix.backend }}" = "ast" ]; then
-            echo "LIN_USE_AST=1" >> "$GITHUB_ENV"
-            echo "Using legacy TypedAST compilation path (LIN_USE_AST=1)"
-          else
-            echo "Using LinIR compilation path (default)"
-          fi
 
       - name: Cache cargo registry
         uses: actions/cache@v4

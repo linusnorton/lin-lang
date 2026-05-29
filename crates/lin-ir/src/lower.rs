@@ -213,9 +213,9 @@ struct LowerCtx {
     global_fn_slots: HashMap<usize, FuncId>,
     /// Import binding slots that resolve to a compiled function in the LLVM module.
     /// slot → (mangled LLVM symbol name e.g. `std_io_print`, declared param types).
-    /// Imported modules are compiled by codegen's AST `register_import` regardless of
-    /// the IR path, so the symbol already exists; the IR `CallTarget::Named` resolver
-    /// looks it up by name. Param types drive arg boxing (concrete → Json param).
+    /// Imported modules are compiled through the IR pipeline (`compile_import_from_ir`), so
+    /// the symbol already exists; the IR `CallTarget::Named` resolver looks it up by name.
+    /// Param types drive arg boxing (concrete → Json param).
     import_fn_slots: HashMap<usize, (String, Vec<Type>)>,
     /// Import binding slots for non-function exported vals. slot → (val-wrapper symbol
     /// name `{module_key}_{name}__val`, value type). Reading the binding calls the
@@ -403,19 +403,6 @@ impl FuncBuilder {
     /// Register an owned temp in the current scope frame.
     fn register_owned(&mut self, t: Temp, ty: Type) {
         if is_rc_type(&ty) {
-            if let Some(frame) = self.scope_owned.last_mut() {
-                frame.push((t, ty));
-            }
-        }
-    }
-
-    /// Register an owned temp that may be a boxed union/Json value (whose heap payload still
-    /// needs releasing). Used for projections (`obj[k]` / `obj.field`) whose result type is a
-    /// union: the projected TaggedVal* aliases a value inside the container, so it must be
-    /// dup'd and tracked for release like any other owned heap value. `Release` codegen is
-    /// tag-aware, so releasing a union temp frees its inner payload correctly.
-    fn register_owned_rc_or_union(&mut self, t: Temp, ty: Type) {
-        if is_rc_type(&ty) || is_union_ty(&ty) {
             if let Some(frame) = self.scope_owned.last_mut() {
                 frame.push((t, ty));
             }
@@ -630,26 +617,6 @@ fn lower_coerce_arg(arg: Temp, arg_ty: &Type, param_ty: Option<&Type>, builder: 
     arg
 }
 
-/// Box a concrete argument when the callee's parameter is a Json/union type.
-/// Emits a `Coerce` (which codegen lowers to `build_tagged_val_alloca`) and returns the
-/// boxed temp; otherwise returns the argument temp unchanged. Mirrors the AST path's
-/// arg-boxing rule in `call_global_fn` (concrete arg → union param ⇒ box).
-fn lower_box_for_param(arg: Temp, arg_ty: &Type, param_ty: Option<&Type>, builder: &mut FuncBuilder) -> Temp {
-    let Some(param_ty) = param_ty else { return arg; };
-    if is_union_ty(param_ty) && !is_union_ty(arg_ty) {
-        let dst = builder.alloc_temp(param_ty.clone());
-        builder.emit(Instruction::Coerce {
-            dst,
-            src: arg,
-            from_ty: arg_ty.clone(),
-            to_ty: param_ty.clone(),
-        });
-        dst
-    } else {
-        arg
-    }
-}
-
 /// Coerce a value temp to a slot's declared type when their runtime representations
 /// differ (box concrete → union, or unbox union → concrete). Returns the (possibly new)
 /// temp; a no-op when representations match.
@@ -732,8 +699,8 @@ fn lower_stmt(stmt: &TypedStmt, builder: &mut FuncBuilder, ctx: &mut LowerCtx) {
             }
         }
         TypedStmt::Import { path, bindings, .. } => {
-            // Imported modules are compiled by codegen's AST `register_import` even on
-            // the IR path, so each exported symbol already exists in the LLVM module
+            // Imported modules are compiled through the IR pipeline (compile_import_from_ir),
+            // so each exported symbol already exists in the LLVM module
             // under its mangled name `{module_key}_{name}`. Resolve each binding slot to
             // either a `Named` call target (function exports) or a zero-arg val-wrapper
             // (non-function exports), matching the AST path's `compile_stmt` Import logic.

@@ -37,8 +37,8 @@ Cargo workspace with nine crates (`crates/`):
 - **`lin-lex`** — lexer with indentation tracking. Produces `Token` stream with synthetic `Indent`/`Dedent`/`Newline` tokens.
 - **`lin-parse`** — parser, surface AST (`Module`, `Stmt`, `Expr`, `Pattern`, `TypeExpr`). Includes parser error recovery and "did you mean" diagnostics.
 - **`lin-check`** — type checker. Consumes the surface AST; produces `TypedModule` (typed IR). Handles bidirectional inference, structural typing, union narrowing, exhaustiveness checking, TypeVar zonking, and numeric widening. Emits `Diagnostic` values with Ariadne-style multi-span rendering.
-- **`lin-ir`** — flat 3-address IR (`LinIR`) sitting between `TypedExpr` and LLVM. Contains: IR data types (`ir.rs`), the `TypedModule → LinModule` lowering pass (`lower.rs`), backwards-dataflow liveness analysis (`liveness.rs`), and the Perceus-inspired RC elision pass (`rc_elide.rs`).
-- **`lin-codegen`** — LLVM backend via `inkwell`. Compiles `TypedModule` directly to LLVM IR today; `lin-ir` is available as an optional pre-pass. Handles functions, closures, objects, arrays, strings, union tagged dispatch, pattern matching, TCO, and unboxed scalar arrays.
+- **`lin-ir`** — flat 3-address IR (`LinIR`) sitting between `TypedExpr` and LLVM, and the **sole** lowering path. Contains: IR data types (`ir.rs`), the `TypedModule → LinModule` lowering pass (`lower.rs`, incl. `lower_module` for the main module and `lower_import_module` for imports), backwards-dataflow liveness analysis (`liveness.rs`), and the Perceus-inspired RC elision pass (`rc_elide.rs`).
+- **`lin-codegen`** — LLVM backend via `inkwell`. Compiles a `LinModule` (the flat IR) to LLVM IR via `compile_module_from_ir` (main module) and `compile_import_from_ir` (imports). Handles functions, closures, objects, arrays, strings, union tagged dispatch, pattern matching, TCO, and unboxed scalar arrays. (The former TypedAST-direct backend was removed once the IR path reached parity.)
 - **`lin-runtime`** — small static library linked into every compiled binary. Provides refcounted strings/arrays/objects, intrinsics (`lin_print`, `lin_string_concat`, etc.), and flat scalar array variants (`lin_flat_array_alloc_i32`, etc.).
 - **`lin-compile`** — orchestrates the full compilation pipeline: source → lex → parse → type check → codegen → link. Includes a module cache (`.lin-cache/<sha256>.typed`) and module signature files (`.lin-cache/<sha256>.sig`) to skip re-checking unchanged imports.
 - **`lin`** — CLI binary. Dispatches `build`, `check`, `test` subcommands.
@@ -53,8 +53,8 @@ Stdlib lives in `stdlib/*.lin` and is loaded via `include_str!` in `lin-compile`
 source (.lin)
   → Lexer → Tokens → Parser → AST
   → lin-check: type checker → TypedModule
-  → lin-ir (optional): TypedModule → LinModule (flat 3-address IR) → RC elision pass
-  → lin-codegen: TypedModule → LLVM IR (via inkwell)
+  → lin-ir: TypedModule → LinModule (flat 3-address IR) → RC elision pass
+  → lin-codegen: LinModule → LLVM IR (via inkwell)
   → LLVM optimisation passes (default: O2)
   → emit .o object file
   → cc link with lin-runtime.a → native binary

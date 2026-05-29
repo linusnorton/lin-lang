@@ -452,3 +452,45 @@ pipeline; the IR path no longer depends on the AST `compile_function_body`/`comp
 ### Milestone 2 is now UNBLOCKED
 Phase 10 (delete the legacy AST path) can proceed: `register_import` no longer needs the AST
 compiler. `compile_import_from_ir` is the IR-path import compiler.
+
+## Checkpoint 10 — Milestone 2 COMPLETE: LinIR is the sole compilation path
+
+Phases 9 and 10 are done. LinIR is the default and only backend.
+
+### Phase 9 — flipped the default
+`lin-compile` now compiles through LinIR unconditionally for both the main module and
+imports. (During development this was briefly a `LIN_USE_AST=1` escape hatch; that gate was
+removed in Phase 10.)
+
+### Phase 10 — deleted the legacy TypedAST path
+Removed the entire AST-direct backend from `lin-codegen`:
+- Public entry points: `compile_module`, `register_import`, `register_import_with_source`,
+  `set_source`.
+- The ~60-function private cascade the compiler flagged as dead once those were gone:
+  `compile_expr`, `compile_call`/`call_global_fn`/`call_slot_fn`/`build_indirect_call`/
+  `build_closure_call`(`_typed`)/`call_closure_ptr_with_args`/`wrap_named_fn_as_closure`,
+  `compile_intrinsic_call`, `compile_async_intrinsic`, `compile_match`/`compile_match_switch`/
+  `compile_pattern_match`, `try_tco_tail_call`, the TypedExpr loop/`call_body` forms,
+  `build_partial_application`, `compile_make_array`/`compile_make_object`/`compile_if`/
+  `compile_index`(`_set`)/`compile_for_loop`/`compile_map_loop`/`compile_filter_loop`/
+  `compile_reduce_loop`/`compile_while_loop`, `value_to_string`, `compile_function_body`, etc.
+- AST-only state: `FnCtx`, `SlotStorage`, `TcoState`, and the now-unused `Codegen` fields
+  (`global_fn_slots`, `global_val_slots`, `current_module_slots`, `rt_array_get_tagged`,
+  `rt_array_length`, `rt_object_has`, `rt_string_build_n`).
+
+**`codegen.rs`: 7,685 → 3,322 lines** (~5,900 lines removed net across the change).
+
+### Coverage
+`lin test --coverage` instrumentation lived only in the AST path. Per the chosen plan it is
+**stubbed**: the CLI now errors with "temporarily unavailable — not yet ported to the LinIR
+backend" rather than silently producing no data. The `CoverageEmitter` scaffolding remains
+for that future port.
+
+### Final gate (IR is the only path)
+- `cargo build --workspace` clean; `cargo test --workspace` green (128/128 integration + all
+  unit tests).
+- Stdlib: 14/14. Non-skipped examples: all run. ASan-clean on stdlib (the standing guard).
+- CI simplified: single backend (the `backend: [ir, ast]` matrix axis removed); ASan leg kept.
+
+The dual-path arrangement that motivated this whole effort is gone — one coherent pipeline:
+source → check → lin-ir (lower + rc_elide) → lin-codegen → LLVM → link.

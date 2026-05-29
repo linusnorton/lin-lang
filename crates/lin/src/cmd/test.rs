@@ -55,6 +55,17 @@ pub fn run(args: &TestArgs) {
     use std::process;
     use rayon::prelude::*;
 
+    // Coverage instrumentation was implemented only in the legacy TypedAST backend, which has
+    // been removed in favour of the LinIR pipeline. The feature is temporarily unavailable
+    // until reimplemented on the IR path; fail clearly rather than silently producing no data.
+    if args.coverage {
+        eprintln!(
+            "error: `lin test --coverage` is temporarily unavailable — coverage instrumentation \
+             has not yet been ported to the LinIR compilation backend."
+        );
+        process::exit(2);
+    }
+
     let test_files = collect_test_files(&args.paths, args.filter.as_deref());
     if test_files.is_empty() {
         eprintln!("No *.test.lin files found.");
