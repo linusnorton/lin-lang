@@ -270,6 +270,13 @@ impl FuncBuilder {
         }
     }
 
+    /// Pop the current ownership scope without emitting releases. Used when the block
+    /// is already terminated (e.g. ends in a tail call or return), so any cleanup
+    /// would be unreachable / handled by the terminating construct.
+    fn discard_scope(&mut self) {
+        self.scope_owned.pop();
+    }
+
     fn is_current_block_terminated(&self) -> bool {
         let id = self.current_block;
         self.blocks
@@ -832,23 +839,43 @@ fn lower_if(
     // Allocate result temp in the pre-branch block so it's accessible post-merge.
     let result_dst = builder.alloc_temp(result_type.clone());
 
+    // Each branch gets its own ownership scope so heap temps it allocates are
+    // released at the end of *that branch* — not in the merge block, where only
+    // one branch's temps are actually live (releasing the other branch's temps
+    // there frees undefined values). The branch result is kept (copied to
+    // result_dst) and re-registered as owned in the enclosing scope.
+    let result_is_rc = is_rc_type(result_type);
+
     // --- then branch ---
     builder.switch_to(then_block);
+    builder.push_scope();
     let then_val = lower_expr(then_br, builder, ctx);
     if !builder.is_current_block_terminated() {
         builder.emit(Instruction::Copy { dst: result_dst, src: then_val });
+        builder.pop_scope_releasing(then_val);
         builder.terminate(Terminator::Jump(merge_block));
+    } else {
+        builder.discard_scope();
     }
 
     // --- else branch ---
     builder.switch_to(else_block);
+    builder.push_scope();
     let else_val = lower_expr(else_br, builder, ctx);
     if !builder.is_current_block_terminated() {
         builder.emit(Instruction::Copy { dst: result_dst, src: else_val });
+        builder.pop_scope_releasing(else_val);
         builder.terminate(Terminator::Jump(merge_block));
+    } else {
+        builder.discard_scope();
     }
 
     builder.switch_to(merge_block);
+    // The kept branch result now lives in result_dst; it is owned by the enclosing
+    // scope so it is released there (or kept if it is the block's return value).
+    if result_is_rc {
+        builder.register_owned(result_dst, result_type.clone());
+    }
     result_dst
 }
 
