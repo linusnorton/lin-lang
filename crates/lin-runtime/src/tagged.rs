@@ -124,9 +124,12 @@ pub unsafe extern "C" fn lin_unbox_bool(p: *const u8) -> u8 {
     (*(p as *const TaggedVal)).payload as u8
 }
 
-/// Unbox a pointer payload (Str, Object, Array, Function).
+/// Unbox a pointer payload (Str, Object, Array, Function). A null TaggedVal* is the Json
+/// null value — unboxing it yields a null container pointer (safe-access: indexing null
+/// propagates null rather than dereferencing).
 #[no_mangle]
 pub unsafe extern "C" fn lin_unbox_ptr(p: *const u8) -> *mut u8 {
+    if p.is_null() { return std::ptr::null_mut(); }
     (*(p as *const TaggedVal)).payload as *mut u8
 }
 
