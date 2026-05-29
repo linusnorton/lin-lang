@@ -519,6 +519,9 @@ fn collect_mutable_capture_slots_expr(expr: &TypedExpr, out: &mut std::collectio
             collect_mutable_capture_slots_expr(left, out);
             collect_mutable_capture_slots_expr(right, out);
         }
+        TypedExpr::UnaryOp { operand, .. } => {
+            collect_mutable_capture_slots_expr(operand, out);
+        }
         TypedExpr::Coerce { expr, .. } | TypedExpr::LocalSet { value: expr, .. } => {
             collect_mutable_capture_slots_expr(expr, out);
         }
@@ -927,6 +930,23 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                 lhs,
                 rhs,
                 operand_ty,
+                ty: result_type.clone(),
+            });
+            dst
+        }
+
+        TypedExpr::UnaryOp { op, operand, result_type, .. } => {
+            // The only surface unary op is `~` (bitwise not), which maps to IR `Not`
+            // (codegen emits `build_not`).
+            let ir_op = match op {
+                lin_parse::ast::UnaryOp::BNot => crate::ir::UnaryOp::Not,
+            };
+            let src = lower_expr(operand, builder, ctx);
+            let dst = builder.alloc_temp(result_type.clone());
+            builder.emit(Instruction::Unary {
+                dst,
+                op: ir_op,
+                operand: src,
                 ty: result_type.clone(),
             });
             dst

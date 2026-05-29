@@ -3251,6 +3251,17 @@ impl<'ctx> Codegen<'ctx> {
             BinOp::GtEq => self.compile_cmp(lv, rv, lty, IntPredicate::SGE, IntPredicate::UGE, FloatPredicate::OGE),
             BinOp::And => self.builder.build_and(lv.into_int_value(), rv.into_int_value(), "ir_and").unwrap().into(),
             BinOp::Or => self.builder.build_or(lv.into_int_value(), rv.into_int_value(), "ir_or").unwrap().into(),
+            // Bitwise integer operators (§35.2). Operands are integers (checker-enforced)
+            // and widths have been reconciled above.
+            BinOp::BAnd => self.builder.build_and(lv.into_int_value(), rv.into_int_value(), "ir_band").unwrap().into(),
+            BinOp::BOr => self.builder.build_or(lv.into_int_value(), rv.into_int_value(), "ir_bor").unwrap().into(),
+            BinOp::BXor => self.builder.build_xor(lv.into_int_value(), rv.into_int_value(), "ir_bxor").unwrap().into(),
+            BinOp::Shl => self.builder.build_left_shift(lv.into_int_value(), rv.into_int_value(), "ir_shl").unwrap().into(),
+            // `>>` is arithmetic for signed types and logical for unsigned types.
+            BinOp::Shr => {
+                let sign_extend = lty.is_signed();
+                self.builder.build_right_shift(lv.into_int_value(), rv.into_int_value(), sign_extend, "ir_shr").unwrap().into()
+            }
         }
     }
 
