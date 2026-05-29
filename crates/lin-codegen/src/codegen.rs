@@ -7439,6 +7439,14 @@ impl<'ctx> Codegen<'ctx> {
                                 CallTarget::Indirect(fn_temp) => {
                                     if let Some(&cls_ptr) = temp_map.get(fn_temp) {
                                         if cls_ptr.is_pointer_value() {
+                                            // A callee retrieved as Json (e.g. from `arr[0]`) is a
+                                            // TaggedVal* wrapping the closure pointer — unbox it to
+                                            // the closure struct first.
+                                            let callee_ty = func.temp_types.get(fn_temp).cloned().unwrap_or(Type::Null);
+                                            let cls_ptr = if Self::is_union_type(&callee_ty) {
+                                                self.builder.build_call(self.rt_unbox_ptr, &[cls_ptr.into()], "ir_fn_unbox")
+                                                    .unwrap().try_as_basic_value().unwrap_basic()
+                                            } else { cls_ptr };
                                             // Build closure call: load fn_ptr from offset 2 of closure struct.
                                             let cls_ty = self.closure_struct_type();
                                             let cls_ptr_v = cls_ptr.into_pointer_value();

@@ -849,7 +849,14 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                 .iter()
                 .map(|e| {
                     let t = lower_expr(e, builder, ctx);
-                    coerce_to_slot_type(t, &e.ty(), &elem_ty, builder)
+                    let c = coerce_to_slot_type(t, &e.ty(), &elem_ty, builder);
+                    // The array takes ownership of heap elements; retain so the element's
+                    // scope-exit release doesn't free a value the array still holds (e.g. a
+                    // closure stored in an array that outlives the constructing function).
+                    if matches!(e.ty(), Type::Function { .. }) {
+                        builder.emit(Instruction::Retain { val: c, ty: e.ty() });
+                    }
+                    c
                 })
                 .collect();
             let dst = builder.alloc_temp(ty.clone());
