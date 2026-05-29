@@ -344,3 +344,23 @@ silent null call).
 Integration: **128/128** (AST and IR). Stdlib: **14/14** (AST and IR), **all 14 ASan-clean
 on the IR leg**. Non-skipped examples: all run on the IR leg. lin-ir unit tests: pass.
 The Milestone-1 parity gate is met — IR is at parity but still OFF by default.
+
+## Architectural note for Milestone 2 (legacy deletion blocker)
+
+The IR path currently compiles **only the main module** through `compile_module_from_ir`.
+Imported modules — the entire stdlib — are still compiled by the **AST** path via
+`register_import` → `compile_function_body` → `compile_expr`. The IR lowering of the main
+module resolves imported symbols to `Named` calls into those AST-compiled functions.
+
+Consequence: Phase 10 ("delete the legacy TypedAST path") **cannot** simply delete
+`compile_module`/`compile_expr` while `register_import` depends on them. Before legacy
+deletion, imports must be routed through the IR pipeline too (lower each imported
+`TypedModule` to a `LinModule` and codegen it via the IR path, or have `register_import`
+lower+emit per function through the IR instruction emitter). This is a prerequisite work
+item for Milestone 2, not covered by the original Phase 10 estimate.
+
+It also explains why several RC corner cases surfaced as AST-stdlib bugs masked by leaks:
+the AST-compiled stdlib leaks containers that the IR-compiled caller correctly releases,
+exposing latent AST use-after-frees (e.g. `std_path_join`'s borrowed `parts[0]`). Those have
+been fixed in the AST path directly (dup-on-projection in `TypedStmt::Var`), so both paths
+are now sound regardless of which compiles the stdlib.
