@@ -7256,6 +7256,10 @@ impl<'ctx> Codegen<'ctx> {
             ir_fn_to_llvm.insert(func.id, llvm_fn);
         }
 
+        // Module globals backing top-level non-function vals (GlobalValSet/Get), shared
+        // across all functions so closures can read module-level vals.
+        let mut ir_global_vals: StdMap<usize, inkwell::values::GlobalValue<'ctx>> = StdMap::new();
+
         // ---- Pass 2: compile each function body ----
         for func in &module.functions {
             let llvm_fn = ir_fn_to_llvm[&func.id];
@@ -7648,6 +7652,27 @@ impl<'ctx> Codegen<'ctx> {
                                 };
                                 temp_map.insert(*dst, result);
                             }
+                        }
+                        Instruction::GlobalValSet { slot, value, ty } => {
+                            if let Some(&v) = temp_map.get(value) {
+                                let llvm_ty = self.llvm_type(ty);
+                                let glob = *ir_global_vals.entry(*slot).or_insert_with(|| {
+                                    let g = self.module.add_global(llvm_ty, None, &format!("_ir_gv_{}", slot));
+                                    g.set_initializer(&llvm_ty.const_zero());
+                                    g
+                                });
+                                self.builder.build_store(glob.as_pointer_value(), v).unwrap();
+                            }
+                        }
+                        Instruction::GlobalValGet { dst, slot, ty } => {
+                            let llvm_ty = self.llvm_type(ty);
+                            let glob = *ir_global_vals.entry(*slot).or_insert_with(|| {
+                                let g = self.module.add_global(llvm_ty, None, &format!("_ir_gv_{}", slot));
+                                g.set_initializer(&llvm_ty.const_zero());
+                                g
+                            });
+                            let v = self.builder.build_load(llvm_ty, glob.as_pointer_value(), "ir_gvget").unwrap();
+                            temp_map.insert(*dst, v);
                         }
                         Instruction::MakeCell { dst, init, ty } => {
                             if let Some(&v) = temp_map.get(init) {

@@ -163,6 +163,12 @@ pub enum Instruction {
     /// result = a new (boxed) object containing all of `src`'s fields except `exclude`.
     /// Used by object rest destructuring (`val { a, ...rest } = obj`).
     ObjectRest { dst: Temp, src: Temp, src_ty: Type, exclude: Vec<String> },
+    /// Store a top-level (module-level) non-function `val` into a per-slot LLVM global so
+    /// closures can read it (they can't see `main`'s SSA temps). Emitted in `main`.
+    GlobalValSet { slot: usize, value: Temp, ty: Type },
+    /// dst = the module-global val for `slot` (load from its LLVM global). Used when a
+    /// closure references a top-level val that is neither a parameter nor a capture.
+    GlobalValGet { dst: Temp, slot: usize, ty: Type },
     /// dst = heap cell holding `init` (a `var` mutably captured by a closure). The cell
     /// pointer is shared by reference: closures capture it and read/write the live value
     /// through CellGet/CellSet (ADR-015). `ty` is the stored value's type.

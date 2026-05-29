@@ -44,6 +44,15 @@ pub fn lower_module(module: &TypedModule) -> LinModule {
         collect_mutable_capture_slots_stmt(stmt, &mut ctx.mutable_cell_slots);
     }
 
+    // Top-level non-function vals become module globals (so closures can read them).
+    for stmt in &module.statements {
+        if let TypedStmt::Val { slot, value, ty, .. } = stmt {
+            if !matches!(value, TypedExpr::Function { .. }) {
+                ctx.global_val_slots.insert(*slot, ty.clone());
+            }
+        }
+    }
+
     // Build the top-level "main" function containing module-level statements.
     let mut builder = FuncBuilder::new(main_id, None, vec![], false, Type::Int32, ctx.intrinsics.clone());
 
@@ -99,6 +108,9 @@ struct LowerCtx {
     /// heap cells (MakeCell) shared by reference; reads/writes go through CellGet/CellSet
     /// and closures capture the cell pointer (ADR-015).
     mutable_cell_slots: std::collections::HashSet<usize>,
+    /// Top-level non-function `val` slots (with their type). These are emitted as LLVM
+    /// globals so closures — which can't see `main`'s SSA temps — can read them.
+    global_val_slots: HashMap<usize, Type>,
 }
 
 impl LowerCtx {
@@ -112,6 +124,7 @@ impl LowerCtx {
             import_fn_slots: HashMap::new(),
             import_val_slots: HashMap::new(),
             mutable_cell_slots: std::collections::HashSet::new(),
+            global_val_slots: HashMap::new(),
         }
     }
 
@@ -529,6 +542,10 @@ fn lower_stmt(stmt: &TypedStmt, builder: &mut FuncBuilder, ctx: &mut LowerCtx) {
                 // see a TaggedVal*.
                 let t = coerce_to_slot_type(t, &value.ty(), ty, builder);
                 builder.slots.insert(*slot, t);
+                // Also publish top-level vals to their module global (for closure reads).
+                if ctx.global_val_slots.contains_key(slot) {
+                    builder.emit(Instruction::GlobalValSet { slot: *slot, value: t, ty: ty.clone() });
+                }
             }
         }
         TypedStmt::Var { slot, value, ty, .. } => {
@@ -728,6 +745,16 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                 });
                 if is_rc_type(&val_ty) {
                     builder.register_owned(dst, val_ty);
+                }
+                dst
+            } else if let Some(gty) = ctx.global_val_slots.get(slot).cloned() {
+                // A top-level val referenced where it isn't an in-scope temp (e.g. inside a
+                // closure) — load it from its module global.
+                let dst = builder.alloc_temp(gty.clone());
+                builder.emit(Instruction::GlobalValGet { dst, slot: *slot, ty: gty.clone() });
+                if is_rc_type(&gty) {
+                    builder.emit(Instruction::Retain { val: dst, ty: gty.clone() });
+                    builder.register_owned(dst, gty);
                 }
                 dst
             } else {
