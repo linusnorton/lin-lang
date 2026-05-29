@@ -7315,6 +7315,13 @@ impl<'ctx> Codegen<'ctx> {
                                 temp_map.insert(*dst, result);
                             }
                         }
+                        Instruction::IndexSet { object, key, value, obj_ty, key_ty, val_ty } => {
+                            if let (Some(&obj_v), Some(&key_v), Some(&val_v)) =
+                                (temp_map.get(object), temp_map.get(key), temp_map.get(value))
+                            {
+                                self.compile_ir_index_set(obj_v, key_v, val_v, obj_ty, key_ty, val_ty);
+                            }
+                        }
                         Instruction::FieldGet { dst, object, field, result_ty } => {
                             if let Some(&obj_v) = temp_map.get(object) {
                                 let result = self.compile_ir_field_get(obj_v, field, result_ty);
@@ -7509,6 +7516,18 @@ impl<'ctx> Codegen<'ctx> {
             } else {
                 return ptr_ty.const_null().into();
             };
+            // Flat scalar element: read the unboxed scalar directly (mirrors AST `flat_array_get`).
+            if Self::is_flat_scalar(result_ty) {
+                return self.flat_array_get(container, idx, result_ty);
+            }
+            // For TypeVar/Union result, use lin_array_get_tagged so the result is always
+            // a valid TaggedVal* regardless of whether the array is flat or tagged.
+            if Self::is_union_type(result_ty) {
+                let get_tagged_fn = self.get_or_declare_fn("lin_array_get_tagged",
+                    ptr_ty.fn_type(&[ptr_ty.into(), self.context.i64_type().into()], false));
+                return self.builder.build_call(get_tagged_fn, &[container.into(), idx.into()], "ir_aget_tv")
+                    .unwrap().try_as_basic_value().unwrap_basic();
+            }
             let tagged = self.builder.build_call(self.rt_array_get, &[container.into(), idx.into()], "ir_aget")
                 .unwrap().try_as_basic_value().unwrap_basic();
             return self.unbox_tagged_val_to_type(tagged, result_ty);
@@ -7525,6 +7544,61 @@ impl<'ctx> Codegen<'ctx> {
         let tagged = self.builder.build_call(self.rt_object_get, &[container.into(), key_str.into()], "ir_oget")
             .unwrap().try_as_basic_value().unwrap_basic();
         self.unbox_tagged_val_to_type(tagged, result_ty)
+    }
+
+    /// `object[key] = value` for the IR path. Mirrors the AST `compile_index_set`:
+    /// dispatch on the object's static type; for Json/union objects, dispatch at
+    /// runtime on the value's LLVM kind (pointer key ⇒ object set, int key ⇒ array set),
+    /// unboxing the boxed container first.
+    fn compile_ir_index_set(&mut self, obj: BasicValueEnum<'ctx>, key: BasicValueEnum<'ctx>, value: BasicValueEnum<'ctx>, obj_ty: &Type, _key_ty: &Type, val_ty: &Type) {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let i64_ty = self.context.i64_type();
+        let void_ty = self.context.void_type();
+        let tagged_val = self.build_tagged_val_alloca(&value, val_ty);
+        match obj_ty {
+            Type::Object(_) | Type::Named(_) => {
+                if obj.is_pointer_value() && key.is_pointer_value() {
+                    self.builder.build_call(self.rt_object_set,
+                        &[obj.into(), key.into(), tagged_val.into()], "").unwrap();
+                }
+            }
+            Type::Array(_) | Type::FixedArray(_) => {
+                let idx = self.index_value_to_i64(key);
+                let set_fn = self.get_or_declare_fn("lin_array_set",
+                    void_ty.fn_type(&[ptr_ty.into(), i64_ty.into(), ptr_ty.into()], false));
+                self.builder.build_call(set_fn, &[obj.into(), idx.into(), tagged_val.into()], "").unwrap();
+            }
+            Type::TypeVar(_) | Type::Union(_) => {
+                if !obj.is_pointer_value() { return; }
+                // Unbox the boxed container, then dispatch on the key's LLVM kind.
+                let container = self.builder.build_call(self.rt_unbox_ptr, &[obj.into()], "iset_unbox")
+                    .unwrap().try_as_basic_value().unwrap_basic();
+                if key.is_pointer_value() {
+                    // String (object) key.
+                    self.builder.build_call(self.rt_object_set,
+                        &[container.into(), key.into(), tagged_val.into()], "").unwrap();
+                } else if key.is_int_value() {
+                    let idx = self.index_value_to_i64(key);
+                    let set_fn = self.get_or_declare_fn("lin_array_set",
+                        void_ty.fn_type(&[ptr_ty.into(), i64_ty.into(), ptr_ty.into()], false));
+                    self.builder.build_call(set_fn, &[container.into(), idx.into(), tagged_val.into()], "").unwrap();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Normalise an index value (raw int or boxed TaggedVal*) to an i64.
+    fn index_value_to_i64(&mut self, key: BasicValueEnum<'ctx>) -> inkwell::values::IntValue<'ctx> {
+        if key.is_int_value() {
+            self.builder.build_int_s_extend_or_bit_cast(key.into_int_value(), self.context.i64_type(), "ir_idx64").unwrap()
+        } else if key.is_pointer_value() {
+            let i32_key = self.builder.build_call(self.rt_unbox_int32, &[key.into()], "ir_skey_i32")
+                .unwrap().try_as_basic_value().unwrap_basic().into_int_value();
+            self.builder.build_int_s_extend(i32_key, self.context.i64_type(), "ir_skey_i64").unwrap()
+        } else {
+            self.context.i64_type().const_zero()
+        }
     }
 
     fn compile_ir_field_get(&mut self, obj: BasicValueEnum<'ctx>, field: &str, result_ty: &Type) -> BasicValueEnum<'ctx> {

@@ -664,9 +664,22 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
             dst
         }
 
-        TypedExpr::IndexSet { .. } => {
-            // IndexSet is handled directly in codegen; lin-ir doesn't lower it.
-            builder.alloc_temp(Type::Null)
+        TypedExpr::IndexSet { object, key, value, obj_ty, .. } => {
+            let key_ty = key.ty();
+            let val_ty = value.ty();
+            let obj_temp = lower_expr(object, builder, ctx);
+            let key_temp = lower_expr(key, builder, ctx);
+            let val_temp = lower_expr(value, builder, ctx);
+            builder.emit(Instruction::IndexSet {
+                object: obj_temp,
+                key: key_temp,
+                value: val_temp,
+                obj_ty: obj_ty.clone(),
+                key_ty,
+                val_ty,
+            });
+            // IndexSet evaluates to Null.
+            builder.const_temp(Const::Null)
         }
     }
 }
