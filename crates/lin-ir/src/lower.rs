@@ -84,6 +84,123 @@ pub fn lower_module(module: &TypedModule) -> LinModule {
     }
 }
 
+/// Lower an IMPORTED TypedModule to a LinModule for the IR pipeline.
+///
+/// Unlike `lower_module`, this does NOT emit a `main`; instead it lowers every top-level
+/// exported binding so the importing module can resolve it by mangled symbol name:
+///   - exported FUNCTIONS become `LinFunction`s named `{module_key}_{name}`, compiled with
+///     their declared concrete signature (NOT the uniform boxed closure ABI) — the importer
+///     resolves them via `CallTarget::Named` and builds the call from the declared types.
+///   - exported NON-FUNCTION vals become zero-arg wrapper functions named
+///     `{module_key}_{name}__val` that recompute and return the value on each call (the
+///     importer reads them via a `Named` call). This mirrors the AST `register_import`
+///     contract exactly, so importers are agnostic to which backend compiled the import.
+///
+/// `module_key` is `mangle_module_key(path)`. Sibling references (function→function) resolve
+/// through `global_fn_slots` (Direct calls to the mangled symbols); cross-module imports,
+/// foreign bindings, and intrinsics resolve exactly as in the main lowering.
+pub fn lower_import_module(module: &TypedModule, module_key: &str) -> LinModule {
+    let mut ctx = LowerCtx::new();
+    ctx.intrinsics = module.intrinsics.clone();
+
+    // Pre-assign a FuncId + mangled symbol name to every top-level function so sibling
+    // Direct calls (and the importer's Named calls) resolve to the same symbol.
+    let mut global_fn_slots: HashMap<usize, FuncId> = HashMap::new();
+    let mut fn_names: HashMap<FuncId, String> = HashMap::new();
+    for stmt in &module.statements {
+        if let TypedStmt::Val {
+            slot,
+            value: TypedExpr::Function { name: Some(name), .. },
+            ..
+        } = stmt
+        {
+            let fid = ctx.alloc_func_id();
+            global_fn_slots.insert(*slot, fid);
+            fn_names.insert(fid, format!("{}_{}", module_key, name));
+        }
+    }
+    ctx.global_fn_slots = global_fn_slots.clone();
+
+    // Mutable-capture pre-scan (heap cells) — same as the main lowering.
+    for stmt in &module.statements {
+        collect_mutable_capture_slots_stmt(stmt, &mut ctx.mutable_cell_slots);
+    }
+
+    // Resolve this module's OWN imports/foreign bindings into the slot maps so function
+    // bodies can call them. We run the relevant arms of `lower_stmt` against a throwaway
+    // builder (Import/ForeignImport emit no instructions — they only populate ctx).
+    let mut resolver = FuncBuilder::new(
+        ctx.alloc_func_id(), None, vec![], false, Type::Null, ctx.intrinsics.clone(),
+    );
+    for stmt in &module.statements {
+        if matches!(stmt, TypedStmt::Import { .. } | TypedStmt::ForeignImport { .. }) {
+            lower_stmt(stmt, &mut resolver, &mut ctx);
+        }
+    }
+
+    // Lower each exported top-level function body under its forced mangled symbol name and
+    // pre-assigned FuncId. We need a host builder to call `lower_function_expr_with_id`,
+    // which appends the finished function to `ctx.pending_functions`.
+    let mut host = FuncBuilder::new(
+        ctx.alloc_func_id(), None, vec![], false, Type::Null, ctx.intrinsics.clone(),
+    );
+    host.push_scope();
+    for stmt in &module.statements {
+        if let TypedStmt::Val {
+            slot,
+            value: TypedExpr::Function { params, body, ret_type, captures, .. },
+            ..
+        } = stmt
+        {
+            if let Some(&fid) = ctx.global_fn_slots.get(slot) {
+                let mangled = fn_names.get(&fid).cloned();
+                lower_function_expr_with_id(
+                    Some(fid), None, mangled.as_deref(), params, body, ret_type, captures,
+                    &mut host, &mut ctx,
+                );
+            }
+        }
+    }
+    host.discard_scope();
+
+    // Emit a zero-arg `{module_key}_{name}__val` wrapper for each non-function exported val.
+    for stmt in &module.statements {
+        if let TypedStmt::Val { value, ty, name: Some(name), .. } = stmt {
+            if matches!(value, TypedExpr::Function { .. }) { continue; }
+            let fid = ctx.alloc_func_id();
+            let wrapper_name = format!("{}_{}__val", module_key, name);
+            let mut wb = FuncBuilder::new(
+                fid, Some(wrapper_name), vec![], false, ty.clone(), ctx.intrinsics.clone(),
+            );
+            wb.push_scope();
+            let t = lower_expr(value, &mut wb, &mut ctx);
+            let t = coerce_to_slot_type(t, &value.ty(), ty, &mut wb);
+            // The wrapper hands ownership of the computed value to the caller; keep it.
+            wb.pop_scope_releasing_keep(&[t]);
+            if !wb.is_current_block_terminated() {
+                if matches!(ty, Type::Null | Type::Never) {
+                    wb.terminate(Terminator::Return(None));
+                } else {
+                    wb.terminate(Terminator::Return(Some(t)));
+                }
+            }
+            wb.seal();
+            ctx.functions.push(wb.finish());
+        }
+    }
+
+    // Collect all lifted/nested functions produced during lowering.
+    while let Some(pending) = ctx.pending_functions.pop() {
+        ctx.functions.push(pending);
+    }
+
+    LinModule {
+        functions: ctx.functions,
+        global_fn_slots,
+        intrinsics: ctx.intrinsics,
+    }
+}
+
 // -------------------------------------------------------------------------
 // Context shared across the whole module lowering
 // -------------------------------------------------------------------------
@@ -436,7 +553,7 @@ fn collect_mutable_capture_slots_expr(expr: &TypedExpr, out: &mut std::collectio
 
 /// Mangle an import path into the LLVM symbol prefix codegen uses for that module's
 /// exports. Must match `register_import`'s `path.replace("/", "_").replace("-", "_")`.
-fn mangle_module_key(path: &str) -> String {
+pub fn mangle_module_key(path: &str) -> String {
     path.replace('/', "_").replace('-', "_")
 }
 
@@ -577,16 +694,26 @@ fn lower_stmt(stmt: &TypedStmt, builder: &mut FuncBuilder, ctx: &mut LowerCtx) {
             }
         }
         TypedStmt::Var { slot, value, ty, .. } => {
-            let t = lower_expr(value, builder, ctx);
-            let t = coerce_to_slot_type(t, &value.ty(), ty, builder);
             if ctx.mutable_cell_slots.contains(slot) {
                 // Mutably captured by a closure: store in a heap cell shared by reference.
                 // The slot maps to the cell-pointer temp; reads/writes go through it.
+                //
+                // Cell type: a `var x = null` is typed `Null` by the checker even when later
+                // reassigned to other types (the checker doesn't widen it). A `Null` cell
+                // would store/read a null pointer and box every read back to null. Promote
+                // such cells to `Json` (TypeVar) so the cell holds boxed values across the
+                // closure boundary — matching the AST path's pointer-cell model. Boxing of
+                // the init and of each reassigned value is handled by coerce_to_slot_type.
+                let cell_ty = if matches!(ty, Type::Null) { Type::TypeVar(u32::MAX) } else { ty.clone() };
+                let t = lower_expr(value, builder, ctx);
+                let t = coerce_to_slot_type(t, &value.ty(), &cell_ty, builder);
                 let cell = builder.alloc_temp(Type::TypeVar(u32::MAX));
-                builder.emit(Instruction::MakeCell { dst: cell, init: t, ty: ty.clone() });
-                builder.cell_slots.insert(*slot, ty.clone());
+                builder.emit(Instruction::MakeCell { dst: cell, init: t, ty: cell_ty.clone() });
+                builder.cell_slots.insert(*slot, cell_ty);
                 builder.slots.insert(*slot, cell);
             } else {
+                let t = lower_expr(value, builder, ctx);
+                let t = coerce_to_slot_type(t, &value.ty(), ty, builder);
                 // Plain mutable temp; tracked per var slot, updated on LocalSet.
                 builder.slots.insert(*slot, t);
             }
@@ -1181,10 +1308,25 @@ fn lower_intrinsic_call(
         "lin_to_string" => Intrinsic::ToString,
         "lin_length" => Intrinsic::Length,
         "lin_push" => Intrinsic::Push,
+        "lin_object_set" => Intrinsic::ObjectSetDyn,
+        "lin_array_set" => Intrinsic::ArraySetDyn,
+        "lin_keys" => Intrinsic::Keys,
+        "lin_value_key" => Intrinsic::ValueKey,
+        "lin_array_allocate" => Intrinsic::ArrayAllocate,
+        "lin_array_allocate_filled" => Intrinsic::ArrayAllocateFilled,
         "concat" => Intrinsic::Concat,
         "lin_async" => Intrinsic::Async,
         "lin_await" => Intrinsic::Await,
         "lin_exit" => Intrinsic::Exit,
+        "lin_parallel" => Intrinsic::Parallel,
+        "lin_race" => Intrinsic::Race,
+        "lin_timeout" => Intrinsic::Timeout,
+        "lin_retry" => Intrinsic::Retry,
+        "lin_thread_pool" => Intrinsic::ThreadPool,
+        "lin_worker" => Intrinsic::Worker,
+        "lin_request" => Intrinsic::Request,
+        "lin_message" => Intrinsic::Message,
+        "lin_close" => Intrinsic::Close,
         _ => {
             // Unknown intrinsic: lower as indirect call fallback.
             let lowered_args: Vec<Temp> = args.iter().map(|a| lower_expr(a, builder, ctx)).collect();
@@ -1715,6 +1857,24 @@ fn lower_reduce(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilde
 // If lowering
 // -------------------------------------------------------------------------
 
+/// Lower a condition expression to an i1 Bool temp. A condition whose static type is not
+/// already Bool (e.g. a call to an untyped `f: Function` predicate, which returns a boxed
+/// Json) is coerced — codegen lowers a Json→Bool Coerce via lin_unbox_bool. Without this,
+/// codegen's CondJump sees a non-i1 value and defaults the branch to `false`.
+fn lower_cond_as_bool(cond: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
+    let t = lower_expr(cond, builder, ctx);
+    let cond_ty = cond.ty();
+    if matches!(cond_ty, Type::Bool) {
+        t
+    } else {
+        let dst = builder.alloc_temp(Type::Bool);
+        builder.emit(Instruction::Coerce {
+            dst, src: t, from_ty: cond_ty, to_ty: Type::Bool,
+        });
+        dst
+    }
+}
+
 fn lower_if(
     cond: &TypedExpr,
     then_br: &TypedExpr,
@@ -1723,7 +1883,7 @@ fn lower_if(
     builder: &mut FuncBuilder,
     ctx: &mut LowerCtx,
 ) -> Temp {
-    let cond_temp = lower_expr(cond, builder, ctx);
+    let cond_temp = lower_cond_as_bool(cond, builder, ctx);
 
     let then_block = builder.alloc_block("if_then");
     let else_block = builder.alloc_block("if_else");
@@ -2242,14 +2402,23 @@ fn lower_function_expr_with_id(
             inner_builder.slots.insert(cap.outer_slot, cap_t);
             if cap.is_mutable {
                 // Inside the closure, this slot is a cell: reads/writes go through it.
-                inner_builder.cell_slots.insert(cap.outer_slot, cap.ty.clone());
+                // Promote a `Null`-typed cell to `Json` to match the outer MakeCell promotion
+                // (see TypedStmt::Var) — otherwise a `found = item` write would coerce the
+                // value to Null (storing a null pointer) and reads would always see null.
+                let inner_cell_ty = if matches!(cap.ty, Type::Null) { Type::TypeVar(u32::MAX) } else { cap.ty.clone() };
+                inner_builder.cell_slots.insert(cap.outer_slot, inner_cell_ty);
             }
         }
     }
 
     inner_builder.push_scope();
-    let body_ty = body.ty();
     let raw_ret = lower_expr(body, &mut inner_builder, ctx);
+    // Use the lowered temp's ACTUAL type for the return coercion, not the surface
+    // `body.ty()`. They can disagree when the body reads a mutably-captured `var` whose
+    // declared type was widened by reassignment: e.g. `var found = null; ...; found` has
+    // surface type `Null`, but the cell (and the CellGet temp) is `Json`. Trusting the
+    // stale `Null` would coerce the live Json value to a boxed null on return.
+    let body_ty = inner_builder.temp_types.get(&raw_ret).cloned().unwrap_or_else(|| body.ty());
     // Closure return ABI:
     // - `forced_ret` (set when this closure is a callback argument whose parameter declares
     //   a concrete return, e.g. groupBy's `keyFn: (Json) => String`): return exactly that
