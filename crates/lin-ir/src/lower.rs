@@ -307,6 +307,22 @@ fn is_union_ty(ty: &Type) -> bool {
     matches!(ty, Type::Union(_) | Type::TypeVar(_) | Type::Named(_))
 }
 
+/// Retain a Function-typed argument that is NOT a freshly-made closure before passing it
+/// to a call. AST-compiled callees release their Function-typed parameters at return; a
+/// borrowed (non-fresh) closure must be retained to balance that, while a fresh closure's
+/// existing +1 is consumed by the callee. Mirrors `call_global_fn`'s `arg_is_fn_owned`.
+fn retain_call_arg(arg: Temp, ty: &Type, _is_fresh: bool, builder: &mut FuncBuilder) {
+    if matches!(ty, Type::Function { .. }) {
+        builder.emit(Instruction::Retain { val: arg, ty: ty.clone() });
+    }
+}
+
+/// Whether an argument expression produces a freshly-allocated value (a function/closure
+/// literal or a call result) whose +1 reference can be transferred to a consuming callee.
+fn expr_is_fresh_alloc(expr: &TypedExpr) -> bool {
+    matches!(expr, TypedExpr::Function { .. } | TypedExpr::Call { .. })
+}
+
 /// Box a concrete argument when the callee's parameter is a Json/union type.
 /// Emits a `Coerce` (which codegen lowers to `build_tagged_val_alloca`) and returns the
 /// boxed temp; otherwise returns the argument temp unchanged. Mirrors the AST path's
@@ -722,7 +738,9 @@ fn lower_call(
                 .map(|(i, a)| {
                     let t = lower_expr(a, builder, ctx);
                     let param_ty = param_tys.get(i);
-                    lower_box_for_param(t, &a.ty(), param_ty, builder)
+                    let boxed = lower_box_for_param(t, &a.ty(), param_ty, builder);
+                    retain_call_arg(boxed, &a.ty(), expr_is_fresh_alloc(a), builder);
+                    boxed
                 })
                 .collect();
             let dst = builder.alloc_temp(result_type.clone());
