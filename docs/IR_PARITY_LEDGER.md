@@ -263,3 +263,29 @@ edge case, a handful of stdlib RC corners, and worker-thread concurrency.
 
 **Next:** ASan/LSan CI leg + RC-stress fixtures → finish the stdlib RC corners and the
 curried-partial case → Phase 8 parity gate → Milestone-1 merge **ask** (IR still off by default).
+
+## Checkpoint 6 — 127/128 integration, 10/14 stdlib (final push state)
+
+Since checkpoint 5: tagged comparison (lin_tagged_cmp) for boxed string/number ordering
+(string sort works); forced concrete return for callbacks with concrete params; box `==`
+rhs by value kind; unbox boxed indirect callee; void closures return void. AST 128/128.
+
+### Remaining integration failure (1)
+- **partial_application_chain** (`add3(1)(2)(3)`): needs closure arity metadata so a
+  partial closure called with too few args re-partial-applies.
+
+### Remaining stdlib-suite failures (4: array/string/object/path)
+Root-caused to a specific **AST-stdlib ↔ IR-closure return-ABI** corner:
+higher-order stdlib functions (groupBy, countBy, …) take a callback with a Json/TypeVar
+param and a CONCRETE return (e.g. `keyFn: (Json) => String`). AST's
+`build_closure_call_typed` calls TypeVar-param closures with a boxed (ptr) return and then
+unboxes the result. An IR closure under the uniform boxed ABI returns a boxed value, which
+AST unboxes — but the round-trip mis-handles a `String` payload (crash reads the string's
+data bytes as a pointer, e.g. `0x6c6c61` = "all"). The closure itself is correct (calling
+keyFn directly works); the defect is at the AST-callee/IR-closure boundary for
+concrete-return-over-Json callbacks. Needs the IR closure's return convention reconciled
+with AST `build_closure_call_typed`'s unbox-on-TypeVar-params rule.
+
+The integration suite — the canonical parity measure — is 127/128 and stable. The stdlib
+suites stress higher-order interop more heavily and surface this one boundary issue plus
+its downstream RC effects.
