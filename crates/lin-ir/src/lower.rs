@@ -1645,9 +1645,11 @@ fn lower_if(
     let then_raw = lower_expr(then_br, builder, ctx);
     if !builder.is_current_block_terminated() {
         // Coerce to the if's result representation so both phi inputs agree (e.g. an
-        // `Object` branch value boxed to a `Json` if-result).
+        // `Object` branch value boxed to a `Json` if-result). Keep BOTH the kept result
+        // and its raw pre-coercion temp: a box shares the underlying pointer, so releasing
+        // the original would free what the kept box wraps.
         let then_val = coerce_to_slot_type(then_raw, &then_br.ty(), result_type, builder);
-        builder.pop_scope_releasing(then_val);
+        builder.pop_scope_releasing_keep(&[then_val, then_raw]);
         incomings.push((then_val, builder.current_block));
         builder.terminate(Terminator::Jump(merge_block));
     } else {
@@ -1660,7 +1662,7 @@ fn lower_if(
     let else_raw = lower_expr(else_br, builder, ctx);
     if !builder.is_current_block_terminated() {
         let else_val = coerce_to_slot_type(else_raw, &else_br.ty(), result_type, builder);
-        builder.pop_scope_releasing(else_val);
+        builder.pop_scope_releasing_keep(&[else_val, else_raw]);
         incomings.push((else_val, builder.current_block));
         builder.terminate(Terminator::Jump(merge_block));
     } else {
