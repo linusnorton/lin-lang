@@ -232,3 +232,34 @@ application, TCO (incl. Int64), guards. **AST leg green (128/128) throughout; ~3
   guards; it should land before the parity gate.
 - Module-global vals in closures (unblocks async_val_capture).
 - Then the Phase 8 parity gate and the Milestone-1 merge **ask** (still off by default).
+
+## Checkpoint 5 — 127/128 integration (near-complete)
+
+Since checkpoint 4 (124): module-level vals as globals (async_val_capture + any closure
+over a module val), foreign-library link paths on the IR path (FFI), and void closures
+return void not boxed-Json (worker_request_reply + async stdlib). FFI example runs;
+11/12 non-network examples pass; 10/14 stdlib test files pass. AST leg 128/128 throughout.
+
+### Final integration failure (1)
+- **partial_application_chain** — `add3(1)(2)(3)`: a partial-application closure called
+  with fewer args than its remaining params must itself partially apply. Needs closure
+  arity metadata (e.g. stored in the closure struct's pad field) so the indirect call
+  site can detect under-application and build a nested partial. Localized but non-trivial.
+
+### Remaining stdlib test failures (4: array/string/object/path)
+Heap-corruption crashes (e.g. `object.rs:124 misaligned pointer`, payload looks like
+string bytes) under the heavy operation mix in the stdlib suites — RC-aliasing edge cases
+not hit by the integration tests. These are exactly what the planned ASan/LSan leg is
+meant to surface and pin down; recommend adding it before chasing them individually.
+
+### Net status vs. the plan
+All Phase 1–7 architecture is implemented and the IR path runs essentially the whole
+language: literals, operators (incl. mixed numeric), strings/interp, objects/arrays
+(flat + tagged), destructuring (+ rest), if/match (+ guards, literal/array/object
+patterns, value constraints), closures (captures, mutable-var cells, curried, HOF),
+partial application (one level), loops (for/while/map/filter/reduce/range/iter) as
+explicit IR blocks, TCO, async/await, FFI, imports. The remaining items are one curried
+edge case, a handful of stdlib RC corners, and worker-thread concurrency.
+
+**Next:** ASan/LSan CI leg + RC-stress fixtures → finish the stdlib RC corners and the
+curried-partial case → Phase 8 parity gate → Milestone-1 merge **ask** (IR still off by default).
