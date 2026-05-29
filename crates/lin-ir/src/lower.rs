@@ -1600,6 +1600,18 @@ fn lower_match_pattern(
             });
             PatternTest::Cond(dst)
         }
+        // `has [a, ...rest]`: array shape check — value is an array with at least the
+        // listed elements (rest ⇒ at-least, else exact).
+        TypedMatchPattern::Has(TypedPattern::Array { elements, rest, .. }) => {
+            let dst = builder.alloc_temp(Type::Bool);
+            builder.emit(Instruction::ArrayLenCheck {
+                dst,
+                val: scrut,
+                n: elements.len() as u64,
+                at_least: rest.is_some(),
+            });
+            PatternTest::Cond(dst)
+        }
         TypedMatchPattern::Has(tp) => {
             let required_fields = pattern_required_fields(tp);
             let dst = builder.alloc_temp(Type::Bool);
@@ -1654,7 +1666,7 @@ fn lower_typed_pattern_bindings(
                 }
             }
         }
-        TypedPattern::Array { elements, .. } => {
+        TypedPattern::Array { elements, rest, .. } => {
             // The scrutinee's static type (often Json/union for match arms) drives whether
             // codegen must unbox it before indexing.
             let scrut_ty = builder.temp_types.get(&scrut).cloned().unwrap_or(Type::TypeVar(u32::MAX));
@@ -1672,6 +1684,29 @@ fn lower_typed_pattern_bindings(
                     result_ty: elem_ty,
                 });
                 lower_typed_pattern_bindings(elem_pat, elem_t, builder);
+            }
+            // `...rest` binds the remaining elements as a new array (slice from N onward).
+            if let Some(rest_slot) = rest {
+                let rest_ty = Type::Array(Box::new(Type::TypeVar(u32::MAX)));
+                let start = builder.const_temp(Const::Int(elements.len() as i64, Type::Int64));
+                // scrut is a boxed Json array; unbox to a raw array for length + slicing.
+                let arr_raw = builder.alloc_temp(rest_ty.clone());
+                builder.emit(Instruction::Coerce {
+                    dst: arr_raw, src: scrut, from_ty: scrut_ty.clone(), to_ty: rest_ty.clone(),
+                });
+                let len = builder.alloc_temp(Type::Int64);
+                builder.emit(Instruction::CallIntrinsic {
+                    dst: len, intrinsic: Intrinsic::Length, args: vec![arr_raw], ret_ty: Type::Int64,
+                });
+                let dst = builder.alloc_temp(rest_ty.clone());
+                builder.emit(Instruction::Call {
+                    dst,
+                    callee: CallTarget::Named("lin_array_slice_tagged".to_string()),
+                    args: vec![arr_raw, start, len],
+                    ret_ty: rest_ty.clone(),
+                });
+                builder.register_owned(dst, rest_ty.clone());
+                builder.slots.insert(*rest_slot, dst);
             }
         }
         TypedPattern::TypeCheck(_, _) | TypedPattern::Literal(_) | TypedPattern::Wildcard(_) => {
