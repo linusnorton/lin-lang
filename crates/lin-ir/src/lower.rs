@@ -1870,9 +1870,13 @@ fn lower_match_pattern(
                 pattern: HasDesc { required_fields },
             });
             // For object fields with a value constraint (e.g. `has { "type": "success" }`),
-            // also require scrut[key] == literal, AND-ed into the condition.
+            // also require scrut[key] == literal, AND-ed into the condition. The transient
+            // comparison temps (boxed literal, fetched field) are scoped so they're released
+            // in THIS test block — not at the enclosing scope exit, which a per-arm test
+            // block does not dominate.
             if let TypedPattern::Object { fields, .. } = tp {
                 let scrut_ty = builder.temp_types.get(&scrut).cloned().unwrap_or(Type::TypeVar(u32::MAX));
+                builder.push_scope();
                 for field in fields {
                     if let Some(vp) = &field.value_pattern {
                         let lit_ty = vp.ty();
@@ -1898,6 +1902,9 @@ fn lower_match_pattern(
                         cond = combined;
                     }
                 }
+                // `cond` is a Bool (not RC), so it survives; only the transient RC temps
+                // (literal strings, fetched fields) are released here.
+                builder.pop_scope_releasing(Temp(u32::MAX));
             }
             PatternTest::Cond(cond)
         }
