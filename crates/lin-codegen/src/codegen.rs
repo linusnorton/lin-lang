@@ -7128,10 +7128,49 @@ impl<'ctx> Codegen<'ctx> {
             // Map Temp → LLVM value (populated as we emit instructions)
             let mut temp_map: StdMap<lir::Temp, BasicValueEnum<'ctx>> = StdMap::new();
 
-            // Pre-load params into temp_map
-            for (i, (temp, _ty)) in func.params.iter().enumerate() {
-                if let Some(param_val) = llvm_fn.get_nth_param(i as u32) {
-                    temp_map.insert(*temp, param_val);
+            // Self-tail-call (TCO) support: if any block ends in TailCall, route params
+            // through stack allocas so a tail call can update them and branch back to the
+            // function's first IR block (the loop header) instead of recursing on the stack.
+            let has_tail_call = func.blocks.iter().any(|b| matches!(b.terminator, Terminator::TailCall { .. }));
+            let mut param_allocs: Vec<PointerValue<'ctx>> = Vec::new();
+            if has_tail_call {
+                // Emit allocas + initial stores in a dedicated entry block that branches to
+                // the first IR block (which becomes the loop header).
+                let tco_entry = self.context.append_basic_block(llvm_fn, "tco_entry");
+                // Move the new entry before the first IR block so it is the function entry.
+                if let Some(first_ir_bb) = func.blocks.first().and_then(|b| ir_block_to_llvm.get(&b.id)) {
+                    tco_entry.move_before(*first_ir_bb).ok();
+                }
+                self.builder.position_at_end(tco_entry);
+                for (i, (_temp, ty)) in func.params.iter().enumerate() {
+                    let llvm_ty = self.llvm_type(ty);
+                    let slot = self.builder.build_alloca(llvm_ty, "tco_param").unwrap();
+                    if let Some(pv) = llvm_fn.get_nth_param(i as u32) {
+                        self.builder.build_store(slot, pv).unwrap();
+                    }
+                    param_allocs.push(slot);
+                }
+                if let Some(first_ir_bb) = func.blocks.first().and_then(|b| ir_block_to_llvm.get(&b.id)) {
+                    self.builder.build_unconditional_branch(*first_ir_bb).unwrap();
+                }
+            }
+
+            // Pre-load params into temp_map. With TCO, params are loaded from their allocas
+            // at the top of the loop-header block so each iteration sees the updated values.
+            if has_tail_call {
+                if let Some(first_ir_bb) = func.blocks.first().and_then(|b| ir_block_to_llvm.get(&b.id)) {
+                    self.builder.position_at_end(*first_ir_bb);
+                    for (i, (temp, ty)) in func.params.iter().enumerate() {
+                        let llvm_ty = self.llvm_type(ty);
+                        let loaded = self.builder.build_load(llvm_ty, param_allocs[i], "tco_pload").unwrap();
+                        temp_map.insert(*temp, loaded);
+                    }
+                }
+            } else {
+                for (i, (temp, _ty)) in func.params.iter().enumerate() {
+                    if let Some(param_val) = llvm_fn.get_nth_param(i as u32) {
+                        temp_map.insert(*temp, param_val);
+                    }
                 }
             }
 
@@ -7434,11 +7473,18 @@ impl<'ctx> Codegen<'ctx> {
                         self.builder.build_conditional_branch(cond_i1, then_bb, else_bb).unwrap();
                     }
                     Terminator::TailCall { args } => {
-                        // TCO: branch back to entry block with updated args (simplified).
-                        // For now, just re-call self as a tail call.
-                        let entry_bb = ir_block_to_llvm[&block.id]; // fallback
-                        let _ = (args, entry_bb);
-                        self.builder.build_unreachable().unwrap();
+                        // TCO: store the new argument values into the param allocas and
+                        // branch back to the loop header (the function's first IR block).
+                        for (i, arg_temp) in args.iter().enumerate() {
+                            if let (Some(&v), Some(slot)) = (temp_map.get(arg_temp), param_allocs.get(i)) {
+                                self.builder.build_store(*slot, v).unwrap();
+                            }
+                        }
+                        if let Some(first_ir_bb) = func.blocks.first().and_then(|b| ir_block_to_llvm.get(&b.id)) {
+                            self.builder.build_unconditional_branch(*first_ir_bb).unwrap();
+                        } else {
+                            self.builder.build_unreachable().unwrap();
+                        }
                     }
                     Terminator::Switch { val, cases, default } => {
                         if let Some(&v) = temp_map.get(val) {

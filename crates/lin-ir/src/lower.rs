@@ -134,6 +134,10 @@ struct FuncBuilder {
     /// Each frame holds (temp, type) pairs for freshly-allocated heap values
     /// introduced in the current scope that must be released on exit.
     scope_owned: Vec<Vec<(Temp, Type)>>,
+    /// Blocks that are dead continuations after a diverging TailCall. They carry a fresh
+    /// temp so `lower_expr` can return one, but control never reaches them; they must not
+    /// become phi predecessors of an enclosing if/match merge.
+    diverged_blocks: std::collections::HashSet<BlockId>,
 }
 
 impl FuncBuilder {
@@ -174,6 +178,7 @@ impl FuncBuilder {
             slots: HashMap::new(),
             intrinsic_slots,
             scope_owned: Vec::new(),
+            diverged_blocks: std::collections::HashSet::new(),
         }
     }
 
@@ -280,6 +285,11 @@ impl FuncBuilder {
 
     fn is_current_block_terminated(&self) -> bool {
         let id = self.current_block;
+        // A diverged (post-tail-call) block is effectively terminated: control never
+        // reaches it, so callers must not append a Jump or treat it as a phi predecessor.
+        if self.diverged_blocks.contains(&id) {
+            return true;
+        }
         self.blocks
             .iter()
             .find(|b| b.id == id)
@@ -780,6 +790,7 @@ fn lower_call(
                 builder.terminate(Terminator::TailCall { args: lowered_args.clone() });
                 // Dead block to keep IR valid.
                 let post = builder.alloc_block("tco_post");
+                builder.diverged_blocks.insert(post);
                 builder.switch_to(post);
                 return builder.alloc_temp(result_type.clone());
             }
@@ -801,6 +812,7 @@ fn lower_call(
     if is_tail {
         builder.terminate(Terminator::TailCall { args: lowered_args.clone() });
         let post = builder.alloc_block("tco_post");
+        builder.diverged_blocks.insert(post);
         builder.switch_to(post);
         return builder.alloc_temp(result_type.clone());
     }
@@ -1684,6 +1696,7 @@ fn lower_function_expr_with_id(
         slots: slot_to_temp,
         intrinsic_slots: builder.intrinsic_slots.clone(),
         scope_owned: Vec::new(),
+        diverged_blocks: std::collections::HashSet::new(),
     };
 
     // Add entry block.
