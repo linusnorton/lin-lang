@@ -992,9 +992,14 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
 /// boxed-return ABI.
 fn lower_call_arg(a: &TypedExpr, param_ty: Option<&Type>, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
     if let (TypedExpr::Function { name, params, body, ret_type, captures, .. },
-            Some(Type::Function { ret: cb_ret, .. })) = (a, param_ty)
+            Some(Type::Function { params: cb_params, ret: cb_ret })) = (a, param_ty)
     {
-        if !is_union_ty(cb_ret) && !matches!(**cb_ret, Type::Null | Type::Never) {
+        // Only force a concrete return when the callback's params are ALSO concrete. If any
+        // param is union/Json (TypeVar), the AST closure-call convention
+        // (build_closure_call_typed) calls with a boxed (ptr) return and unboxes — so the
+        // closure must keep the uniform boxed ABI, not a forced concrete return.
+        let concrete_params = cb_params.iter().all(|p| !is_union_ty(p));
+        if concrete_params && !is_union_ty(cb_ret) && !matches!(**cb_ret, Type::Null | Type::Never) {
             return lower_callback_arg(cb_ret, name.as_deref(), params, body, ret_type, captures, builder, ctx);
         }
     }
