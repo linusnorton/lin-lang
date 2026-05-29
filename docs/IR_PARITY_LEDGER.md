@@ -104,3 +104,44 @@ the scheduled phases rather than more hidden foundational gaps:
 | 6 (partial application) | 28 / 128 | under-applied Direct/Named calls (args < arity, Function result) now build a partial-application closure via a value-input port of `build_partial_application`. `add(5)(10)`→15. 100 passing. AST leg 128/128. |
 | 6b (narrowed LocalGet unbox) | 27 / 128 | a Json slot narrowed to a concrete type in a match arm (e.g. `is String => x`) read the boxed value without unboxing → null/garbage. `LocalGet` now emits a `Coerce` when the stored slot type is union but the use wants concrete. 101 passing. AST leg 128/128. |
 | 6c (closure env + uniform return) | 27 / 128 | closures capturing values crashed: env reads used `lin_object_get` on the raw env struct, and a closure returning a concrete scalar was called via the opaque-Function ABI expecting a ptr return. Added an `EnvCapture` IR instruction (raw struct load at offset 8+i*8) and made closures use a uniform boxed (Json) return ABI. Capturing-param closures work (`adder(10)(5)`→15); mutable var-capture-by-ref still pending. 101 passing. AST leg 128/128. |
+
+## Status checkpoint (Phases 1–7 substantially complete)
+
+**IR-leg integration: 103 / 128 passing** (from a 7/128 baseline). AST leg: **128/128
+throughout**. ~21 commits, each verified.
+
+Architecture delivered (Option B):
+- Import/foreign call resolution; top-level FuncId fix; ToString-by-type.
+- Index/IndexSet/FieldGet carry object/key types; box/unbox at boundaries; flat vs
+  tagged array reads.
+- **Phi-based SSA merge** (if-exprs, match) with deferred back-edge backpatch.
+- **Loops as explicit IR blocks** (for/while/map/filter/reduce/range) + ArrayAlloc/
+  FlatArray intrinsics; callback ABI (box args to Json params, uniform boxed closure
+  return, re-box union arithmetic).
+- **Closures**: EnvCapture instruction (raw env-struct load); capture-less wrapping;
+  uniform boxed return ABI.
+- **TCO**: structural TailCall loop transform (param allocas + header reload).
+- **Partial application** (value-input port).
+- Heap-boxing of escaping values; Function-arg retain to balance callee consume;
+  narrowed-slot unbox; Val/Var + array-element coercion to declared representation;
+  mixed int/float widening; literal-pattern value equality.
+
+### Remaining failures (25), by area
+- **Closures / curry / mutable var-capture (≈5):** closures_and_var,
+  multiple_closures_share_var, higher_order_functions, partial_application_chain,
+  forward_reference_in_closure. Curried-closure return ABI when the inner fn type is
+  inferred; mutable `var` captured by reference (heap cell) not yet modelled in IR.
+- **Array pattern / rest destructuring (≈4):** array_pattern_matching_is/has,
+  array_rest_destructuring, object_rest_destructuring. Rest slicing + array-pattern
+  binding need IR support.
+- **Async / concurrency (≈5):** async_await_basic, async_val_capture,
+  parallel_three_thunks, thread_pool_async, worker_request_reply. IR codegen for
+  async/await/exit exists; the stdlib wrappers are still AST-compiled, so full parity
+  needs the IR path to compile imports too (or the wrapper RC interaction resolved).
+- **Iterators (2):** iter_builtin, iterator_restart — `lin_iter` not yet lowered.
+- **Heterogeneous-literal boxing (≈3):** tagged_unions, tostring_objects_and_arrays,
+  speculative_reads_typed_union — boolean (and null) boxing inside mixed Json arrays.
+- **stdlib array fns (2):** stdlib_array_find_some_every, flatmap_indexof_reverse.
+- **FFI / fs (2):** ffi_end_to_end_c_library, fs_read_lines.
+- **TCO (1):** tail_call_optimization — a specific shape still failing (basic + deep TCO work).
+- **pattern_matching_has (1).**
