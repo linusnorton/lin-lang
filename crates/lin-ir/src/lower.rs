@@ -664,9 +664,15 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                 Type::Array(inner) => *inner.clone(),
                 _ => Type::Null,
             };
+            // Coerce each element to the array's element representation. For a Json/union
+            // element type (heterogeneous array) this boxes each concrete element to a
+            // TaggedVal*, so codegen can push them uniformly.
             let lowered: Vec<Temp> = elements
                 .iter()
-                .map(|e| lower_expr(e, builder, ctx))
+                .map(|e| {
+                    let t = lower_expr(e, builder, ctx);
+                    coerce_to_slot_type(t, &e.ty(), &elem_ty, builder)
+                })
                 .collect();
             let dst = builder.alloc_temp(ty.clone());
             builder.emit(Instruction::MakeArray {
