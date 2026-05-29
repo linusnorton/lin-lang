@@ -8059,6 +8059,28 @@ impl<'ctx> Codegen<'ctx> {
         lty: &Type,
         result_ty: &Type,
     ) -> BasicValueEnum<'ctx> {
+        // Mixed int/float arithmetic (e.g. `5 + 3.0`): widen the integer operand to float
+        // so both sides agree, and dispatch on the float type. The checker permits these
+        // numeric combinations without inserting explicit Coerce nodes on both operands.
+        if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div
+            | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq | BinOp::Eq | BinOp::NotEq)
+            && lv.is_int_value() != rv.is_int_value()
+            && (lv.is_float_value() || rv.is_float_value())
+            && (lv.is_int_value() || lv.is_float_value())
+            && (rv.is_int_value() || rv.is_float_value())
+        {
+            let f64_ty = self.context.f64_type();
+            let to_f = |s: &Self, v: BasicValueEnum<'ctx>| -> BasicValueEnum<'ctx> {
+                if v.is_int_value() {
+                    s.builder.build_signed_int_to_float(v.into_int_value(), f64_ty, "ir_i2f").unwrap().into()
+                } else {
+                    s.builder.build_float_cast(v.into_float_value(), f64_ty, "ir_fwiden").unwrap().into()
+                }
+            };
+            let lf = to_f(self, lv);
+            let rf = to_f(self, rv);
+            return self.compile_binary_op_values(lf, rf, op, &Type::Float64, result_ty);
+        }
         // When operands are boxed (Json/union), use tagged runtime ops for equality and
         // ordering (which tolerate mixed/null payloads), and unbox to a concrete numeric
         // type for arithmetic. Mirrors the AST path's TypeVar handling in compile_binary_op.
