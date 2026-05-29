@@ -276,6 +276,17 @@ impl FuncBuilder {
         }
     }
 
+    /// Pop the current scope frame, releasing all owned temps except those in `keep`.
+    fn pop_scope_releasing_keep(&mut self, keep: &[Temp]) {
+        if let Some(frame) = self.scope_owned.pop() {
+            for (t, ty) in frame {
+                if !keep.contains(&t) {
+                    self.emit(Instruction::Release { val: t, ty });
+                }
+            }
+        }
+    }
+
     /// Pop the current ownership scope without emitting releases. Used when the block
     /// is already terminated (e.g. ends in a tail call or return), so any cleanup
     /// would be unreachable / handled by the terminating construct.
@@ -1959,8 +1970,10 @@ fn lower_function_expr_with_id(
     } else {
         raw_ret
     };
-    // Release owned temps in function scope except the return value.
-    inner_builder.pop_scope_releasing(ret_temp);
+    // Release owned temps in function scope except the return value AND the raw
+    // pre-coercion temp: a box (e.g. lin_box_object) shares the underlying pointer, so
+    // releasing the original would free what the returned box wraps.
+    inner_builder.pop_scope_releasing_keep(&[ret_temp, raw_ret]);
     if !inner_builder.is_current_block_terminated() {
         inner_builder.terminate(Terminator::Return(Some(ret_temp)));
     }
