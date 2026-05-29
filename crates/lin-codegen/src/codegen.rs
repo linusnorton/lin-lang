@@ -7233,7 +7233,13 @@ impl<'ctx> Codegen<'ctx> {
                                 .iter()
                                 .filter_map(|a| temp_map.get(a).copied())
                                 .collect();
-                            let result = self.compile_ir_intrinsic(intrinsic, &arg_vals, ret_ty);
+                            // Recover each argument's static type so intrinsics can
+                            // dispatch correctly (e.g. ToString of Str vs tagged ptr).
+                            let arg_tys: Vec<Type> = args
+                                .iter()
+                                .map(|a| func.temp_types.get(a).cloned().unwrap_or(Type::Null))
+                                .collect();
+                            let result = self.compile_ir_intrinsic(intrinsic, &arg_vals, &arg_tys, ret_ty);
                             temp_map.insert(*dst, result);
                         }
                         Instruction::MakeObject { dst, fields, spreads, ty } => {
@@ -7430,7 +7436,7 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
-    fn compile_ir_intrinsic(&mut self, intrinsic: &lir::Intrinsic, args: &[BasicValueEnum<'ctx>], ret_ty: &Type) -> BasicValueEnum<'ctx> {
+    fn compile_ir_intrinsic(&mut self, intrinsic: &lir::Intrinsic, args: &[BasicValueEnum<'ctx>], arg_tys: &[Type], ret_ty: &Type) -> BasicValueEnum<'ctx> {
         use lir::Intrinsic;
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         match intrinsic {
@@ -7442,7 +7448,8 @@ impl<'ctx> Codegen<'ctx> {
             }
             Intrinsic::ToString => {
                 let arg = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
-                self.compile_to_string_value(arg, ret_ty)
+                let in_ty = arg_tys.first().cloned().unwrap_or(Type::Null);
+                self.compile_to_string_value(arg, &in_ty)
             }
             Intrinsic::Length => {
                 if let Some(&arr) = args.first() {
@@ -7738,23 +7745,12 @@ impl<'ctx> Codegen<'ctx> {
     }
 
     /// Compile a `toString` call on a typed value (used by LinIR intrinsic path).
-    fn compile_to_string_value(&mut self, val: BasicValueEnum<'ctx>, _ty: &Type) -> BasicValueEnum<'ctx> {
-        let ptr_ty = self.context.ptr_type(AddressSpace::default());
-        if val.is_pointer_value() {
-            self.builder.build_call(self.rt_tagged_to_string, &[val.into()], "ir_ts")
-                .unwrap().try_as_basic_value().unwrap_basic()
-        } else if val.is_int_value() {
-            let i64_ty = self.context.i64_type();
-            let ext = self.builder.build_int_z_extend_or_bit_cast(val.into_int_value(), i64_ty, "ts_ext").unwrap();
-            self.builder.build_call(self.rt_int_to_string, &[ext.into()], "ir_its")
-                .unwrap().try_as_basic_value().unwrap_basic()
-        } else if val.is_float_value() {
-            let fv = val.into_float_value();
-            let f64_ty = self.context.f64_type();
-            let ext = self.builder.build_float_cast(fv, f64_ty, "ts_fext").unwrap();
-            self.builder.build_call(self.rt_float_to_string, &[ext.into()], "ir_fts")
-                .unwrap().try_as_basic_value().unwrap_basic()
-        } else { ptr_ty.const_null().into() }
+    /// Stringify a value for the IR path. Delegates to the type-driven
+    /// `value_to_string_simple` so that Str returns as-is, numerics use the right
+    /// width, and tagged/Array/Object values use the correct runtime dispatch.
+    /// `ty` MUST be the input value's type, not the (always-Str) result type.
+    fn compile_to_string_value(&mut self, val: BasicValueEnum<'ctx>, ty: &Type) -> BasicValueEnum<'ctx> {
+        self.value_to_string_simple(val, ty)
     }
 
     fn compile_is_check(

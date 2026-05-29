@@ -60,3 +60,4 @@ a prerequisite for any program to run on the IR path.
 | 0 (baseline) | 121 / 128 | starting point |
 | 1a (import resolution) | 83 / 128 | resolve import/foreign slots to `Named` targets + box concrete args to Json params; 45 passing. AST leg still 128/128. |
 | 1b (top-level fn FuncId) | 77 / 128 | top-level fn vals reused a fresh FuncId instead of the pre-assigned `global_fn_slots` id (Direct calls panicked); also main must be FuncId(0). 51 passing. AST leg 128/128. |
+| 1c (ToString by input type) | 74 / 128 | `compile_to_string_value` dispatched on LLVM value kind, treating `Str` as a tagged ptr (broke string interp). Thread arg types into `compile_ir_intrinsic`; delegate to type-driven `value_to_string_simple`. 54 passing. AST leg 128/128. |
