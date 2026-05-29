@@ -53,6 +53,35 @@ real `Named` targets for import/foreign-import slots; (b) THEN the intrinsic-nam
 catalogue; (c) CI scaffolding. Item (a) was not in the approved plan's Phase 1 and is
 a prerequisite for any program to run on the IR path.
 
+## Remaining failures after Phase 1 foundation (74)
+
+Bucketed against the plan's later phases — confirms the remaining work maps onto
+the scheduled phases rather than more hidden foundational gaps:
+
+- **Loops / iteration (Phase 4):** for_and_range, map_filter_reduce, iter_builtin,
+  iterator_restart, chaining, multiline_chain, stdlib_array_* — control-flow
+  intrinsics still lower to no-ops (`_ => null`).
+- **Pattern matching / match (Phase 4):** pattern_matching_is/has,
+  array_pattern_matching_*, tagged_unions, string_literal_pattern,
+  non_exhaustive_match_error, tco_in_match, match_with_block_body.
+- **Partial application (Phase 6):** functions_and_partial_application,
+  dot_partial_application, partial_application_chain, higher_order_functions.
+- **TCO (Phase 7):** tail_call_optimization, recursion, recursive_fibonacci,
+  mutual_recursion_via_forward_decl.
+- **Async (Phase 5):** async_await_basic, async_val_capture, parallel_three_thunks,
+  thread_pool_async, worker_request_reply.
+- **Closures/var:** closures_and_var, multiple_closures_share_var,
+  forward_reference_in_closure.
+- **fs/http/server (need investigation — may share a common cause):** fs_*, http_*,
+  server_*, io_lines/io_read.
+- **Misc to investigate:** equality, not_equal, numeric_comparison, string_comparison,
+  if_expressions, if_block_branches, chained_if_else, continuation_*,
+  index_assign (IndexSet — Phase 2), keys_values_entries, push_and_concat,
+  nested_objects_access, object_equality_deep, object/array_rest_destructuring,
+  is_has_as_boolean_expressions, speculative_reads_typed_union, multi_param_lambda,
+  multi_statement_*_lambda/paren, interp_with_expressions, array_oob_error,
+  mixed_numeric_operations.
+
 ## Progress log
 
 | Phase | IR-leg failures | Notes |
