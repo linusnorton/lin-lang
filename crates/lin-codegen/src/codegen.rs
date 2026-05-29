@@ -966,6 +966,67 @@ impl<'ctx> Codegen<'ctx> {
     /// Named functions have signature `(T1, T2, ...) -> R` (no env_ptr).
     /// The closure ABI expects `(ptr env, T1, T2, ...) -> R`.
     /// We generate a wrapper `__cls_wrap_N(ptr _env, T1, T2, ...) -> R` that forwards the call.
+    /// IR-path variant of `wrap_named_fn_as_closure`: the wrapper returns a boxed
+    /// TaggedVal* (ptr), matching the uniform closure ABI the IR indirect-call path uses
+    /// (where every closure returns Json and the caller unboxes). The wrapped function's
+    /// concrete scalar/pointer return is boxed before returning.
+    fn wrap_named_fn_as_closure_boxed(&mut self, named_fn: FunctionValue<'ctx>) -> BasicValueEnum<'ctx> {
+        let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
+        let named_ret_ty = named_fn.get_type().get_return_type();
+        let mut wrapper_param_types: Vec<BasicMetadataTypeEnum> = vec![ptr_ty.into()];
+        for i in 0..named_fn.count_params() {
+            wrapper_param_types.push(named_fn.get_nth_param(i).unwrap().get_type().into());
+        }
+        // Uniform ABI: always return ptr.
+        let wrapper_fn_ty = ptr_ty.fn_type(&wrapper_param_types, false);
+        let wrapper_name = format!("__cls_wrapb_{}", named_fn.get_name().to_str().unwrap_or("fn"));
+        let wrapper_fn = if let Some(existing) = self.module.get_function(&wrapper_name) {
+            existing
+        } else {
+            let wf = self.module.add_function(&wrapper_name, wrapper_fn_ty, None);
+            let saved_block = self.builder.get_insert_block().unwrap();
+            let entry = self.context.append_basic_block(wf, "entry");
+            self.builder.position_at_end(entry);
+            let fwd_args: Vec<BasicMetadataValueEnum> = (1..wf.count_params())
+                .map(|i| wf.get_nth_param(i).unwrap().into())
+                .collect();
+            let call = self.builder.build_call(named_fn, &fwd_args, "wfwd").unwrap();
+            // Box the concrete return to a TaggedVal* using the LLVM return kind.
+            let boxed: BasicValueEnum<'ctx> = match named_ret_ty {
+                Some(rt) => {
+                    let rv = call.try_as_basic_value().basic().unwrap();
+                    let lin_ty = if rt.is_int_type() {
+                        match rt.into_int_type().get_bit_width() { 1 => Type::Bool, 8 => Type::Int8, 16 => Type::Int16, 64 => Type::Int64, _ => Type::Int32 }
+                    } else if rt.is_float_type() {
+                        if rt.into_float_type() == self.context.f32_type() { Type::Float32 } else { Type::Float64 }
+                    } else {
+                        // Already a pointer (Str/Array/Object/Json) — box as-is via TypeVar dispatch.
+                        Type::TypeVar(u32::MAX)
+                    };
+                    if matches!(lin_ty, Type::TypeVar(_)) { rv } else { self.box_value(rv, &lin_ty) }
+                }
+                None => ptr_ty.const_null().into(),
+            };
+            self.builder.build_return(Some(&boxed)).unwrap();
+            self.builder.position_at_end(saved_block);
+            wf
+        };
+        // Build {rc, _pad, fn_ptr, null_env} closure struct.
+        let lin_alloc_fn = self.get_or_declare_fn("lin_alloc",
+            ptr_ty.fn_type(&[self.context.i64_type().into()], false));
+        let cls_mem = self.builder.build_call(lin_alloc_fn,
+            &[self.context.i64_type().const_int(32, false).into()], "wnfnb_cls")
+            .unwrap().try_as_basic_value().unwrap_basic().into_pointer_value();
+        let cls_ty = self.closure_struct_type();
+        let rc_field = self.builder.build_struct_gep(cls_ty, cls_mem, 0, "wnfnb_rc").unwrap();
+        self.builder.build_store(rc_field, self.context.i32_type().const_int(1, false)).unwrap();
+        let fn_field = self.builder.build_struct_gep(cls_ty, cls_mem, 2, "wnfnb_fp").unwrap();
+        self.builder.build_store(fn_field, wrapper_fn.as_global_value().as_pointer_value()).unwrap();
+        let env_field = self.builder.build_struct_gep(cls_ty, cls_mem, 3, "wnfnb_ep").unwrap();
+        self.builder.build_store(env_field, ptr_ty.const_null()).unwrap();
+        cls_mem.into()
+    }
+
     fn wrap_named_fn_as_closure(&mut self, named_fn: FunctionValue<'ctx>, _param_ty: &Type) -> BasicValueEnum<'ctx> {
         let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
 
@@ -7358,14 +7419,27 @@ impl<'ctx> Codegen<'ctx> {
                                                 fn_param_types.push(self.llvm_param_type(&arg_ty));
                                                 call_args.push((*av).into());
                                             }
-                                            let fn_ty = if matches!(ret_ty, Type::Null | Type::Never) {
+                                            // Closures use the uniform boxed ABI: they always
+                                            // return a TaggedVal* (ptr), except Null/void.
+                                            // Call with a ptr return, then unbox to ret_ty.
+                                            let returns_void = matches!(ret_ty, Type::Null | Type::Never);
+                                            let fn_ty = if returns_void {
                                                 void_ty.fn_type(&fn_param_types, false)
                                             } else {
-                                                self.llvm_type(ret_ty).fn_type(&fn_param_types, false)
+                                                ptr_ty.fn_type(&fn_param_types, false)
                                             };
                                             let call = self.builder.build_indirect_call(fn_ty, fn_ptr, &call_args, "ir_ind").unwrap();
-                                            if matches!(ret_ty, Type::Null | Type::Never) { ptr_ty.const_null().into() }
-                                            else { call.try_as_basic_value().unwrap_basic() }
+                                            if returns_void {
+                                                ptr_ty.const_null().into()
+                                            } else {
+                                                let boxed = call.try_as_basic_value().unwrap_basic();
+                                                // Unbox to the expected concrete type; leave union/Json as the TaggedVal*.
+                                                if Self::is_union_type(ret_ty) {
+                                                    boxed
+                                                } else {
+                                                    self.unbox_tagged_val_to_type(boxed, ret_ty)
+                                                }
+                                            }
                                         } else { ptr_ty.const_null().into() }
                                     } else { ptr_ty.const_null().into() }
                                 }
@@ -7446,9 +7520,10 @@ impl<'ctx> Codegen<'ctx> {
                             if let Some(&callee_fn) = ir_fn_to_llvm.get(fid) {
                                 let cls = if captures.is_empty() {
                                     // The target was lowered as a non-closure (no env param 0),
-                                    // but closure call sites invoke fn_ptr(env, args...). Wrap it
-                                    // in an env-ignoring stub so the closure ABI lines up.
-                                    self.wrap_named_fn_as_closure(callee_fn, &Type::Null)
+                                    // but closure call sites invoke fn_ptr(env, args...) -> ptr.
+                                    // Wrap it in an env-ignoring stub that also boxes the return,
+                                    // matching the uniform boxed closure ABI.
+                                    self.wrap_named_fn_as_closure_boxed(callee_fn)
                                 } else {
                                     // Captures present ⇒ the function has an env param 0; build
                                     // the env struct and store the raw fn ptr.
