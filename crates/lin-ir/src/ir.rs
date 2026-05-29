@@ -121,8 +121,10 @@ pub enum Instruction {
     Copy { dst: Temp, src: Temp },
     /// result = unary op applied to operand
     Unary { dst: Temp, op: UnaryOp, operand: Temp, ty: Type },
-    /// result = lhs op rhs
-    Binary { dst: Temp, op: BinOp, lhs: Temp, rhs: Temp, ty: Type },
+    /// result = lhs op rhs. `operand_ty` is the type of the operands (needed for
+    /// equality/comparison dispatch, e.g. object/array deep equality); `ty` is the
+    /// result type.
+    Binary { dst: Temp, op: BinOp, lhs: Temp, rhs: Temp, operand_ty: Type, ty: Type },
     /// result = coerce(src, from_ty, to_ty)
     Coerce { dst: Temp, src: Temp, from_ty: Type, to_ty: Type },
     /// result = callee(args...)

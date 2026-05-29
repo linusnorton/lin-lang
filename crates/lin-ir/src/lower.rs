@@ -515,6 +515,9 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
         }
 
         TypedExpr::BinaryOp { left, op, right, result_type, .. } => {
+            // The operand type drives equality/comparison dispatch (e.g. object/array
+            // deep equality); it differs from result_type for comparisons (which yield Bool).
+            let operand_ty = left.ty();
             let lhs = lower_expr(left, builder, ctx);
             let rhs = lower_expr(right, builder, ctx);
             let dst = builder.alloc_temp(result_type.clone());
@@ -523,6 +526,7 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                 op: *op,
                 lhs,
                 rhs,
+                operand_ty,
                 ty: result_type.clone(),
             });
             dst

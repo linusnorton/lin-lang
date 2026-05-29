@@ -7157,10 +7157,10 @@ impl<'ctx> Codegen<'ctx> {
                                 temp_map.insert(*dst, v);
                             }
                         }
-                        Instruction::Binary { dst, op, lhs, rhs, ty } => {
+                        Instruction::Binary { dst, op, lhs, rhs, operand_ty, ty } => {
                             let lv = temp_map.get(lhs).copied().unwrap_or_else(|| ptr_ty.const_null().into());
                             let rv = temp_map.get(rhs).copied().unwrap_or_else(|| ptr_ty.const_null().into());
-                            let result = self.compile_binary_op_values(lv, rv, op, ty, ty);
+                            let result = self.compile_binary_op_values(lv, rv, op, operand_ty, ty);
                             temp_map.insert(*dst, result);
                         }
                         Instruction::Retain { val, .. } => {
