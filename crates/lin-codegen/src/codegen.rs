@@ -2915,6 +2915,75 @@ impl<'ctx> Codegen<'ctx> {
         if let Type::Function { params, .. } = func.ty() { params } else { vec![] }
     }
 
+    /// Value-input port of `build_partial_application` for the LinIR path: the partial
+    /// arguments arrive as already-compiled LLVM values rather than TypedExprs. Builds a
+    /// closure {wrapper_fn, env} capturing the partials; the wrapper loads them and calls
+    /// `llvm_fn` with partials ++ remaining params.
+    fn build_partial_application_values(
+        &mut self,
+        llvm_fn: FunctionValue<'ctx>,
+        compiled_partials: &[BasicValueEnum<'ctx>],
+        remaining_params: &[Type],
+        final_ret: &Type,
+    ) -> BasicValueEnum<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+
+        let env_field_types: Vec<BasicTypeEnum> = compiled_partials.iter().map(|v| v.get_type()).collect();
+        let env_struct_ty = self.context.struct_type(&env_field_types, false);
+        let env_size = env_struct_ty.size_of().unwrap();
+        let env_size_i64 = self.builder.build_int_z_extend_or_bit_cast(env_size, self.context.i64_type(), "papp_env_sz").unwrap();
+        let env_ptr = self.builder.build_call(self.rt_alloc, &[env_size_i64.into()], "papp_env")
+            .unwrap().try_as_basic_value().unwrap_basic().into_pointer_value();
+        for (i, val) in compiled_partials.iter().enumerate() {
+            let field = self.builder.build_struct_gep(env_struct_ty, env_ptr, i as u32, "papp_f").unwrap();
+            self.builder.build_store(field, *val).unwrap();
+        }
+
+        let wrapper_name = format!("__papp_ir_{}", self.closure_count);
+        self.closure_count += 1;
+        let mut wrapper_param_tys: Vec<BasicMetadataTypeEnum> = vec![ptr_ty.into()];
+        for p in remaining_params {
+            wrapper_param_tys.push(self.llvm_type(p).into());
+        }
+        let ret_llvm = self.llvm_type(final_ret);
+        let wrapper_fn_ty = ret_llvm.fn_type(&wrapper_param_tys, false);
+        let wrapper_fn = self.module.add_function(&wrapper_name, wrapper_fn_ty, None);
+
+        let cls_struct_ty = self.closure_struct_type();
+        let cls_ptr = self.builder.build_call(self.rt_alloc, &[self.context.i64_type().const_int(32, false).into()], "papp_cls")
+            .unwrap().try_as_basic_value().unwrap_basic().into_pointer_value();
+        let rc_field = self.builder.build_struct_gep(cls_struct_ty, cls_ptr, 0, "papp_cls_rc").unwrap();
+        self.builder.build_store(rc_field, self.context.i32_type().const_int(1, false)).unwrap();
+        let fn_field = self.builder.build_struct_gep(cls_struct_ty, cls_ptr, 2, "papp_cls_fn").unwrap();
+        self.builder.build_store(fn_field, wrapper_fn.as_global_value().as_pointer_value()).unwrap();
+        let env_field = self.builder.build_struct_gep(cls_struct_ty, cls_ptr, 3, "papp_cls_env").unwrap();
+        self.builder.build_store(env_field, env_ptr).unwrap();
+
+        let current_block = self.builder.get_insert_block().unwrap();
+        {
+            let entry = self.context.append_basic_block(wrapper_fn, "entry");
+            self.builder.position_at_end(entry);
+            let env_arg = wrapper_fn.get_nth_param(0).unwrap().into_pointer_value();
+            let mut call_args: Vec<BasicMetadataValueEnum> = Vec::new();
+            for (i, field_ty) in env_field_types.iter().enumerate() {
+                let fp = self.builder.build_struct_gep(env_struct_ty, env_arg, i as u32, "papp_load_f").unwrap();
+                let v = self.builder.build_load(*field_ty, fp, "papp_v").unwrap();
+                call_args.push(v.into());
+            }
+            for i in 0..remaining_params.len() {
+                let p = wrapper_fn.get_nth_param(1 + i as u32).unwrap();
+                call_args.push(p.into());
+            }
+            let call = self.builder.build_call(llvm_fn, &call_args, "papp_call").unwrap();
+            match call.try_as_basic_value().basic() {
+                Some(v) => { self.builder.build_return(Some(&v)).unwrap(); }
+                None => { self.builder.build_return(None).unwrap(); }
+            }
+        }
+        self.builder.position_at_end(current_block);
+        cls_ptr.into()
+    }
+
     fn build_indirect_call(
         &mut self,
         fn_val: BasicValueEnum<'ctx>,
@@ -7233,18 +7302,40 @@ impl<'ctx> Codegen<'ctx> {
                                 .iter()
                                 .filter_map(|a| temp_map.get(a).map(|v| (*v).into()))
                                 .collect();
+                            // Detect under-application: fewer args than the callee's arity
+                            // and a Function result type ⇒ build a partial-application closure.
+                            let partial_app = |s: &mut Self, callee_fn: FunctionValue<'ctx>| -> Option<BasicValueEnum<'ctx>> {
+                                if (arg_vals.len() as u32) < callee_fn.count_params() {
+                                    if let Type::Function { params: remaining, ret: final_ret } = ret_ty {
+                                        let vals: Vec<BasicValueEnum> = arg_vals.iter().map(|a| match a {
+                                            BasicMetadataValueEnum::IntValue(v) => (*v).into(),
+                                            BasicMetadataValueEnum::FloatValue(v) => (*v).into(),
+                                            BasicMetadataValueEnum::PointerValue(v) => (*v).into(),
+                                            _ => s.context.ptr_type(AddressSpace::default()).const_null().into(),
+                                        }).collect();
+                                        return Some(s.build_partial_application_values(callee_fn, &vals, remaining, final_ret));
+                                    }
+                                }
+                                None
+                            };
                             let result = match callee {
                                 CallTarget::Direct(fid) => {
                                     let callee_fn = ir_fn_to_llvm[fid];
-                                    let call = self.builder.build_call(callee_fn, &arg_vals, "call").unwrap();
-                                    if matches!(ret_ty, Type::Null | Type::Never) { ptr_ty.const_null().into() }
-                                    else { call.try_as_basic_value().unwrap_basic() }
+                                    if let Some(p) = partial_app(self, callee_fn) { p }
+                                    else {
+                                        let call = self.builder.build_call(callee_fn, &arg_vals, "call").unwrap();
+                                        if matches!(ret_ty, Type::Null | Type::Never) { ptr_ty.const_null().into() }
+                                        else { call.try_as_basic_value().unwrap_basic() }
+                                    }
                                 }
                                 CallTarget::Named(name) => {
                                     if let Some(callee_fn) = self.module.get_function(name) {
-                                        let call = self.builder.build_call(callee_fn, &arg_vals, "call_n").unwrap();
-                                        if matches!(ret_ty, Type::Null | Type::Never) { ptr_ty.const_null().into() }
-                                        else { call.try_as_basic_value().unwrap_basic() }
+                                        if let Some(p) = partial_app(self, callee_fn) { p }
+                                        else {
+                                            let call = self.builder.build_call(callee_fn, &arg_vals, "call_n").unwrap();
+                                            if matches!(ret_ty, Type::Null | Type::Never) { ptr_ty.const_null().into() }
+                                            else { call.try_as_basic_value().unwrap_basic() }
+                                        }
                                     } else { ptr_ty.const_null().into() }
                                 }
                                 CallTarget::Indirect(fn_temp) => {
