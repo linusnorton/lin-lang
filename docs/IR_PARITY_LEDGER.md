@@ -417,3 +417,38 @@ All are subtle RC/ABI corners in the IR-compiled stdlib, exposed because the IR 
 - **array.test**: `array_to_json_string` overflows a Vec — a nested array's `len` field is
   corrupted (toString of nested arrays), pointing at a container RC/transfer bug.
 - **template.test**: not yet root-caused.
+
+## Checkpoint 9 — IR-compiled imports COMPLETE (full parity)
+
+The import migration is done. Imported modules (the whole stdlib) compile through the LinIR
+pipeline; the IR path no longer depends on the AST `compile_function_body`/`compile_expr`.
+
+### Status
+- **Integration: 128/128 on BOTH legs.**
+- **Stdlib: 14/14 on BOTH legs**, and **all 14 ASan-clean on the IR leg.**
+- Non-skipped examples run on the IR leg; lin-ir unit tests pass; AST leg fully green.
+
+### Final batch of fixes (beyond checkpoint 8)
+- **resolve_lin_str** (runtime): compare the full leading u64 (not byte 0) to tell a boxed
+  TaggedVal from a raw LinString — a string whose refcount low-byte == TAG_STR(6) no longer
+  mis-unboxes (the IR path's deferred releases push refcounts higher than the AST path).
+- **Runtime key-tag Index dispatch**: for `obj[k]` where obj is Json and k is a runtime-boxed
+  value, branch on the key's tag (int → array get, string → object get). Fixes `arr[j]` where
+  arr is a captured Json and j is a boxed loop variable (chunk / nested loops returned nulls).
+- **push / array_set / object_set element ownership**: a fresh element transfers its +1 into
+  the container (codegen doesn't retain / the object_set box-release cancels its retain); a
+  borrowed element is retained. Fixes zip, groupBy, fromCodePoints (`[[null,null],…]` / UAFs).
+- **match arm returning the scrutinee**: transfer the scrutinee's ownership out of the
+  enclosing scope so it isn't released while still live as the match result.
+- **Is(Object) pattern**: `is { "type": "error", .. }` now uses the object field-check path
+  (HasPattern + value constraints), shared with `has`. The generic `Is` arm did a bare tag
+  check against `Type::Never`'s tag (0xFF), so object patterns never matched — `render` on a
+  missing file took the wrong arm and returned garbage.
+- **lin_tagged_retain** + tag-aware IR `Retain` for union temps (lin_rc_retain would corrupt
+  the tag byte at offset 0 of a TaggedVal).
+- **Cross-module FuncId collision** (checkpoint 8): per-module `ir_anon_prefix` on
+  `__lin_fn_<id>` symbols.
+
+### Milestone 2 is now UNBLOCKED
+Phase 10 (delete the legacy AST path) can proceed: `register_import` no longer needs the AST
+compiler. `compile_import_from_ir` is the IR-path import compiler.

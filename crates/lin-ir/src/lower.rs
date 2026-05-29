@@ -2159,6 +2159,14 @@ fn lower_match_pattern(
             });
             PatternTest::Cond(dst)
         }
+        // Object pattern (`is { "type": "error", "message": _ }`): the value must be an
+        // object that HAS the listed fields, with any value-constrained fields matching.
+        // This mirrors the `has { .. }` object handling below. The generic `Is(tp)` arm's
+        // bare `IsType` is wrong here — `pattern_type_check` maps an object pattern to
+        // `Type::Never`, whose tag constant is 0xFF, so the tag check would never match.
+        TypedMatchPattern::Is(tp @ TypedPattern::Object { .. }) => {
+            lower_object_pattern_test(tp, scrut, builder, ctx)
+        }
         TypedMatchPattern::Is(tp) => {
             let (check_ty, _) = pattern_type_check(tp);
             let dst = builder.alloc_temp(Type::Bool);
@@ -2181,54 +2189,64 @@ fn lower_match_pattern(
             });
             PatternTest::Cond(dst)
         }
-        TypedMatchPattern::Has(tp) => {
-            let required_fields = pattern_required_fields(tp);
-            let mut cond = builder.alloc_temp(Type::Bool);
-            builder.emit(Instruction::HasPattern {
-                dst: cond,
-                val: scrut,
-                pattern: HasDesc { required_fields },
-            });
-            // For object fields with a value constraint (e.g. `has { "type": "success" }`),
-            // also require scrut[key] == literal, AND-ed into the condition. The transient
-            // comparison temps (boxed literal, fetched field) are scoped so they're released
-            // in THIS test block — not at the enclosing scope exit, which a per-arm test
-            // block does not dominate.
-            if let TypedPattern::Object { fields, .. } = tp {
-                let scrut_ty = builder.temp_types.get(&scrut).cloned().unwrap_or(Type::TypeVar(u32::MAX));
-                builder.push_scope();
-                for field in fields {
-                    if let Some(vp) = &field.value_pattern {
-                        let lit_ty = vp.ty();
-                        let lit_raw = lower_expr(vp, builder, ctx);
-                        let lit = box_to_json(lit_raw, &lit_ty, builder);
-                        // got = scrut[key]
-                        let key_temp = builder.const_temp(Const::Str(field.key.clone()));
-                        let got = builder.alloc_temp(Type::TypeVar(u32::MAX));
-                        builder.emit(Instruction::Index {
-                            dst: got, object: scrut, key: key_temp,
-                            obj_ty: scrut_ty.clone(), key_ty: Type::Str, result_ty: Type::TypeVar(u32::MAX),
-                        });
-                        let eq = builder.alloc_temp(Type::Bool);
-                        builder.emit(Instruction::Binary {
-                            dst: eq, op: BinOp::Eq, lhs: got, rhs: lit,
-                            operand_ty: Type::TypeVar(u32::MAX), ty: Type::Bool,
-                        });
-                        let combined = builder.alloc_temp(Type::Bool);
-                        builder.emit(Instruction::Binary {
-                            dst: combined, op: BinOp::And, lhs: cond, rhs: eq,
-                            operand_ty: Type::Bool, ty: Type::Bool,
-                        });
-                        cond = combined;
-                    }
-                }
-                // `cond` is a Bool (not RC), so it survives; only the transient RC temps
-                // (literal strings, fetched fields) are released here.
-                builder.pop_scope_releasing(Temp(u32::MAX));
-            }
-            PatternTest::Cond(cond)
-        }
+        TypedMatchPattern::Has(tp) => lower_object_pattern_test(tp, scrut, builder, ctx),
     }
+}
+
+/// Lower an object pattern test (`is`/`has { k: v, .. }`): the scrutinee must be an object
+/// that HAS the listed fields, with each value-constrained field equal to its literal. Used
+/// by both `Is(Object)` and `Has(Object)` — for an object shape check the two are equivalent
+/// (tag-is-object + required fields + value constraints).
+fn lower_object_pattern_test(
+    tp: &TypedPattern,
+    scrut: Temp,
+    builder: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+) -> PatternTest {
+    let required_fields = pattern_required_fields(tp);
+    let mut cond = builder.alloc_temp(Type::Bool);
+    builder.emit(Instruction::HasPattern {
+        dst: cond,
+        val: scrut,
+        pattern: HasDesc { required_fields },
+    });
+    // For object fields with a value constraint (e.g. `{ "type": "success" }`), also require
+    // scrut[key] == literal, AND-ed into the condition. The transient comparison temps (boxed
+    // literal, fetched field) are scoped so they're released in THIS test block — not at the
+    // enclosing scope exit, which a per-arm test block does not dominate.
+    if let TypedPattern::Object { fields, .. } = tp {
+        let scrut_ty = builder.temp_types.get(&scrut).cloned().unwrap_or(Type::TypeVar(u32::MAX));
+        builder.push_scope();
+        for field in fields {
+            if let Some(vp) = &field.value_pattern {
+                let lit_ty = vp.ty();
+                let lit_raw = lower_expr(vp, builder, ctx);
+                let lit = box_to_json(lit_raw, &lit_ty, builder);
+                // got = scrut[key]
+                let key_temp = builder.const_temp(Const::Str(field.key.clone()));
+                let got = builder.alloc_temp(Type::TypeVar(u32::MAX));
+                builder.emit(Instruction::Index {
+                    dst: got, object: scrut, key: key_temp,
+                    obj_ty: scrut_ty.clone(), key_ty: Type::Str, result_ty: Type::TypeVar(u32::MAX),
+                });
+                let eq = builder.alloc_temp(Type::Bool);
+                builder.emit(Instruction::Binary {
+                    dst: eq, op: BinOp::Eq, lhs: got, rhs: lit,
+                    operand_ty: Type::TypeVar(u32::MAX), ty: Type::Bool,
+                });
+                let combined = builder.alloc_temp(Type::Bool);
+                builder.emit(Instruction::Binary {
+                    dst: combined, op: BinOp::And, lhs: cond, rhs: eq,
+                    operand_ty: Type::Bool, ty: Type::Bool,
+                });
+                cond = combined;
+            }
+        }
+        // `cond` is a Bool (not RC), so it survives; only the transient RC temps
+        // (literal strings, fetched fields) are released here.
+        builder.pop_scope_releasing(Temp(u32::MAX));
+    }
+    PatternTest::Cond(cond)
 }
 
 /// After a pattern test succeeds, bind pattern variables into slots.
