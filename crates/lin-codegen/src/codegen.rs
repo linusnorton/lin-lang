@@ -7574,6 +7574,35 @@ impl<'ctx> Codegen<'ctx> {
                                 temp_map.insert(*dst, result);
                             }
                         }
+                        Instruction::ObjectRest { dst, src, src_ty, exclude } => {
+                            if let Some(&src_v) = temp_map.get(src) {
+                                // Unbox a boxed Json object to the raw LinObject*.
+                                let src_obj = if Self::is_union_type(src_ty) && src_v.is_pointer_value() {
+                                    self.builder.build_call(self.rt_unbox_ptr, &[src_v.into()], "orest_unbox")
+                                        .unwrap().try_as_basic_value().unwrap_basic()
+                                } else { src_v };
+                                let rest_obj = self.builder.build_call(self.rt_object_alloc,
+                                    &[i32_ty.const_int(4, false).into()], "orest")
+                                    .unwrap().try_as_basic_value().unwrap_basic().into_pointer_value();
+                                let exclude_fn = self.get_or_declare_fn("lin_object_copy_except",
+                                    void_ty.fn_type(&[ptr_ty.into(), ptr_ty.into(), ptr_ty.into(), i32_ty.into()], false));
+                                let n_exc = exclude.len() as u32;
+                                let arr_ty = ptr_ty.array_type(n_exc.max(1));
+                                let keys_arr = self.builder.build_alloca(arr_ty, "orest_keys").unwrap();
+                                for (i, key) in exclude.iter().enumerate() {
+                                    let key_str = self.compile_string_lit(key);
+                                    let gep = unsafe { self.builder.build_gep(arr_ty, keys_arr,
+                                        &[i32_ty.const_zero(), i32_ty.const_int(i as u64, false)], "orest_kp").unwrap() };
+                                    self.builder.build_store(gep, key_str).unwrap();
+                                }
+                                let keys_ptr = self.builder.build_pointer_cast(keys_arr, ptr_ty, "orest_kps").unwrap();
+                                self.builder.build_call(exclude_fn,
+                                    &[rest_obj.into(), src_obj.into(), keys_ptr.into(), i32_ty.const_int(n_exc as u64, false).into()], "").unwrap();
+                                let boxed = self.builder.build_call(self.rt_box_object, &[rest_obj.into()], "orest_boxed")
+                                    .unwrap().try_as_basic_value().unwrap_basic();
+                                temp_map.insert(*dst, boxed);
+                            }
+                        }
                         Instruction::ArrayLenCheck { dst, val, n, at_least } => {
                             if let Some(&v) = temp_map.get(val) {
                                 let result = if v.is_pointer_value() {

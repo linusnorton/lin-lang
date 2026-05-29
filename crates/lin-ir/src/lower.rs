@@ -445,6 +445,7 @@ fn lower_stmt(stmt: &TypedStmt, builder: &mut FuncBuilder, ctx: &mut LowerCtx) {
             obj_slot,
             value,
             fields,
+            rest,
             obj_ty,
             ..
         } => {
@@ -462,6 +463,19 @@ fn lower_stmt(stmt: &TypedStmt, builder: &mut FuncBuilder, ctx: &mut LowerCtx) {
                     result_ty: field_ty.clone(),
                 });
                 builder.slots.insert(*binding_slot, dst);
+            }
+            // `...rest` binds a new object with all fields except the destructured ones.
+            if let Some(rest_slot) = rest {
+                let rest_ty = Type::TypeVar(u32::MAX);
+                let dst = builder.alloc_temp(rest_ty.clone());
+                builder.emit(Instruction::ObjectRest {
+                    dst,
+                    src: obj_temp,
+                    src_ty: dobj_ty.clone(),
+                    exclude: fields.iter().map(|(name, _, _)| name.clone()).collect(),
+                });
+                builder.register_owned(dst, rest_ty);
+                builder.slots.insert(*rest_slot, dst);
             }
             let _ = obj_ty;
         }

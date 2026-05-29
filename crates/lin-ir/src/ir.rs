@@ -160,6 +160,9 @@ pub enum Instruction {
     /// result = (val is an array) && (len(val) == n)  [exact], or `>= n` when `at_least`.
     /// Used to test array patterns in match (`is [a, b]`). `val` is a boxed TaggedVal*.
     ArrayLenCheck { dst: Temp, val: Temp, n: u64, at_least: bool },
+    /// result = a new (boxed) object containing all of `src`'s fields except `exclude`.
+    /// Used by object rest destructuring (`val { a, ...rest } = obj`).
+    ObjectRest { dst: Temp, src: Temp, src_ty: Type, exclude: Vec<String> },
     /// Increment refcount of a heap value (string, array, object, closure env).
     Retain { val: Temp, ty: Type },
     /// Decrement refcount; free if zero. Only emitted for owned values.
