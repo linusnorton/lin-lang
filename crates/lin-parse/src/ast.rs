@@ -204,10 +204,12 @@ pub enum BinOp {
     Shr,
 }
 
-/// Unary operators. `~` (bitwise not) is the only unary operator in the language.
+/// Unary operators: `~` (bitwise not) and `!` (logical not). Both prefix,
+/// right-associative, at the same precedence (tighter than `*`, looser than postfix).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum UnaryOp {
     BNot,
+    Not,
 }
 
 #[derive(Debug, Clone)]

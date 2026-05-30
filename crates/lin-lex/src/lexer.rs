@@ -532,7 +532,7 @@ impl Lexer {
                     self.pos += 1;
                     TokenKind::NotEq
                 } else {
-                    TokenKind::Ident("!".to_string())
+                    TokenKind::Bang
                 }
             }
             '<' => {
