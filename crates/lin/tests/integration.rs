@@ -3678,6 +3678,59 @@ val c: Array<Array<Int32>> = [[1, 2], [3, 4]]
 }
 
 #[test]
+fn test_generic_alias_single_param() {
+    // A user generic type alias `Box<T>` type-checks AND runs end-to-end: the param `T` is
+    // bound while resolving the declaration body, so `Box<Int32>` substitutes correctly.
+    let out = run(r#"import { print } from "std/io"
+type Box<T> = { "value": T }
+val a: Box<Int32> = { "value": 5 }
+print("${a["value"]}")
+"#);
+    assert_eq!(out, vec!["5"]);
+}
+
+#[test]
+fn test_generic_alias_nested_application() {
+    // Nested application `Box<Box<Int32>>`: substitution recurses through the alias body.
+    let out = run(r#"import { print } from "std/io"
+type Box<T> = { "value": T }
+val b: Box<Box<Int32>> = { "value": { "value": 7 } }
+print("${b["value"]["value"]}")
+"#);
+    assert_eq!(out, vec!["7"]);
+}
+
+#[test]
+fn test_generic_alias_multi_param() {
+    // A multi-param alias `Pair<A, B>`: each param resolves independently at the use-site.
+    let out = run(r#"import { print } from "std/io"
+type Pair<A, B> = { "fst": A, "snd": B }
+val p: Pair<Int32, String> = { "fst": 3, "snd": "hi" }
+print("${p["fst"]} ${p["snd"]}")
+"#);
+    assert_eq!(out, vec!["3 hi"]);
+}
+
+#[test]
+fn test_generic_tagged_union_match_has() {
+    // A multi-param GENERIC TAGGED UNION `Result<T, E>` consumed with match/has: substitution
+    // applies inside every union variant, and field-presence narrowing discriminates them.
+    let out = run(r#"import { print } from "std/io"
+type Result<T, E> = { "value": T } | { "error": E }
+val describe = (r: Result<Int32, String>): String =>
+  match r
+    has { "value" } => "ok:${r["value"]}"
+    has { "error" } => "err:${r["error"]}"
+    else => "?"
+val ok: Result<Int32, String> = { "value": 42 }
+val bad: Result<Int32, String> = { "error": "boom" }
+print(describe(ok))
+print(describe(bad))
+"#);
+    assert_eq!(out, vec!["ok:42", "err:boom"]);
+}
+
+#[test]
 fn test_uint8_flat_array_roundtrip() {
     // UInt8[] is an unboxed flat byte array: literals, length, index, push and print all
     // round-trip values without wrapping (255 stays 255, not -1).

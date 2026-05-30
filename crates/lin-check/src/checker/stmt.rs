@@ -187,8 +187,27 @@ impl Checker {
             } => {
                 // The placeholder was registered in forward_declare_types.
                 // Now resolve the actual body; self-references stay as Named(name) (cycle guard).
-                let resolved = resolve_type(body, &self.env)
-                    .map_err(|e| Diagnostic::error(*span, e))?;
+                //
+                // For a generic alias (`type Box<T> = ...`), the params (`T`, `E`, ...) are not
+                // real types — they must survive resolution as `Type::Named("T")` so that
+                // `substitute` (resolve.rs) can replace them at each use-site (`Box<Int32>`).
+                // We bind each param into a scratch env as a self-referential type decl (body
+                // `Named(param)`); `resolve_named_cycle` then leaves it as `Named(param)` via the
+                // same cycle guard used for the alias's own self-references. Without this, a bare
+                // `T` in the body resolves as `Unknown type 'T'` and the body is never stored.
+                let resolved = if params.is_empty() {
+                    resolve_type(body, &self.env).map_err(|e| Diagnostic::error(*span, e))?
+                } else {
+                    let mut scratch = self.env.clone();
+                    for param in params {
+                        scratch.define_type(
+                            param.clone(),
+                            Vec::new(),
+                            Type::Named(param.clone()),
+                        );
+                    }
+                    resolve_type(body, &scratch).map_err(|e| Diagnostic::error(*span, e))?
+                };
                 self.env
                     .define_type(name.clone(), params.clone(), resolved);
                 // Type declarations produce no runtime code
