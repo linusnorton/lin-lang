@@ -191,8 +191,7 @@ pub unsafe extern "C" fn lin_object_get(obj: *const LinObject, key: *const LinSt
 #[no_mangle]
 pub unsafe extern "C" fn lin_object_merge(dst: *mut LinObject, src: *const LinObject) {
     if src.is_null() {
-        eprintln!("Runtime error: cannot spread null into object");
-        std::process::exit(1);
+        crate::fault::runtime_fault("Runtime error: cannot spread null into object");
     }
     let src_len = (*src).len;
     for i in 0..src_len {

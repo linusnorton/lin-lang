@@ -5,6 +5,7 @@
 pub mod array;
 pub mod async_rt;
 pub mod env;
+pub mod fault;
 pub mod fs;
 pub mod http;
 pub mod io;

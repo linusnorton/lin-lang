@@ -47,7 +47,7 @@ impl<'ctx> Codegen<'ctx> {
         let wf = self.module.add_function(&wrapper_name, wrapper_fn_ty, None);
         // User-emitted Lin functions never unwind (value-based errors), and this wrapper
         // only forwards + boxes — mark it nounwind like other emitted functions.
-        self.add_fn_attrs(wf, &["nounwind"]);
+        self.mark_user_fn_nounwind(wf);
         let saved_block = self.builder.get_insert_block();
         let entry = self.context.append_basic_block(wf, "entry");
         self.builder.position_at_end(entry);
@@ -149,7 +149,7 @@ impl<'ctx> Codegen<'ctx> {
         // application is callable through an opaque Function value like any other closure.
         let wrapper_fn_ty = ptr_ty.fn_type(&wrapper_param_tys, false);
         let wrapper_fn = self.module.add_function(&wrapper_name, wrapper_fn_ty, None);
-        self.add_fn_attrs(wrapper_fn, &["nounwind"]);
+        self.mark_user_fn_nounwind(wrapper_fn);
 
         let cls_struct_ty = self.closure_struct_type();
         // 40 bytes: closure header (32) + descriptor slot at offset 32 (null here — a partial
@@ -244,7 +244,7 @@ impl<'ctx> Codegen<'ctx> {
         }
         let wrapper_fn_ty = ptr_ty.fn_type(&wrapper_param_types, false);
         let wrapper_fn = self.module.add_function(&wrapper_name, wrapper_fn_ty, None);
-        self.add_fn_attrs(wrapper_fn, &["nounwind"]);
+        self.mark_user_fn_nounwind(wrapper_fn);
 
         let saved_block = self.builder.get_insert_block().unwrap();
         let wrapper_entry = self.context.append_basic_block(wrapper_fn, "entry");
