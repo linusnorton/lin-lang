@@ -1,7 +1,10 @@
 import { handleIndex, handleStatus, handleUser } from "./handlers"
 import { pathMatch } from "std/http"
 
-export val router = (req: Json): Json =>
+// Requests have a known shape; responses are the handlers' `Json` results.
+type Request = { "method": String, "path": String, "query": String, "headers": Json, "body": String }
+
+export val router = (req: Request): Json =>
   match req["path"]
     is "/" => handleIndex(req)
     is "/api/status" => handleStatus(req)

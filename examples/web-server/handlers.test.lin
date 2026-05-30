@@ -1,7 +1,9 @@
 import { expect, toBe, test, suite, run } from "std/test"
 import { handleStatus, handleUser } from "./handlers"
 
-val makeReq = (method: String, path: String): Json =>
+type Request = { "method": String, "path": String, "query": String, "headers": Json, "body": String }
+
+val makeReq = (method: String, path: String): Request =>
   { "method": method, "path": path, "query": "", "headers": {}, "body": "" }
 
 val s = suite("handlers", [

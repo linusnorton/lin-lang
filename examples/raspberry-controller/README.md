@@ -27,6 +27,14 @@ Each library module `export`s its functions and has **no top-level side effects*
 so it can be imported by its colocated `*.test.lin`. The tests port the Rust
 `#[cfg(test)]` cases as `expect(...).toBe(...)` assertions.
 
+Record shapes are given named type aliases where they exist: `motor.lin` exports
+`MotorCommand` (`{ channel, duty }`) and `nal.lin` exports `NalUnit`
+(`{ nalType, data }`). Wire buffers stay flat `UInt8[]`, and RTP packet
+collections stay `Json[]` — a packet is a raw byte buffer, not a record, and Lin
+has no nested-array type (`UInt8[][]`) to name "array of byte buffers". The RTP
+scalar header fields are precisely typed (`UInt16` sequence, `UInt32`
+timestamp/SSRC).
+
 ## Protocols
 
 **Control** (client → server, UDP port 3000): 8 bytes — two big-endian IEEE-754
@@ -52,8 +60,8 @@ small NALs, FU-A fragmentation at 1200 bytes for large ones (`rtp.packetize`).
 
 **Stubbed / omitted (hardware & OS edges):**
 
-- **GPIO/PWM** (`rppal`): `motor.lin` returns a descriptive
-  `{ "channel", "duty" }` command instead of toggling pins. A real driver would
+- **GPIO/PWM** (`rppal`): `motor.lin` returns a descriptive `MotorCommand`
+  (`{ "channel", "duty" }`) instead of toggling pins. A real driver would
   feed this to an FFI GPIO/PWM call (e.g. an `import foreign` binding to a
   `libgpiod`/`pigpio` symbol). No pin I/O is performed.
 - **Camera capture** (`rpicam-vid` subprocess + pipe): omitted. The camera itself

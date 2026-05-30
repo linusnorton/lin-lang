@@ -2,7 +2,10 @@ import { router } from "./router"
 import { print } from "std/io"
 import { toString } from "std/string"
 
-val makeReq = (method: String, path: String): Json =>
+// HTTP request record shape (structural — see router.lin / handlers.lin).
+type Request = { "method": String, "path": String, "query": String, "headers": Json, "body": String }
+
+val makeReq = (method: String, path: String): Request =>
   { "method": method, "path": path, "query": "", "headers": {}, "body": "" }
 
 val statusResp = router(makeReq("GET", "/api/status"))

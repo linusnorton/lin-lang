@@ -19,7 +19,7 @@ export val poolSum = (workers: Int32, n: Int32): Int32 =>
 // Worker — a long-lived thread that owns confined mutable state (§32.6.4). The handler
 // closes over `var total`; sequential requests accumulate into it, and `onShutdown` is
 // invoked at close. Returns the running total after the given deposits.
-export val accumulate = (deposits: Json): Int32 =>
+export val accumulate = (deposits: Int32[]): Int32 =>
   var total = 0
   val acc = worker(
     n =>

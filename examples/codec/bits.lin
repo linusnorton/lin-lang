@@ -20,9 +20,9 @@ export val nalType = (header: Int32): Int32 =>
   header & 0x1F
 
 // A simple 1-byte XOR checksum over a byte list.
-val checksumFrom = (bytes: Json, i: Int32, acc: Int32): Int32 =>
+val checksumFrom = (bytes: Int32[], i: Int32, acc: Int32): Int32 =>
   if i >= length(bytes) then acc
   else checksumFrom(bytes, i + 1, acc ^ bytes[i])
 
-export val checksum = (bytes: Json): Int32 =>
+export val checksum = (bytes: Int32[]): Int32 =>
   checksumFrom(bytes, 0, 0)
