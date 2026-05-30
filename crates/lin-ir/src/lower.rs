@@ -1417,6 +1417,12 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
         }
 
         TypedExpr::BinaryOp { left, op, right, result_type, .. } => {
+            // `&&` / `||` are SHORT-CIRCUITING (spec §24): the RHS must only be evaluated when
+            // the LHS does not already decide the result. Emit branch + merge + Phi control flow
+            // (mirroring lower_if) rather than a bitwise and/or over two eagerly-lowered operands.
+            if matches!(op, BinOp::And | BinOp::Or) {
+                return lower_short_circuit(left, *op, right, result_type, builder, ctx);
+            }
             // The operand type drives equality/comparison dispatch (e.g. object/array
             // deep equality); it differs from result_type for comparisons (which yield Bool).
             let left_ty = left.ty();
@@ -2716,6 +2722,76 @@ fn lower_if(
     if result_is_rc {
         builder.register_owned(result_dst, result_type.clone());
     }
+    result_dst
+}
+
+/// Lower a short-circuiting `&&` / `||` (spec §24) as branch + merge + Phi, so the RHS is
+/// only evaluated on the path that needs it.
+///
+/// - `a && b`: eval a; if a then eval b else `false`; phi.
+/// - `a || b`: eval a; if a then `true`  else eval b; phi.
+///
+/// The RHS is lowered INSIDE the conditionally-executed block (its own ownership scope), so any
+/// owned temps it allocates are released there and are only ever created on the taken path —
+/// exactly as lower_if handles a branch arm. Both operands are booleans (scalars), so the result
+/// is RC-trivial.
+fn lower_short_circuit(
+    left: &TypedExpr,
+    op: BinOp,
+    right: &TypedExpr,
+    _result_type: &Type,
+    builder: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+) -> Temp {
+    let lhs = lower_cond_as_bool(left, builder, ctx);
+
+    // The block that evaluates the RHS, and the block that short-circuits to a constant.
+    let rhs_block = builder.alloc_block(if matches!(op, BinOp::And) { "and_rhs" } else { "or_rhs" });
+    let short_block = builder.alloc_block(if matches!(op, BinOp::And) { "and_short" } else { "or_short" });
+    let merge_block = builder.alloc_block("sc_merge");
+    builder.set_block_span(rhs_block, right.span());
+
+    // For `&&`, the RHS is evaluated when the LHS is true; for `||`, when the LHS is false.
+    let (then_block, else_block) = match op {
+        BinOp::And => (rhs_block, short_block),
+        BinOp::Or => (short_block, rhs_block),
+        _ => unreachable!("lower_short_circuit only handles And/Or"),
+    };
+    builder.terminate(Terminator::CondJump {
+        cond: lhs,
+        then_block,
+        else_block,
+    });
+
+    let result_dst = builder.alloc_temp(Type::Bool);
+    let mut incomings: Vec<(Temp, BlockId)> = Vec::new();
+
+    // --- RHS block: evaluate the right operand (its own ownership scope) ---
+    builder.switch_to(rhs_block);
+    builder.push_scope();
+    let rhs_raw = lower_cond_as_bool(right, builder, ctx);
+    if !builder.is_current_block_terminated() {
+        // rhs is a Bool scalar; keep it across the scope pop (nothing to release for a bool).
+        builder.pop_scope_releasing_keep(&[rhs_raw]);
+        incomings.push((rhs_raw, builder.current_block));
+        builder.terminate(Terminator::Jump(merge_block));
+    } else {
+        builder.discard_scope();
+    }
+
+    // --- short-circuit block: yield the constant that the LHS already determined ---
+    builder.switch_to(short_block);
+    // `false && _` → false; `true || _` → true.
+    let short_val = builder.const_temp(Const::Bool(matches!(op, BinOp::Or)));
+    incomings.push((short_val, builder.current_block));
+    builder.terminate(Terminator::Jump(merge_block));
+
+    builder.switch_to(merge_block);
+    builder.emit(Instruction::Phi {
+        dst: result_dst,
+        ty: Type::Bool,
+        incomings,
+    });
     result_dst
 }
 

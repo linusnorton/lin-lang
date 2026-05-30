@@ -870,6 +870,49 @@ print(toString(c))
 }
 
 #[test]
+fn test_logical_operators_short_circuit_evaluation() {
+    // Spec §24: `&&` / `||` are SHORT-CIRCUITING — the RHS must NOT be evaluated when the LHS
+    // already decides the result. This asserts EVALUATION order, not just the boolean value:
+    //  - a side-effecting RHS (a print) must be absent from the output when short-circuited;
+    //  - the canonical bounds-check guard `i < length(arr) && arr[i] > 0` must not index OOB.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { length } from "std/array"
+
+val boomTrue = (): Boolean =>
+  print("BOOM-AND")
+  true
+val boomFalse = (): Boolean =>
+  print("BOOM-OR")
+  false
+
+// false && _ : RHS must NOT run.
+val r1 = false && boomTrue()
+print(toString(r1))
+// true || _ : RHS must NOT run.
+val r2 = true || boomFalse()
+print(toString(r2))
+
+// Guard idiom: index is out of bounds, so the LHS is false and arr[i] must not be evaluated.
+val arr = [1, 2]
+val safeAnd = (i: Int32): Boolean =>
+  if i < length(arr) && arr[i] > 0 then true else false
+print(toString(safeAnd(5)))
+// `||` guard: LHS true short-circuits, so arr[i] must not be evaluated.
+val safeOr = (i: Int32): Boolean =>
+  if i >= length(arr) || arr[i] > 0 then true else false
+print(toString(safeOr(5)))
+
+print("end")
+"#);
+    // No "BOOM-AND" / "BOOM-OR" lines: the side-effecting RHS never ran.
+    assert!(!output.contains(&"BOOM-AND".to_string()), "&& RHS was evaluated: {:?}", output);
+    assert!(!output.contains(&"BOOM-OR".to_string()), "|| RHS was evaluated: {:?}", output);
+    // Guards are safe (no OOB crash) and yield false / true respectively; program reaches "end".
+    assert_eq!(output, vec!["false", "true", "false", "true", "end"]);
+}
+
+#[test]
 fn test_if_block_branches() {
     let output = run(r#"import { print } from "std/io"
 
