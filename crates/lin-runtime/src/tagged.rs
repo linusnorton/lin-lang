@@ -38,6 +38,11 @@ pub const TAG_UINT64: u8 = 14;
 /// JSON reads them unsigned. (Boxed UInt32 *scalars* still use TAG_INT64 positive; this tag
 /// only ever appears as a flat-array elem_tag, never on a boxed TaggedVal.)
 pub const TAG_UINT32: u8 = 15;
+/// Promise (async) — payload is a `*mut LinPromise` (an opaque, non-refcounted runtime handle).
+/// A boxed promise round-trips through TypeVar slots and arrays like any other tagged value;
+/// codegen boxes a freshly-spawned promise and unboxes it at `await`/combinator boundaries. RC
+/// is a no-op for this tag (promises are not refcounted; `await` reaps the underlying thread).
+pub const TAG_PROMISE: u8 = 16;
 
 #[repr(C)]
 #[derive(Clone, Copy)]

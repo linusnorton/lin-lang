@@ -1859,6 +1859,120 @@ print(await(p))
 }
 
 #[test]
+fn test_race_first_wins() {
+    let output = run(r#"import { print } from "std/io"
+import { async, await, race } from "std/async"
+import { sleep } from "std/time"
+
+val winner = await(race([
+  async(() =>
+    sleep(200)
+    "slow"
+  ),
+  async(() =>
+    sleep(10)
+    "fast"
+  )
+]))
+print(winner)
+"#);
+    assert_eq!(output, vec!["fast"]);
+}
+
+#[test]
+fn test_timeout_expires_to_null() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { async, await, timeout } from "std/async"
+import { sleep } from "std/time"
+
+val slow = async(() =>
+  sleep(300)
+  "done"
+)
+val r = await(timeout(slow, 30))
+print(toString(r))
+"#);
+    assert_eq!(output, vec!["null"]);
+}
+
+#[test]
+fn test_timeout_completes_in_time() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { async, await, timeout } from "std/async"
+
+val quick = async(() => 99)
+val r = await(timeout(quick, 5000))
+print(toString(r))
+"#);
+    assert_eq!(output, vec!["99"]);
+}
+
+#[test]
+fn test_retry_succeeds_first_try() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { async, await, retry } from "std/async"
+
+val p = retry(() => 7, 3)
+print(toString(await(p)))
+"#);
+    assert_eq!(output, vec!["7"]);
+}
+
+#[test]
+fn test_retry_all_fail_returns_error() {
+    let output = run(r#"import { print } from "std/io"
+import { async, await, retry } from "std/async"
+
+val z = 0
+val p = retry(() => 1 / z, 3)
+val r = await(p)
+print(r["type"])
+"#);
+    assert_eq!(output, vec!["error"]);
+}
+
+#[test]
+fn test_parallel_preserves_order_with_sleep() {
+    // Tasks finish in reverse order of submission, but results must stay in submission order.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { parallel } from "std/async"
+import { sleep } from "std/time"
+
+val rs = parallel([
+  () =>
+    sleep(120)
+    1,
+  () =>
+    sleep(60)
+    2,
+  () =>
+    sleep(10)
+    3
+])
+print(toString(rs))
+"#);
+    assert_eq!(output, vec!["[1, 2, 3]"]);
+}
+
+#[test]
+fn test_async_captures_function_value_runs() {
+    // A thunk capturing a function value (CAP_OPAQUE env) runs inline as a sound fallback.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { async, await } from "std/async"
+
+val double = (x: Int32): Int32 => x * 2
+val p = async(() => double(21))
+print(toString(await(p)))
+"#);
+    assert_eq!(output, vec!["42"]);
+}
+
+#[test]
 fn test_iterator_restart() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"

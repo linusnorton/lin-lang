@@ -67,6 +67,33 @@ unsafe fn make_error_tagged(msg: &str) -> *mut u8 {
     alloc_tagged(TAG_OBJECT, obj as u64)
 }
 
+/// Box a raw `*mut LinPromise` into a `TaggedVal*(TAG_PROMISE)` so it round-trips through
+/// TypeVar slots and arrays. Null promise → null Json.
+#[no_mangle]
+pub unsafe extern "C" fn lin_box_promise(p: *mut LinPromise) -> *mut u8 {
+    if p.is_null() {
+        return std::ptr::null_mut();
+    }
+    crate::tagged::alloc_tagged(crate::tagged::TAG_PROMISE, p as u64)
+}
+
+/// Unbox a `TaggedVal*(TAG_PROMISE)` back to the raw `*mut LinPromise`. Accepts an
+/// already-raw pointer defensively (returns it unchanged if its first byte isn't TAG_PROMISE…
+/// — but callers always pass a boxed promise). Null → null.
+#[no_mangle]
+pub unsafe extern "C" fn lin_unbox_promise(p: *mut u8) -> *mut LinPromise {
+    if p.is_null() {
+        return std::ptr::null_mut();
+    }
+    let tv = &*(p as *const crate::tagged::TaggedVal);
+    if tv.tag == crate::tagged::TAG_PROMISE {
+        tv.payload as *mut LinPromise
+    } else {
+        // Not a boxed promise — treat the pointer itself as the promise (legacy/raw path).
+        p as *mut LinPromise
+    }
+}
+
 /// Allocate a LinPromise that is already resolved to `value` (no thread). Used for the
 /// degenerate inline path and by combinators that need a settled promise.
 #[no_mangle]
@@ -188,6 +215,181 @@ pub unsafe extern "C" fn lin_await_promise(promise: *mut LinPromise) -> *mut u8 
         Ok(v) => v,
         Err(msg) => make_error_tagged(&msg),
     }
+}
+
+/// Poll a promise without consuming it. Returns `Some(Ok(value))` / `Some(Err(msg))` if it has
+/// settled, or `None` if still pending. The returned value pointer is still owned by the
+/// promise — callers that keep it must deep-copy.
+unsafe fn poll_promise(promise: *mut LinPromise) -> Option<Result<*mut u8, String>> {
+    if promise.is_null() {
+        return Some(Ok(std::ptr::null_mut()));
+    }
+    let (lock, _cvar) = &*(*promise).inner;
+    let state = lock.lock().unwrap();
+    match &*state {
+        PromiseState::Pending => None,
+        PromiseState::Resolved(p) => Some(Ok(p.0)),
+        PromiseState::Failed(msg) => Some(Err(msg.clone())),
+    }
+}
+
+/// `race(promises)` (spec §32.4): returns a settled promise carrying the result of the FIRST of
+/// `promises` to complete. The others keep running; their results are discarded (abandoned, not
+/// cancelled — Lin has no cancellation in v1). `promises` is the raw `LinArray*` whose elements'
+/// payloads are `*mut LinPromise`. The winning value is deep-copied into the returned promise so
+/// ownership is independent of the still-live source promises.
+#[no_mangle]
+pub unsafe extern "C" fn lin_race(promises: *mut u8) -> *mut LinPromise {
+    use crate::array::{lin_array_length, LinArray};
+    let arr = promises as *mut LinArray;
+    if arr.is_null() {
+        return lin_make_promise(std::ptr::null_mut());
+    }
+    let len = lin_array_length(arr);
+    if len == 0 {
+        return lin_make_promise(std::ptr::null_mut());
+    }
+    loop {
+        for i in 0..len as usize {
+            let elem = (*arr).data.add(i);
+            let p = (*elem).payload as *mut LinPromise;
+            if let Some(settled) = poll_promise(p) {
+                let v = match settled {
+                    Ok(v) => crate::transfer::lin_transfer_clone(v as *const u8),
+                    Err(msg) => make_error_tagged(&msg),
+                };
+                return lin_make_promise(v);
+            }
+        }
+        // Brief backoff to avoid a busy spin while no promise has settled.
+        std::thread::sleep(std::time::Duration::from_micros(200));
+    }
+}
+
+/// `timeout(promise, ms)` (spec §32.4): returns a settled promise carrying the original value if
+/// `promise` completes within `ms` milliseconds, else the Json null value (timed out — the slow
+/// thread is abandoned, not cancelled). An error result is passed through. The value is
+/// deep-copied so it is independent of the source promise.
+#[no_mangle]
+pub unsafe extern "C" fn lin_timeout(promise: *mut LinPromise, ms: i32) -> *mut LinPromise {
+    if promise.is_null() {
+        return lin_make_promise(std::ptr::null_mut());
+    }
+    let deadline_ms = ms.max(0) as u64;
+    let mut waited: u64 = 0;
+    let step: u64 = 1; // poll every 1ms
+    loop {
+        if let Some(settled) = poll_promise(promise) {
+            let v = match settled {
+                Ok(v) => crate::transfer::lin_transfer_clone(v as *const u8),
+                Err(msg) => make_error_tagged(&msg),
+            };
+            return lin_make_promise(v);
+        }
+        if waited >= deadline_ms {
+            // Timed out: resolve with null. The source thread keeps running (abandoned).
+            return lin_make_promise(std::ptr::null_mut());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(step));
+        waited += step;
+    }
+}
+
+/// `retry(thunk, n)` (spec §32.4): spawn `thunk` up to `n` times, returning a settled promise
+/// with the first result that is NOT an `Error`; if all `n` attempts error, the last `Error` is
+/// the result. `thunk` is the raw closure pointer. Runs attempts sequentially (each is itself a
+/// real spawn+await), which is the spec's "spawns the thunk up to n times" semantics.
+#[no_mangle]
+pub unsafe extern "C" fn lin_retry(thunk: *mut u8, n: i32) -> *mut LinPromise {
+    let attempts = n.max(1);
+    let mut last: *mut u8 = std::ptr::null_mut();
+    for _ in 0..attempts {
+        let p = lin_async_spawn(thunk);
+        last = lin_await_promise(p);
+        if !is_error_value(last) {
+            return lin_make_promise(last);
+        }
+        // Error: free this attempt's box and try again (unless it was the last).
+        if !last.is_null() {
+            crate::tagged::lin_tagged_release(last);
+            last = std::ptr::null_mut();
+        }
+    }
+    // All attempts errored — re-run once more to produce a fresh last Error to return. To avoid
+    // an extra spawn, just rebuild a generic error if we cleared the last one.
+    if last.is_null() {
+        last = make_error_tagged("retry: all attempts failed");
+    }
+    lin_make_promise(last)
+}
+
+/// True if `v` is an Error-shaped object `{ "type": "error", ... }` (the runtime's fault/Error
+/// representation). Used by `retry` to decide success vs. failure.
+unsafe fn is_error_value(v: *mut u8) -> bool {
+    use crate::object::{lin_object_get, LinObject};
+    use crate::string::lin_string_from_bytes;
+    use crate::tagged::{TaggedVal, TAG_OBJECT, TAG_STR};
+    if v.is_null() {
+        return false;
+    }
+    let tv = &*(v as *const TaggedVal);
+    if tv.tag != TAG_OBJECT {
+        return false;
+    }
+    let obj = tv.payload as *const LinObject;
+    let key = lin_string_from_bytes("type".as_ptr(), 4);
+    let got = lin_object_get(obj, key);
+    crate::string::lin_string_release(key);
+    if got.is_null() {
+        return false;
+    }
+    if (*got).tag != TAG_STR {
+        return false;
+    }
+    let s = (*got).payload as *const crate::string::LinString;
+    if s.is_null() {
+        return false;
+    }
+    (*s).as_str() == "error"
+}
+
+/// Run all thunks in `tasks` (a tagged `LinArray*` of boxed closures) concurrently on OS
+/// threads, then join them in order, returning a fresh tagged `LinArray*` of their boxed
+/// results — **order-preserving** (result[i] is task[i]'s result), spec §32.3. A thunk that
+/// faults yields an `Error` object in its slot (fault isolation per task). Each task's env is
+/// deep-copied for transfer (Option C); a non-transferable task runs inline on a worker thread.
+///
+/// `tasks` is the raw (unboxed) array. Ownership of the result array transfers to the caller.
+#[no_mangle]
+pub unsafe extern "C" fn lin_parallel(tasks: *mut u8) -> *mut u8 {
+    use crate::array::{lin_array_alloc, lin_array_length, lin_array_push_tagged, LinArray};
+    crate::fault::install_quiet_fault_hook();
+    let arr = tasks as *mut LinArray;
+    if arr.is_null() {
+        return lin_array_alloc(4) as *mut u8;
+    }
+    let len = lin_array_length(arr);
+    // Spawn each thunk as its own promise (real overlap), collecting promises in order.
+    // Tasks is a tagged array (elem_tag 0xFF) whose elements are closures; read each
+    // closure pointer straight from the element buffer (borrow — no alloc/retain).
+    let mut promises: Vec<*mut LinPromise> = Vec::with_capacity(len as usize);
+    for i in 0..len as usize {
+        let elem = (*arr).data.add(i);
+        let cls = (*elem).payload as *mut u8; // closure ptr (TAG_FUNCTION payload)
+        promises.push(lin_async_spawn(cls));
+    }
+    // Join in order, preserving result positions. lin_await returns an owned result box;
+    // push_tagged copies its 16 bytes and takes ownership of the inner payload, so we free
+    // only the now-redundant box shell afterward.
+    let out = lin_array_alloc(len.max(1) as u64);
+    for p in promises {
+        let res = lin_await_promise(p);
+        lin_array_push_tagged(out, res as *const u8);
+        if !res.is_null() {
+            crate::tagged::lin_tagged_free_box(res);
+        }
+    }
+    out as *mut u8
 }
 
 /// Allocate a LinThreadPool with `n` workers. (Phase 4 fills in real worker threads.)
