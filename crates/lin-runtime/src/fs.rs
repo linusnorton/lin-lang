@@ -531,3 +531,43 @@ pub unsafe extern "C" fn lin_fs_write_lines(path: *const u8, arr: *const u8) -> 
         Err(e) => make_error_tagged(&e.to_string()),
     }
 }
+
+#[cfg(test)]
+mod write_lines_tests {
+    use super::*;
+    use crate::array::{lin_array_alloc, lin_array_push};
+    use crate::string::lin_string_from_bytes;
+    use crate::tagged::{alloc_tagged, TAG_STR, TAG_ARRAY};
+
+    // Regression: lin_fs_write_lines previously read each String element with
+    // resolve_lin_str(tv as *const u8) on a freshly lin_array_get_tagged'd TaggedVal,
+    // which misread the wrapper and leaked a retain — producing intermittent wild-pointer
+    // SEGVs under allocation load. This test drives write_lines directly with a real
+    // tagged String[] and verifies the file contents, exercising the element-read path.
+    // Run under `cargo test` (and the -Zsanitizer=address CI leg) it is deterministic.
+    #[test]
+    fn write_lines_reads_string_elements_correctly() {
+        unsafe {
+            // Build a tagged String[] = ["foo", "bar", "baz"].
+            let arr = lin_array_alloc(4);
+            for word in ["foo", "bar", "baz"] {
+                let s = lin_string_from_bytes(word.as_ptr(), word.len() as u32);
+                let payload = s as u64;
+                lin_array_push(arr, &payload as *const u64 as *const u8, TAG_STR);
+            }
+            let arr_tagged = alloc_tagged(TAG_ARRAY, arr as u64);
+
+            // Path string as a TaggedVal*(Str), matching how Lin passes a String arg.
+            let path = "/tmp/lin_write_lines_unit_test.txt";
+            let path_str = lin_string_from_bytes(path.as_ptr(), path.len() as u32);
+            let path_tagged = alloc_tagged(TAG_STR, path_str as u64);
+
+            let res = lin_fs_write_lines(path_tagged as *const u8, arr_tagged as *const u8);
+            assert!(res.is_null(), "write_lines should succeed (null = ok)");
+
+            let written = std::fs::read_to_string(path).expect("file should exist");
+            assert_eq!(written, "foo\nbar\nbaz\n");
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
