@@ -360,6 +360,18 @@ struct FuncBuilder {
     /// Slots stored as heap cells (mutably-captured `var`s): slot → stored value type.
     /// `slots[slot]` holds the cell-pointer temp; LocalGet/LocalSet go through the cell.
     cell_slots: HashMap<usize, Type>,
+    /// Transfer-on-escape aliasing: a call-result `dst` → the RAW fresh-alloc heap-literal
+    /// temps whose payload that result aliases (because the literal was boxed into a
+    /// Json/union parameter and the callee borrows + returns it, e.g. `(acc) => acc`).
+    ///
+    /// The literal is `register_owned` in this scope and would normally be released at
+    /// scope exit. That is correct when the call result is TRANSIENT (consumed/discarded —
+    /// the single release balances the single +1). But when the result ESCAPES (is kept in
+    /// the return keep-set), releasing the literal frees the payload the escaping result
+    /// still aliases → use-after-free. So `pop_scope_releasing_keep` transitively expands
+    /// the keep-set through this map: keeping a result also keeps the literals it aliases,
+    /// transferring ownership into the escaping value (its eventual owner does the release).
+    escape_alias: HashMap<Temp, Vec<Temp>>,
 }
 
 impl FuncBuilder {
@@ -403,6 +415,7 @@ impl FuncBuilder {
             scope_owned: Vec::new(),
             diverged_blocks: std::collections::HashSet::new(),
             cell_slots: HashMap::new(),
+            escape_alias: HashMap::new(),
         }
     }
 
@@ -537,19 +550,52 @@ impl FuncBuilder {
         }
     }
 
-    /// Pop the current scope frame and emit Release for all owned temps except `keep`.
+    /// Pop the current scope frame and emit Release for all owned temps except `keep` (and the
+    /// fresh literals whose ownership transfers into `keep` when it escapes this scope — e.g. a
+    /// block whose result is `id([1,2])` must keep the `[1,2]` literal alive, not just the
+    /// result temp; see `escape_alias`).
     fn pop_scope_releasing(&mut self, keep: Temp) {
+        let keep = self.expand_keep_for_escape(&[keep]);
         if let Some(frame) = self.scope_owned.pop() {
             for (t, ty) in frame {
-                if t != keep {
+                if !keep.contains(&t) {
                     self.emit(Instruction::Release { val: t, ty });
                 }
             }
         }
     }
 
+    /// Record that the call result `dst` aliases the payload of the raw fresh-alloc literal
+    /// `lit` (see `escape_alias`). Used by `lower_call` when a fresh heap literal is boxed
+    /// into a Json/union parameter; ownership of `lit` transfers into `dst` if `dst` escapes.
+    fn record_escape_alias(&mut self, dst: Temp, lit: Temp) {
+        self.escape_alias.entry(dst).or_default().push(lit);
+    }
+
+    /// Expand a return keep-set transitively through `escape_alias`: if a kept temp is a
+    /// call result that aliases fresh literal(s), those literals must be kept too (their
+    /// ownership transfers into the escaping result). Follows chains (e.g. `wrap` returning
+    /// `mid([1,2])` where `mid` returns `id(acc)`).
+    fn expand_keep_for_escape(&self, keep: &[Temp]) -> Vec<Temp> {
+        let mut out: Vec<Temp> = keep.to_vec();
+        let mut i = 0;
+        while i < out.len() {
+            let t = out[i];
+            if let Some(lits) = self.escape_alias.get(&t) {
+                for &lit in lits {
+                    if !out.contains(&lit) {
+                        out.push(lit);
+                    }
+                }
+            }
+            i += 1;
+        }
+        out
+    }
+
     /// Pop the current scope frame, releasing all owned temps except those in `keep`.
     fn pop_scope_releasing_keep(&mut self, keep: &[Temp]) {
+        let keep = self.expand_keep_for_escape(keep);
         if let Some(frame) = self.scope_owned.pop() {
             for (t, ty) in frame {
                 if !keep.contains(&t) {
@@ -1565,6 +1611,32 @@ fn lower_call_arg(a: &TypedExpr, param_ty: Option<&Type>, builder: &mut FuncBuil
     lower_coerce_arg(t, &a.ty(), param_ty, builder)
 }
 
+/// Like `lower_call_arg`, but also returns the RAW (pre-coercion) temp when the argument is
+/// a fresh-alloc heap literal being boxed into a Json/union parameter — the temp that
+/// `register_owned` tracks for scope-exit release. `lower_call` records this against the
+/// call result so its ownership transfers on escape (see `escape_alias`). Returns `None`
+/// for the raw temp when no such transfer-on-escape tracking applies (the common case:
+/// non-fresh args, non-Json params, or callback-lowered closures).
+fn lower_call_arg_tracked(
+    a: &TypedExpr,
+    param_ty: Option<&Type>,
+    builder: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+) -> (Temp, Option<Temp>) {
+    // Only fresh-alloc heap literals boxed into a Json/union param participate. The callback
+    // path in `lower_call_arg` never boxes a heap literal this way, so we can lower normally
+    // there; for everything else we lower the expr ourselves to capture the raw temp.
+    if arg_box_is_caller_owned_shell(&a.ty(), param_ty) && expr_is_fresh_alloc(a) {
+        let raw = lower_expr(a, builder, ctx);
+        let coerced = lower_coerce_arg(raw, &a.ty(), param_ty, builder);
+        // Only track when the coercion actually produced a distinct box; if coerced == raw
+        // there is no separately-owned literal underneath to suppress.
+        let tracked = if coerced != raw { Some(raw) } else { None };
+        return (coerced, tracked);
+    }
+    (lower_call_arg(a, param_ty, builder, ctx), None)
+}
+
 fn lower_call(
     func: &TypedExpr,
     args: &[TypedExpr],
@@ -1590,14 +1662,18 @@ fn lower_call(
         // concrete args passed to Json/union-typed parameters.
         if let Some((sym, param_tys)) = ctx.import_fn_slots.get(slot).cloned() {
             let mut shell_boxes: Vec<Temp> = Vec::new();
+            let mut escape_lits: Vec<Temp> = Vec::new();
             let lowered_args: Vec<Temp> = args
                 .iter()
                 .enumerate()
                 .map(|(i, a)| {
-                    let arg = lower_call_arg(a, param_tys.get(i), builder, ctx);
+                    let (arg, raw_lit) = lower_call_arg_tracked(a, param_tys.get(i), builder, ctx);
                     retain_call_arg(arg, &a.ty(), expr_is_fresh_alloc(a), builder);
                     if arg_box_is_caller_owned_shell(&a.ty(), param_tys.get(i)) {
                         shell_boxes.push(arg);
+                    }
+                    if let Some(lit) = raw_lit {
+                        escape_lits.push(lit);
                     }
                     arg
                 })
@@ -1618,6 +1694,9 @@ fn lower_call(
             });
             free_arg_box_shells(&shell_boxes, dst, builder);
             builder.register_owned(dst, result_type.clone());
+            for lit in escape_lits {
+                builder.record_escape_alias(dst, lit);
+            }
             return dst;
         }
         // Check global function slots.
@@ -1629,14 +1708,18 @@ fn lower_call(
                 _ => vec![],
             };
             let mut shell_boxes: Vec<Temp> = Vec::new();
+            let mut escape_lits: Vec<Temp> = Vec::new();
             let lowered_args: Vec<Temp> = args
                 .iter()
                 .enumerate()
                 .map(|(i, a)| {
-                    let arg = lower_call_arg(a, param_tys.get(i), builder, ctx);
+                    let (arg, raw_lit) = lower_call_arg_tracked(a, param_tys.get(i), builder, ctx);
                     retain_call_arg(arg, &a.ty(), expr_is_fresh_alloc(a), builder);
                     if arg_box_is_caller_owned_shell(&a.ty(), param_tys.get(i)) {
                         shell_boxes.push(arg);
+                    }
+                    if let Some(lit) = raw_lit {
+                        escape_lits.push(lit);
                     }
                     arg
                 })
@@ -1674,6 +1757,9 @@ fn lower_call(
             });
             free_arg_box_shells(&shell_boxes, dst, builder);
             builder.register_owned(dst, result_type.clone());
+            for lit in escape_lits {
+                builder.record_escape_alias(dst, lit);
+            }
             return dst;
         }
     }
@@ -1688,12 +1774,16 @@ fn lower_call(
         Type::Function { params, .. } => params,
         _ => vec![],
     };
+    let mut escape_lits: Vec<Temp> = Vec::new();
     let lowered_args: Vec<Temp> = args
         .iter()
         .enumerate()
         .map(|(i, a)| {
-            let arg = lower_call_arg(a, param_tys.get(i), builder, ctx);
+            let (arg, raw_lit) = lower_call_arg_tracked(a, param_tys.get(i), builder, ctx);
             retain_call_arg(arg, &a.ty(), expr_is_fresh_alloc(a), builder);
+            if let Some(lit) = raw_lit {
+                escape_lits.push(lit);
+            }
             arg
         })
         .collect();
@@ -1714,6 +1804,9 @@ fn lower_call(
         ret_ty: result_type.clone(),
     });
     builder.register_owned(dst, result_type.clone());
+    for lit in escape_lits {
+        builder.record_escape_alias(dst, lit);
+    }
     dst
 }
 
@@ -3096,6 +3189,7 @@ fn lower_function_expr_with_id(
         scope_owned: Vec::new(),
         diverged_blocks: std::collections::HashSet::new(),
         cell_slots: HashMap::new(),
+        escape_alias: HashMap::new(),
     };
 
     // Add entry block. Tag it with the function body's span so coverage records a

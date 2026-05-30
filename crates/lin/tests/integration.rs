@@ -360,6 +360,95 @@ print(toString(length(acc)))
     assert_eq!(output, vec!["2"]);
 }
 
+// Regression: a fresh-alloc heap literal (array/object) passed to a Json/union parameter,
+// where the call RESULT ESCAPES (is returned / outlives the literal), must NOT have its
+// backing store released at the caller's scope exit while the escaping result still aliases
+// it. The lowerer registers the literal as owned in the caller scope and would release it on
+// exit; ownership must instead transfer into the escaping result (the eventual owner releases
+// it). Previously the premature scope-release fired, corrupting the array's length header and
+// crashing the returned value's later use with `capacity overflow` (a use-after-free).
+// Covers the array passthrough (identity `(acc) => acc`) and the accumulator-threading idiom
+// (recursive `build(i, n, acc)` returning the threaded `acc`).
+#[test]
+fn test_fresh_heap_arg_to_json_param_escapes_no_uaf() {
+    // Array passthrough: `id([1, 2])` returned out of `wrap`.
+    let passthrough = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val id = (acc: Json): Json => acc
+val wrap = (): Json => id([1, 2])
+print(toString(wrap()))
+"#);
+    assert_eq!(passthrough, vec!["[1, 2]"]);
+
+    // Accumulator-threading: `build(0, n, [])` returns the threaded `acc`.
+    let accumulator = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { push } from "std/array"
+
+val build = (i: Int32, n: Int32, acc: Json): Json =>
+  if i >= n then acc
+  else
+    push(acc, i * i)
+    build(i + 1, n, acc)
+val squares = (n: Int32): Json => build(0, n, [])
+print(toString(squares(4)))
+"#);
+    assert_eq!(accumulator, vec!["[0, 1, 4, 9]"]);
+
+    // Result BOUND to a `val` and then returned (block-scope escape, not just direct return) —
+    // the literal is owned in the block scope, so the block's own scope-release must also
+    // transfer ownership into the escaping result, not just the function-return release.
+    let bound = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val id = (acc: Json): Json => acc
+val wrap = (): Json =>
+  val x = id([1, 2])
+  x
+print(toString(wrap()))
+"#);
+    assert_eq!(bound, vec!["[1, 2]"]);
+
+    // INDIRECT (closure-value) call: the literal escapes through a call whose callee is a
+    // closure value (`f`), not a statically-known function.
+    let indirect = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val makeId = () => (acc: Json): Json => acc
+val wrap = (): Json =>
+  val f = makeId()
+  f([1, 2])
+print(toString(wrap()))
+"#);
+    assert_eq!(indirect, vec!["[1, 2]"]);
+
+    // Object literal carrying a nested array, passed through and returned — the nested payload
+    // must survive too (a shallow box-aliasing guard would free the inner array prematurely).
+    let nested = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val id = (acc: Json): Json => acc
+val wrap = (data: Json): Json => id(data["items"])
+print(toString(wrap({ "items": [1, 2, 3] })))
+"#);
+    assert_eq!(nested, vec!["[1, 2, 3]"]);
+
+    // TRANSIENT result (consumed, not escaped) must still be released normally — guards against
+    // the keep-expansion over-suppressing the literal release and leaking.
+    let transient = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { length } from "std/array"
+
+val id = (acc: Json): Json => acc
+val use = (): Int32 =>
+  val x = id([1, 2])
+  length(x)
+print(toString(use()))
+"#);
+    assert_eq!(transient, vec!["2"]);
+}
+
 #[test]
 fn test_recursion() {
     let output = run(r#"import { print } from "std/io"
