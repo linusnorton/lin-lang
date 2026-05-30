@@ -3234,3 +3234,41 @@ print("done")
 "#);
     assert_eq!(out, vec!["done"]);
 }
+
+#[test]
+fn test_flat_array_arg_used_twice_no_double_free() {
+    // Regression: a flat scalar array (Float64[]) passed in two argument positions, or two
+    // separate flat-array literals, must not be released more times than it was retained.
+    // The callee `dot` reads each heap parameter twice (`a[0]`, `a[1]`); each read lowered to
+    // a Retain + a scope-exit Release. The RC-elision pass paired BOTH Retains to the SAME
+    // first Release (a HashSet deduped the second elision), eliding two Retains but only one
+    // Release — leaving one extra Release and a heap-use-after-free in lin_array_release. The
+    // functional guard here (prints 25.0 instead of crashing) catches it deterministically;
+    // the ASan CI leg surfaces the underlying UAF.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val dot = (a: Float64[], b: Float64[]): Float64 => a[0] * b[0] + a[1] * b[1]
+val v: Float64[] = [3.0, 4.0]
+print(toString(dot(v, v)))
+"#);
+    assert_eq!(out, vec!["25.0"]);
+
+    // Two separate flat-array literals exercise the same balance (each callee param read twice,
+    // distinct caller-owned allocations).
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val dot = (a: Float64[], b: Float64[]): Float64 => a[0] * b[0] + a[1] * b[1]
+print(toString(dot([3.0, 4.0], [3.0, 4.0])))
+"#);
+    assert_eq!(out, vec!["25.0"]);
+
+    // A single flat-array argument whose parameter is read more than once is the minimal form
+    // of the same bug (one alloc, callee consumes one extra reference).
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val sum2 = (a: Float64[]): Float64 => a[0] + a[1]
+val v: Float64[] = [3.0, 4.0]
+print(toString(sum2(v)))
+"#);
+    assert_eq!(out, vec!["7.0"]);
+}
