@@ -445,6 +445,33 @@ impl FuncBuilder {
         }
     }
 
+    /// THE container-insert ownership rule, in one place.
+    ///
+    /// When a value is stored into a container that takes ownership of one reference
+    /// (array element, object field, `push`/`set`), the source's refcount must end up
+    /// balanced so that exactly one owner frees it:
+    ///   - a **fresh allocation** (`expr_is_fresh_alloc`) already holds the only +1; transfer
+    ///     it by dropping the temp from the owning scope so scope-exit won't also release it
+    ///     (the container's drop accounts for it);
+    ///   - a **borrowed** heap value (e.g. a `LocalGet`) is shared, so retain it — the
+    ///     container's copy and the original owner can then each release independently.
+    /// Non-RC values need nothing. Centralising this means a new container-insert site can't
+    /// silently get the rule half-right (the historical source of double-free / leak bugs).
+    ///
+    /// `temp` is the RAW underlying heap value (never a boxed TaggedVal — retaining a box
+    /// bumps the wrong refcount). `source` is the expression that produced it.
+    fn transfer_into_container(&mut self, temp: Temp, source: &TypedExpr) {
+        let ty = source.ty();
+        if !is_rc_type(&ty) {
+            return;
+        }
+        if expr_is_fresh_alloc(source) {
+            self.unregister_owned(temp);
+        } else {
+            self.emit(Instruction::Retain { val: temp, ty });
+        }
+    }
+
     /// Pop the current scope frame and emit Release for all owned temps except `keep`.
     fn pop_scope_releasing(&mut self, keep: Temp) {
         if let Some(frame) = self.scope_owned.pop() {
@@ -1139,24 +1166,10 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                 .map(|e| {
                     let t = lower_expr(e, builder, ctx);
                     // The array owns a reference to each heap element (lin_array_release
-                    // recursively releases them when the array is freed). Manage ownership on
-                    // the RAW underlying heap value `t`, NOT the boxed TaggedVal — retaining a
-                    // box would bump the wrong refcount and the inner value would still be
-                    // double-freed. Mirrors AST compile_make_array's `!expr_is_owned_alloc`.
-                    let et = e.ty();
-                    if is_rc_type(&et) {
-                        if expr_is_fresh_alloc(e) {
-                            // Fresh allocation: transfer its +1 into the array. Drop it from
-                            // the owning scope so the scope-exit release doesn't double-free
-                            // (the array's recursive release already accounts for it).
-                            builder.unregister_owned(t);
-                        } else {
-                            // Borrowed value (e.g. a LocalGet): retain so the array's copy and
-                            // the original owner can each release independently.
-                            builder.emit(Instruction::Retain { val: t, ty: et.clone() });
-                        }
-                    }
-                    coerce_to_slot_type(t, &et, &elem_ty, builder)
+                    // recursively releases them when the array is freed) — apply the standard
+                    // container-insert ownership rule on the RAW value before boxing/coercing.
+                    builder.transfer_into_container(t, e);
+                    coerce_to_slot_type(t, &e.ty(), &elem_ty, builder)
                 })
                 .collect();
             let dst = builder.alloc_temp(ty.clone());
@@ -1454,27 +1467,15 @@ fn lower_intrinsic_call(
     };
     let lowered_args: Vec<Temp> = args.iter().map(|a| lower_expr(a, builder, ctx)).collect();
 
-    // `push(arr, elem)` / `set(arr, idx, elem)` transfer a reference to the element into the
-    // array, and codegen's push/set do NOT retain (they store the pointer / copy the boxed
-    // value). So manage the element's ownership like a MakeArray element: a fresh allocation
-    // transfers its +1 (drop it from the owning scope so the scope-exit release doesn't free a
-    // value the array now holds); a borrowed heap value is retained so both owners can release.
-    // The element is the LAST argument in all three: push(arr, elem), set(arr, idx, elem),
-    // object_set(obj, key, val). For push/set, codegen does NOT retain (stores the pointer);
-    // for object_set, codegen boxes the value, calls lin_object_set (which retains the inner),
-    // then releases the box (undoing that retain) — so the net effect is also a transfer.
-    // Either way: a fresh allocation transfers its +1 into the container (drop it from the
-    // owning scope so scope-exit doesn't double-free); a borrowed heap value is retained.
+    // `push(arr, elem)` / `set(arr, idx, elem)` / `object_set(obj, key, val)` all transfer a
+    // reference to their LAST argument into the container. For push/set, codegen stores the
+    // pointer / copies the boxed value without retaining; for object_set, codegen boxes the
+    // value, calls lin_object_set (which retains the inner), then releases the box (undoing
+    // that retain) — net effect is also a transfer. So the standard container-insert ownership
+    // rule applies to the element in every case.
     if matches!(intrinsic, Intrinsic::Push | Intrinsic::ArraySetDyn | Intrinsic::ObjectSetDyn) {
         if let (Some(elem_expr), Some(&elem_temp)) = (args.last(), lowered_args.last()) {
-            let et = elem_expr.ty();
-            if is_rc_type(&et) {
-                if expr_is_fresh_alloc(elem_expr) {
-                    builder.unregister_owned(elem_temp);
-                } else {
-                    builder.emit(Instruction::Retain { val: elem_temp, ty: et });
-                }
-            }
+            builder.transfer_into_container(elem_temp, elem_expr);
         }
     }
 
