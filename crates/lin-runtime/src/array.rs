@@ -352,8 +352,7 @@ pub unsafe extern "C" fn lin_array_get(arr: *const LinArray, idx: i64) -> *mut L
     let len = (*arr).len as i64;
     let actual = if idx < 0 { len + idx } else { idx };
     if actual < 0 || actual >= len {
-        eprintln!("Runtime error: array index {} out of bounds (len {})", idx, len);
-        std::process::exit(1);
+        crate::fault::runtime_fault(&format!("Runtime error: array index {} out of bounds (len {})", idx, len));
     }
     (*arr).data.add(actual as usize)
 }
@@ -419,8 +418,7 @@ pub unsafe extern "C" fn lin_array_get_tagged(arr: *const LinArray, idx: i64) ->
     let actual = if idx < 0 { len + idx } else { idx };
     let idx = actual;
     if idx < 0 || idx >= len {
-        eprintln!("Runtime error: array index {} out of bounds (len {})", actual, len);
-        std::process::exit(1);
+        crate::fault::runtime_fault(&format!("Runtime error: array index {} out of bounds (len {})", actual, len));
     }
     let tv_layout = Layout::from_size_align_unchecked(
         std::mem::size_of::<TaggedVal>(),
@@ -629,20 +627,55 @@ pub unsafe extern "C" fn lin_flat_array_concat_into_f64(dst: *mut LinArray, src:
     }
 }
 
-/// Tagged-element array equality (structural, element-by-element).
+/// Read element `i` of `arr` as a by-value `TaggedVal`, honoring the array's `elem_tag`
+/// (flat scalar storage of width 1/2/4/8, or 16-byte tagged `LinArrayElem`). This does NOT
+/// allocate and does NOT retain pointer payloads — it is a read-only view for comparison.
+/// Mirrors the scalar-widening rules of `lin_array_get_tagged`.
+#[inline]
+unsafe fn array_elem_value(arr: *const LinArray, i: usize) -> crate::tagged::TaggedVal {
+    use crate::tagged::*;
+    let mk = |tag: u8, payload: u64| TaggedVal { tag, _pad: [0; 7], payload };
+    match (*arr).elem_tag {
+        TAG_INT32 => mk(TAG_INT32, *((*arr).data as *const i32).add(i) as i64 as u64),
+        TAG_INT64 => mk(TAG_INT64, *((*arr).data as *const i64).add(i) as u64),
+        TAG_FLOAT32 => mk(TAG_FLOAT32, (*((*arr).data as *const f32).add(i)).to_bits() as u64),
+        TAG_FLOAT64 => mk(TAG_FLOAT64, (*((*arr).data as *const f64).add(i)).to_bits()),
+        TAG_UINT8 => mk(TAG_INT32, *((*arr).data as *const u8).add(i) as i64 as u64),
+        TAG_INT8 => mk(TAG_INT32, *((*arr).data as *const i8).add(i) as i64 as u64),
+        TAG_UINT16 => mk(TAG_INT32, *((*arr).data as *const u16).add(i) as i64 as u64),
+        TAG_INT16 => mk(TAG_INT32, *((*arr).data as *const i16).add(i) as i64 as u64),
+        TAG_UINT32 => mk(TAG_INT64, *((*arr).data as *const u32).add(i) as u64),
+        TAG_UINT64 => mk(TAG_UINT64, *((*arr).data as *const u64).add(i)),
+        _ => {
+            // Tagged array: elem IS a LinArrayElem (== TaggedVal layout).
+            let elem = (*arr).data.add(i);
+            mk((*elem).tag, (*elem).payload)
+        }
+    }
+}
+
+/// Structural array equality (element-by-element), handling flat scalar AND tagged arrays,
+/// including mixed representations (e.g. a flat `Int32[]` vs a tagged `Json[]` of ints).
+/// Element comparison is deep for nested strings/arrays/objects (via `lin_tagged_eq`), and
+/// cross-numeric by value (Int == Float), matching `lin_tagged_eq`'s scalar rules.
 #[no_mangle]
 pub unsafe extern "C" fn lin_array_eq(a: *const LinArray, b: *const LinArray) -> u8 {
     if a == b { return 1; }
     if a.is_null() || b.is_null() { return 0; }
     let len = (*a).len;
     if len != (*b).len { return 0; }
+    // Fast path: both tagged with identical scalar elem_tag → original cheap loop is safe
+    // (both walk 16-byte strides) but `lin_tagged_eq` is just as correct, so use the general
+    // path uniformly — the per-element copy is cheap and avoids the flat-stride OOB bug.
     for i in 0..len as usize {
-        let ae = (*a).data.add(i);
-        let be = (*b).data.add(i);
-        if (*ae).tag != (*be).tag { return 0; }
-        // Compare payloads — for strings/arrays/objects this is pointer eq (shallow),
-        // which matches the spec for the typed-array case where elements are scalars.
-        if (*ae).payload != (*be).payload { return 0; }
+        let av = array_elem_value(a, i);
+        let bv = array_elem_value(b, i);
+        if crate::tagged::lin_tagged_eq(
+            &av as *const crate::tagged::TaggedVal as *const u8,
+            &bv as *const crate::tagged::TaggedVal as *const u8,
+        ) == 0 {
+            return 0;
+        }
     }
     1
 }
@@ -738,8 +771,7 @@ pub unsafe extern "C" fn lin_flat_array_get_i32(arr: *const LinArray, idx: i64) 
     let len = (*arr).len as i64;
     let actual = if idx < 0 { len + idx } else { idx };
     if actual < 0 || actual >= len {
-        eprintln!("Runtime error: array index {} out of bounds (len {})", idx, len);
-        std::process::exit(1);
+        crate::fault::runtime_fault(&format!("Runtime error: array index {} out of bounds (len {})", idx, len));
     }
     let data = (*arr).data as *const i32;
     *data.add(actual as usize)
@@ -799,8 +831,7 @@ pub unsafe extern "C" fn lin_flat_array_get_i64(arr: *const LinArray, idx: i64) 
     let len = (*arr).len as i64;
     let actual = if idx < 0 { len + idx } else { idx };
     if actual < 0 || actual >= len {
-        eprintln!("Runtime error: array index {} out of bounds (len {})", idx, len);
-        std::process::exit(1);
+        crate::fault::runtime_fault(&format!("Runtime error: array index {} out of bounds (len {})", idx, len));
     }
     let data = (*arr).data as *const i64;
     *data.add(actual as usize)
@@ -860,8 +891,7 @@ pub unsafe extern "C" fn lin_flat_array_get_f32(arr: *const LinArray, idx: i64) 
     let len = (*arr).len as i64;
     let actual = if idx < 0 { len + idx } else { idx };
     if actual < 0 || actual >= len {
-        eprintln!("Runtime error: array index {} out of bounds (len {})", idx, len);
-        std::process::exit(1);
+        crate::fault::runtime_fault(&format!("Runtime error: array index {} out of bounds (len {})", idx, len));
     }
     let data = (*arr).data as *const f32;
     *data.add(actual as usize)
@@ -921,8 +951,7 @@ pub unsafe extern "C" fn lin_flat_array_get_f64(arr: *const LinArray, idx: i64) 
     let len = (*arr).len as i64;
     let actual = if idx < 0 { len + idx } else { idx };
     if actual < 0 || actual >= len {
-        eprintln!("Runtime error: array index {} out of bounds (len {})", idx, len);
-        std::process::exit(1);
+        crate::fault::runtime_fault(&format!("Runtime error: array index {} out of bounds (len {})", idx, len));
     }
     let data = (*arr).data as *const f64;
     *data.add(actual as usize)
@@ -1061,8 +1090,7 @@ macro_rules! flat_set_slice {
             let len = (*arr).len as i64;
             let actual = if idx < 0 { len + idx } else { idx };
             if actual < 0 || actual >= len {
-                eprintln!("Runtime error: array index {} out of bounds (len {})", idx, len);
-                std::process::exit(1);
+                crate::fault::runtime_fault(&format!("Runtime error: array index {} out of bounds (len {})", idx, len));
             }
             let data = (*arr).data as *mut $t;
             *data.add(actual as usize) = val;
@@ -1144,8 +1172,7 @@ macro_rules! flat_small_int {
             let len = (*arr).len as i64;
             let actual = if idx < 0 { len + idx } else { idx };
             if actual < 0 || actual >= len {
-                eprintln!("Runtime error: array index {} out of bounds (len {})", idx, len);
-                std::process::exit(1);
+                crate::fault::runtime_fault(&format!("Runtime error: array index {} out of bounds (len {})", idx, len));
             }
             let data = (*arr).data as *const $t;
             *data.add(actual as usize)
@@ -1156,8 +1183,7 @@ macro_rules! flat_small_int {
             let len = (*arr).len as i64;
             let actual = if idx < 0 { len + idx } else { idx };
             if actual < 0 || actual >= len {
-                eprintln!("Runtime error: array index {} out of bounds (len {})", idx, len);
-                std::process::exit(1);
+                crate::fault::runtime_fault(&format!("Runtime error: array index {} out of bounds (len {})", idx, len));
             }
             let data = (*arr).data as *mut $t;
             *data.add(actual as usize) = val;
