@@ -985,6 +985,27 @@ print(toString("z" > "a"))
 }
 
 #[test]
+fn test_string_vs_null_equality() {
+    // Regression: comparing a String to `null` (the ubiquitous `s != null` guard) must be a
+    // plain boolean, not a null-pointer deref. `lin_string_eq` previously dereferenced both
+    // operands unconditionally; a Lin `null` is a null pointer, so `"s" == null` / `s != null`
+    // crashed. Now null-safe (matching lin_object_eq / lin_array_eq).
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val s = "hello"
+print(toString(s == null))
+print(toString(s != null))
+print(toString(null == s))
+
+val obj = { "k": "v" }
+print(toString(obj["k"] != null))
+print(toString(obj["missing"] != null))
+"#);
+    assert_eq!(output, vec!["false", "true", "false", "true", "false"]);
+}
+
+#[test]
 fn test_numeric_comparison() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
