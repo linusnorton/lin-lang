@@ -396,6 +396,18 @@ struct FuncBuilder {
     /// The subset of `created_cells` proven to ESCAPE (a capturing closure was lowered outside
     /// safe-combinator-callback context). Escaping cells are NEVER freed (leak, but sound).
     escaping_cells: std::collections::HashSet<Temp>,
+    /// Transfer-on-escape aliasing: a call-result `dst` → the RAW fresh-alloc heap-literal
+    /// temps whose payload that result aliases (because the literal was boxed into a
+    /// Json/union parameter and the callee borrows + returns it, e.g. `(acc) => acc`).
+    ///
+    /// The literal is `register_owned` in this scope and would normally be released at
+    /// scope exit. That is correct when the call result is TRANSIENT (consumed/discarded —
+    /// the single release balances the single +1). But when the result ESCAPES (is kept in
+    /// the return keep-set), releasing the literal frees the payload the escaping result
+    /// still aliases → use-after-free. So `pop_scope_releasing_keep` transitively expands
+    /// the keep-set through this map: keeping a result also keeps the literals it aliases,
+    /// transferring ownership into the escaping value (its eventual owner does the release).
+    escape_alias: HashMap<Temp, Vec<Temp>>,
 }
 
 impl FuncBuilder {
@@ -441,6 +453,7 @@ impl FuncBuilder {
             cell_slots: HashMap::new(),
             created_cells: Vec::new(),
             escaping_cells: std::collections::HashSet::new(),
+            escape_alias: HashMap::new(),
         }
     }
 
@@ -556,6 +569,33 @@ impl FuncBuilder {
         }
     }
 
+    /// True if `t` is registered as owned (holds an independent +1) in any live scope frame.
+    /// Used at the function return boundary to distinguish a value the scope already owns
+    /// (fresh alloc, retained projection, cloned cell/global read — return it as-is) from a
+    /// BORROWED interior pointer (e.g. a union/Json `obj[k]` projection — `lin_object_get`
+    /// hands back a `*TaggedVal` pointing INTO the container, which the lowerer deliberately
+    /// does NOT own). The latter must be cloned before it escapes as the result, or the
+    /// caller's uniform "result is owned +1, release it" convention double-frees the interior
+    /// value when the container is also released.
+    fn is_owned_in_scope(&self, t: Temp) -> bool {
+        self.scope_owned
+            .iter()
+            .any(|frame| frame.iter().any(|(owned, _)| *owned == t))
+    }
+
+    /// True if `t` is registered owned in the INNERMOST (current) scope frame only — i.e. a
+    /// value freshly produced and owned by THIS scope (a +1 the scope will release on pop),
+    /// as opposed to one owned by an enclosing frame (e.g. a `val r = …` local read inside a
+    /// branch: `r`'s +1 lives in the function-body scope, not the branch scope). Used by an
+    /// `if`/match branch to decide whether a union value flowing into the merge can TRANSFER
+    /// its branch-scope +1 (current-frame owned) or must be CLONED (owned elsewhere / borrowed),
+    /// so the merge ends up with an independently-owned box that an enclosing release can't free.
+    fn is_owned_in_current_scope(&self, t: Temp) -> bool {
+        self.scope_owned
+            .last()
+            .is_some_and(|frame| frame.iter().any(|(owned, _)| *owned == t))
+    }
+
     /// THE container-insert ownership rule, in one place.
     ///
     /// When a value is stored into a container that takes ownership of one reference
@@ -604,23 +644,65 @@ impl FuncBuilder {
         }
     }
 
-    /// Pop the current scope frame and emit Release for all owned temps except `keep`.
-    /// `keep` transfers EXACTLY ONE owned reference to the survivor: a temp registered more than
-    /// once in this scope (e.g. `val r = [..]; r`, where the block result `r` is registered at the
-    /// array allocation AND again by the `LocalGet` read-retain of the trailing expression) leaks
-    /// every reference beyond the first unless the extras are released. So keep the FIRST `keep`
-    /// occurrence and RELEASE the rest. (Mirrors `pop_scope_releasing_keep`.)
+    /// Pop the current scope frame and emit Release for all owned temps except those in the kept
+    /// set. The kept set is `keep` expanded through `escape_alias` — the fresh literals whose
+    /// ownership transfers into `keep` when it escapes this scope (e.g. a block whose result is
+    /// `id([1,2])` must keep the `[1,2]` literal alive, not just the result temp). Each kept temp
+    /// transfers EXACTLY ONE owned reference: a temp registered more than once in this scope
+    /// (e.g. `val r = [..]; r`, where the block result `r` is registered at the array allocation
+    /// AND again by the `LocalGet` read-retain of the trailing expression) leaks every reference
+    /// beyond the first unless the extras are released — so keep each temp's FIRST occurrence and
+    /// RELEASE the rest. (Mirrors `pop_scope_releasing_keep`.)
     fn pop_scope_releasing(&mut self, keep: Temp) {
+        let keep = self.expand_keep_for_escape(&[keep]);
         if let Some(frame) = self.scope_owned.pop() {
-            let mut kept = false;
+            let mut kept: Vec<(Temp, Type)> = Vec::new();
             for (t, ty) in frame {
-                if t == keep && !kept {
-                    kept = true;
+                if keep.contains(&t) && !kept.iter().any(|(k, _)| *k == t) {
+                    kept.push((t, ty));
                 } else {
                     self.emit(Instruction::Release { val: t, ty });
                 }
             }
+            // The kept survivors' +1 references TRANSFER UP to the now-current (parent) scope:
+            // re-register them so the parent owns and releases them (or keeps them again if the
+            // value is the parent's own survivor). Without this, a block whose result is an
+            // owned +1 (e.g. an `if`/match merge value, a fresh call result) would be seen as
+            // unowned by the enclosing function-return path — which then takes a SECOND +1 via
+            // CloneBox/Retain, leaking one reference per evaluation (a per-iteration leak inside
+            // a loop). Mirrors `pop_scope_releasing_keep`.
+            for (t, ty) in kept {
+                self.register_owned(t, ty);
+            }
         }
+    }
+
+    /// Record that the call result `dst` aliases the payload of the raw fresh-alloc literal
+    /// `lit` (see `escape_alias`). Used by `lower_call` when a fresh heap literal is boxed
+    /// into a Json/union parameter; ownership of `lit` transfers into `dst` if `dst` escapes.
+    fn record_escape_alias(&mut self, dst: Temp, lit: Temp) {
+        self.escape_alias.entry(dst).or_default().push(lit);
+    }
+
+    /// Expand a return keep-set transitively through `escape_alias`: if a kept temp is a
+    /// call result that aliases fresh literal(s), those literals must be kept too (their
+    /// ownership transfers into the escaping result). Follows chains (e.g. `wrap` returning
+    /// `mid([1,2])` where `mid` returns `id(acc)`).
+    fn expand_keep_for_escape(&self, keep: &[Temp]) -> Vec<Temp> {
+        let mut out: Vec<Temp> = keep.to_vec();
+        let mut i = 0;
+        while i < out.len() {
+            let t = out[i];
+            if let Some(lits) = self.escape_alias.get(&t) {
+                for &lit in lits {
+                    if !out.contains(&lit) {
+                        out.push(lit);
+                    }
+                }
+            }
+            i += 1;
+        }
+        out
     }
 
     /// Pop the current scope frame, releasing all owned temps except those in `keep`.
@@ -634,6 +716,7 @@ impl FuncBuilder {
     /// extra refcount). So we keep only the FIRST occurrence of each kept temp and RELEASE the
     /// rest, leaving the survivor at exactly +1 for the caller.
     fn pop_scope_releasing_keep(&mut self, keep: &[Temp]) {
+        let keep = self.expand_keep_for_escape(keep);
         if let Some(frame) = self.scope_owned.pop() {
             let mut kept_seen: Vec<Temp> = Vec::new();
             for (t, ty) in frame {
@@ -963,6 +1046,77 @@ fn coerce_to_slot_type(t: Temp, value_ty: &Type, slot_ty: &Type, builder: &mut F
     }
 }
 
+/// Coerce one branch of an `if` (used as a value) to the merge's result representation, producing
+/// a result the merge OWNS independently. Returns `(merge_value, keep_set, owns_plus_one)`:
+/// `keep_set` lists temps the branch scope must NOT release; `owns_plus_one` is true when
+/// `merge_value` carries an independent +1 reference (so the merge must register+release it).
+///
+/// Two use-after-free hazards drive this, both for the `if isFailure(r) then r else …`
+/// propagation idiom where `r` is an owned local (`val r = deep()`) whose +1 lives in the
+/// ENCLOSING (function-body) scope — not the branch scope:
+///
+/// 1. UNBOX to a CONCRETE merge type. A plain `Coerce` (union → concrete) yields the box's
+///    INTERIOR pointer with NO new reference, so the concrete value ALIASES the box's inner
+///    payload. The merge releases it once; meanwhile the enclosing scope releases `r`'s box —
+///    freeing the very payload the result aliases.
+/// 2. A UNION merge value that aliases `r`'s box. The merge phi just forwards `r`'s box; the
+///    enclosing scope releases `r` BEFORE the function-return clone (or any later use) runs,
+///    so the forwarded box dangles.
+///
+/// Fix in both cases: take an INDEPENDENT reference. For (1), `CloneBox` then unbox the clone
+/// then free the clone's shell — the concrete result owns a +1 inner. For (2), `CloneBox` a
+/// branch value that is NOT owned by the branch's own scope (a `val`-local read, a param, a
+/// projection) into a fresh +1 box. A value already owned by the CURRENT branch scope (a fresh
+/// allocation / call result) just transfers its +1. A concrete value boxed to union transfers
+/// via the kept raw temp.
+fn coerce_if_branch(
+    raw: Temp,
+    value_ty: &Type,
+    result_type: &Type,
+    builder: &mut FuncBuilder,
+) -> (Temp, Vec<Temp>, bool) {
+    // (1) Unbox a union/Json value to a CONCRETE rc merge representation: take an independent
+    // reference via clone-then-unbox so the merge result does not alias a payload freed by the
+    // source box's own owner.
+    if is_union_ty(value_ty) && !is_union_ty(result_type) && is_rc_type(result_type) {
+        let cloned = builder.alloc_temp(value_ty.clone());
+        builder.emit(Instruction::CloneBox { dst: cloned, src: raw, ty: value_ty.clone() });
+        let unboxed = builder.alloc_temp(result_type.clone());
+        builder.emit(Instruction::Coerce {
+            dst: unboxed, src: cloned, from_ty: value_ty.clone(), to_ty: result_type.clone(),
+        });
+        // The clone's inner payload (+1) now lives on as `unboxed`; reclaim the clone's
+        // 16-byte box shell (the inner survives). `raw` (the source box) is left to its own
+        // owner — do not keep it. The merge owns `unboxed` (+1 concrete rc).
+        builder.emit(Instruction::FreeBoxShell { val: cloned });
+        return (unboxed, vec![unboxed], true);
+    }
+    // (2) Union merge value. Ensure it is an independently-owned +1 box.
+    if is_union_ty(result_type) {
+        if is_union_ty(value_ty) {
+            if builder.is_owned_in_current_scope(raw) {
+                // Fresh in this branch (a call result / allocation owned by the branch scope):
+                // transfer its +1 to the merge. Keep it across the branch pop.
+                return (raw, vec![raw], true);
+            }
+            // Borrowed (a `val`-local read like `r`, a param, a projection): clone into a fresh
+            // +1 box so an enclosing release of the source box cannot free what the merge holds.
+            let cloned = builder.alloc_temp(value_ty.clone());
+            builder.emit(Instruction::CloneBox { dst: cloned, src: raw, ty: value_ty.clone() });
+            return (cloned, vec![cloned], true);
+        }
+        // Concrete value boxed to union: the fresh box owns its inner (the kept raw transfers
+        // its +1 into the box). The merge owns the box.
+        let boxed = coerce_to_slot_type(raw, value_ty, result_type, builder);
+        return (boxed, vec![boxed, raw], true);
+    }
+    // Concrete merge, concrete branch (or scalar unbox): the existing coercion, no extra
+    // ownership. Keep BOTH the value and the raw pre-coercion temp — a box (e.g. lin_box_object)
+    // shares the underlying pointer, so releasing the raw would free what the kept box wraps.
+    let val = coerce_to_slot_type(raw, value_ty, result_type, builder);
+    (val, vec![val, raw], false)
+}
+
 fn const_type(c: &Const) -> Type {
     match c {
         Const::Int(_, t) => t.clone(),
@@ -1285,6 +1439,28 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                 let dst = builder.alloc_temp(gty.clone());
                 builder.emit(Instruction::GlobalValGet { dst, slot: *slot, ty: gty.clone() });
                 own_for_read(dst, &gty, builder)
+            } else if let Some(&fid) = ctx.global_fn_slots.get(slot) {
+                // A top-level NAMED function referenced as a VALUE (not in call position):
+                // e.g. passed as a `Function`-typed argument `combine(t, l, p, leaf)`, or stored
+                // in a binding. Top-level fn vals are NOT published as module globals (they live
+                // only as `main`'s SSA temps — see lower_module's global_val_slots scan, which
+                // excludes Function vals), so inside any OTHER function the slot resolves to none
+                // of the branches above. Without this it fell through to the placeholder `else`
+                // and emitted NO instruction, so codegen's arg collection (filter_map over
+                // temp_map) silently DROPPED the arg — "3 args for a 4-param call" → codegen
+                // error for a recursive callee, segfault for a non-recursive one. Materialize the
+                // named fn as a closure VALUE exactly as a lambda literal would (MakeClosure with
+                // no captures), so codegen wraps it in the uniform boxed-ABI desc-ret stub.
+                let closure_ty = ty.clone();
+                let dst = builder.alloc_temp(closure_ty.clone());
+                builder.emit(Instruction::MakeClosure {
+                    dst,
+                    func: fid,
+                    captures: vec![],
+                    ret_ty: closure_ty.clone(),
+                });
+                builder.register_owned(dst, closure_ty);
+                dst
             } else {
                 // Slot not yet in scope — emit a placeholder null temp.
                 // (Can happen for forward-declared functions resolved by codegen.)
@@ -1388,6 +1564,12 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
         }
 
         TypedExpr::BinaryOp { left, op, right, result_type, .. } => {
+            // `&&` / `||` are SHORT-CIRCUITING (spec §24): the RHS must only be evaluated when
+            // the LHS does not already decide the result. Emit branch + merge + Phi control flow
+            // (mirroring lower_if) rather than a bitwise and/or over two eagerly-lowered operands.
+            if matches!(op, BinOp::And | BinOp::Or) {
+                return lower_short_circuit(left, *op, right, result_type, builder, ctx);
+            }
             // The operand type drives equality/comparison dispatch (e.g. object/array
             // deep equality); it differs from result_type for comparisons (which yield Bool).
             let left_ty = left.ty();
@@ -1673,27 +1855,39 @@ fn lower_call_arg(a: &TypedExpr, param_ty: Option<&Type>, builder: &mut FuncBuil
     lower_coerce_arg(t, &a.ty(), param_ty, builder)
 }
 
-/// Lower argument `i` of a call. When `i` is the callback index of a KNOWN synchronous
-/// combinator (`cb_idx`), enable the captured-cell safe-context (the closure is consumed
-/// synchronously and never escapes); otherwise lower normally. `safe_callback_depth` is a
-/// counter so nested combinator callbacks remain safe and only fully unwinding to 0 (a
-/// non-combinator context) marks captured cells escaping.
-fn lower_call_arg_maybe_safe(
+/// Lower argument `i` of a call, combining two concerns:
+///   1. When `i` is the callback index of a KNOWN synchronous combinator (`cb_idx`), enable
+///      the captured-cell safe-context (`safe_callback_depth`, a counter so nested combinator
+///      callbacks stay safe) so a closure lowered there keeps its captured cells freeable.
+///   2. Capture the RAW (pre-coercion) temp when the argument is a fresh-alloc heap literal
+///      boxed into a Json/union parameter — the temp `register_owned` tracks — so `lower_call`
+///      can transfer its ownership on escape (see `escape_alias`). Returns `None` otherwise.
+/// The two are mutually exclusive in practice (the combinator-callback path lowers a closure,
+/// which is never a boxed fresh heap literal), but composing them keeps the call site uniform.
+fn lower_call_arg_tracked(
     a: &TypedExpr,
     param_ty: Option<&Type>,
     i: usize,
     cb_idx: Option<usize>,
     builder: &mut FuncBuilder,
     ctx: &mut LowerCtx,
-) -> Temp {
+) -> (Temp, Option<Temp>) {
+    // Fresh-alloc heap literal boxed into a Json/union param: capture the raw temp for
+    // transfer-on-escape tracking. (This path never coincides with a combinator callback.)
+    if arg_box_is_caller_owned_shell(&a.ty(), param_ty) && expr_is_fresh_alloc(a) {
+        let raw = lower_expr(a, builder, ctx);
+        let coerced = lower_coerce_arg(raw, &a.ty(), param_ty, builder);
+        let tracked = if coerced != raw { Some(raw) } else { None };
+        return (coerced, tracked);
+    }
+    // Combinator callback position: enable the safe captured-cell context while lowering.
     if cb_idx == Some(i) {
         ctx.safe_callback_depth += 1;
         let t = lower_call_arg(a, param_ty, builder, ctx);
         ctx.safe_callback_depth -= 1;
-        t
-    } else {
-        lower_call_arg(a, param_ty, builder, ctx)
+        return (t, None);
     }
+    (lower_call_arg(a, param_ty, builder, ctx), None)
 }
 
 fn lower_call(
@@ -1725,14 +1919,18 @@ fn lower_call(
         // concrete args passed to Json/union-typed parameters.
         if let Some((sym, param_tys)) = ctx.import_fn_slots.get(slot).cloned() {
             let mut shell_boxes: Vec<Temp> = Vec::new();
+            let mut escape_lits: Vec<Temp> = Vec::new();
             let lowered_args: Vec<Temp> = args
                 .iter()
                 .enumerate()
                 .map(|(i, a)| {
-                    let arg = lower_call_arg_maybe_safe(a, param_tys.get(i), i, cb_idx, builder, ctx);
+                    let (arg, raw_lit) = lower_call_arg_tracked(a, param_tys.get(i), i, cb_idx, builder, ctx);
                     retain_call_arg(arg, &a.ty(), expr_is_fresh_alloc(a), builder);
                     if arg_box_is_caller_owned_shell(&a.ty(), param_tys.get(i)) {
                         shell_boxes.push(arg);
+                    }
+                    if let Some(lit) = raw_lit {
+                        escape_lits.push(lit);
                     }
                     arg
                 })
@@ -1753,6 +1951,9 @@ fn lower_call(
             });
             free_arg_box_shells(&shell_boxes, dst, builder);
             builder.register_owned(dst, result_type.clone());
+            for lit in escape_lits {
+                builder.record_escape_alias(dst, lit);
+            }
             return dst;
         }
         // Check global function slots.
@@ -1764,14 +1965,18 @@ fn lower_call(
                 _ => vec![],
             };
             let mut shell_boxes: Vec<Temp> = Vec::new();
+            let mut escape_lits: Vec<Temp> = Vec::new();
             let lowered_args: Vec<Temp> = args
                 .iter()
                 .enumerate()
                 .map(|(i, a)| {
-                    let arg = lower_call_arg_maybe_safe(a, param_tys.get(i), i, cb_idx, builder, ctx);
+                    let (arg, raw_lit) = lower_call_arg_tracked(a, param_tys.get(i), i, cb_idx, builder, ctx);
                     retain_call_arg(arg, &a.ty(), expr_is_fresh_alloc(a), builder);
                     if arg_box_is_caller_owned_shell(&a.ty(), param_tys.get(i)) {
                         shell_boxes.push(arg);
+                    }
+                    if let Some(lit) = raw_lit {
+                        escape_lits.push(lit);
                     }
                     arg
                 })
@@ -1809,6 +2014,9 @@ fn lower_call(
             });
             free_arg_box_shells(&shell_boxes, dst, builder);
             builder.register_owned(dst, result_type.clone());
+            for lit in escape_lits {
+                builder.record_escape_alias(dst, lit);
+            }
             return dst;
         }
     }
@@ -1823,12 +2031,18 @@ fn lower_call(
         Type::Function { params, .. } => params,
         _ => vec![],
     };
+    let mut escape_lits: Vec<Temp> = Vec::new();
     let lowered_args: Vec<Temp> = args
         .iter()
         .enumerate()
         .map(|(i, a)| {
-            let arg = lower_call_arg(a, param_tys.get(i), builder, ctx);
+            // Indirect call through a closure value: the callee is not a known synchronous
+            // combinator, so cb_idx is None (no safe captured-cell context — conservative).
+            let (arg, raw_lit) = lower_call_arg_tracked(a, param_tys.get(i), i, None, builder, ctx);
             retain_call_arg(arg, &a.ty(), expr_is_fresh_alloc(a), builder);
+            if let Some(lit) = raw_lit {
+                escape_lits.push(lit);
+            }
             arg
         })
         .collect();
@@ -1856,6 +2070,13 @@ fn lower_call(
     // ARE +1: a concrete param read retains in place before the closure keeps it on return.)
     if is_rc_type(result_type) {
         builder.register_owned(dst, result_type.clone());
+    }
+    // Record transfer-on-escape aliasing regardless of whether the result was registered owned:
+    // when the result escapes (is kept in a scope's keep-set), the fresh literal args it aliases
+    // must be kept too (their scope-exit release would otherwise free the payload the escaping
+    // result still aliases — the arg-box use-after-free).
+    for lit in escape_lits {
+        builder.record_escape_alias(dst, lit);
     }
     dst
 }
@@ -2634,33 +2855,32 @@ fn lower_if(
     });
 
     let result_dst = builder.alloc_temp(result_type.clone());
-    // Only CONCRETE rc merge results are registered as owned. A boxed-union if-result is NOT
-    // owned here: a branch may yield a BORROWED union box (e.g. `if c then x else y` returning
-    // params, as in minBy's reducer `if x[0] < acc[0] then x else acc`), which carries no +1, so
-    // registering+releasing the merge would double-free a borrowed box. (Concrete rc branch
-    // values are always +1 — a concrete param read retains in place.)
-    let result_is_rc = is_rc_type(result_type);
 
     // Each branch gets its own ownership scope so heap temps it allocates are released
     // at the end of *that branch* — not in the merge block, where only one branch's
     // temps are live (releasing the other branch's temps there frees undefined values).
-    // The branch's result value is kept (released as part of the merge's owned set).
+    // `coerce_if_branch` produces a value the merge OWNS independently (cloning a borrowed
+    // union/concrete that aliases an enclosing-scope value), so registering+releasing the
+    // merge is always balanced — no borrowed-box double-free (the historic reason a union
+    // merge was left unowned: e.g. minBy's reducer `if x[0] < acc[0] then x else acc` over
+    // params — now those params are cloned into a fresh +1).
     // We collect (value_temp, predecessor_block) for a Phi in the merge block, recording
     // the ACTUAL predecessor (the block current at the end of the branch, which may differ
     // from the branch entry if the branch contained nested control flow).
     let mut incomings: Vec<(Temp, BlockId)> = Vec::new();
+    // Whether the merged value carries an independent +1 (so the enclosing scope owns/releases
+    // it). Determined by the branch coercion; both branches agree (it is a function of the
+    // result representation). Defaults to the concrete-rc rule if neither branch falls through.
+    let mut merge_owned = is_rc_type(result_type) || is_union_ty(result_type);
 
     // --- then branch ---
     builder.switch_to(then_block);
     builder.push_scope();
     let then_raw = lower_expr(then_br, builder, ctx);
     if !builder.is_current_block_terminated() {
-        // Coerce to the if's result representation so both phi inputs agree (e.g. an
-        // `Object` branch value boxed to a `Json` if-result). Keep BOTH the kept result
-        // and its raw pre-coercion temp: a box shares the underlying pointer, so releasing
-        // the original would free what the kept box wraps.
-        let then_val = coerce_to_slot_type(then_raw, &then_br.ty(), result_type, builder);
-        builder.pop_scope_releasing_keep(&[then_val, then_raw]);
+        let (then_val, keep, owned) = coerce_if_branch(then_raw, &then_br.ty(), result_type, builder);
+        merge_owned = owned;
+        builder.pop_scope_releasing_keep(&keep);
         incomings.push((then_val, builder.current_block));
         builder.terminate(Terminator::Jump(merge_block));
     } else {
@@ -2672,8 +2892,9 @@ fn lower_if(
     builder.push_scope();
     let else_raw = lower_expr(else_br, builder, ctx);
     if !builder.is_current_block_terminated() {
-        let else_val = coerce_to_slot_type(else_raw, &else_br.ty(), result_type, builder);
-        builder.pop_scope_releasing_keep(&[else_val, else_raw]);
+        let (else_val, keep, owned) = coerce_if_branch(else_raw, &else_br.ty(), result_type, builder);
+        merge_owned = owned;
+        builder.pop_scope_releasing_keep(&keep);
         incomings.push((else_val, builder.current_block));
         builder.terminate(Terminator::Jump(merge_block));
     } else {
@@ -2690,9 +2911,79 @@ fn lower_if(
     });
     // The merged result is owned by the enclosing scope (released there, or kept if it is
     // the block's return value).
-    if result_is_rc {
+    if merge_owned {
         builder.register_owned(result_dst, result_type.clone());
     }
+    result_dst
+}
+
+/// Lower a short-circuiting `&&` / `||` (spec §24) as branch + merge + Phi, so the RHS is
+/// only evaluated on the path that needs it.
+///
+/// - `a && b`: eval a; if a then eval b else `false`; phi.
+/// - `a || b`: eval a; if a then `true`  else eval b; phi.
+///
+/// The RHS is lowered INSIDE the conditionally-executed block (its own ownership scope), so any
+/// owned temps it allocates are released there and are only ever created on the taken path —
+/// exactly as lower_if handles a branch arm. Both operands are booleans (scalars), so the result
+/// is RC-trivial.
+fn lower_short_circuit(
+    left: &TypedExpr,
+    op: BinOp,
+    right: &TypedExpr,
+    _result_type: &Type,
+    builder: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+) -> Temp {
+    let lhs = lower_cond_as_bool(left, builder, ctx);
+
+    // The block that evaluates the RHS, and the block that short-circuits to a constant.
+    let rhs_block = builder.alloc_block(if matches!(op, BinOp::And) { "and_rhs" } else { "or_rhs" });
+    let short_block = builder.alloc_block(if matches!(op, BinOp::And) { "and_short" } else { "or_short" });
+    let merge_block = builder.alloc_block("sc_merge");
+    builder.set_block_span(rhs_block, right.span());
+
+    // For `&&`, the RHS is evaluated when the LHS is true; for `||`, when the LHS is false.
+    let (then_block, else_block) = match op {
+        BinOp::And => (rhs_block, short_block),
+        BinOp::Or => (short_block, rhs_block),
+        _ => unreachable!("lower_short_circuit only handles And/Or"),
+    };
+    builder.terminate(Terminator::CondJump {
+        cond: lhs,
+        then_block,
+        else_block,
+    });
+
+    let result_dst = builder.alloc_temp(Type::Bool);
+    let mut incomings: Vec<(Temp, BlockId)> = Vec::new();
+
+    // --- RHS block: evaluate the right operand (its own ownership scope) ---
+    builder.switch_to(rhs_block);
+    builder.push_scope();
+    let rhs_raw = lower_cond_as_bool(right, builder, ctx);
+    if !builder.is_current_block_terminated() {
+        // rhs is a Bool scalar; keep it across the scope pop (nothing to release for a bool).
+        builder.pop_scope_releasing_keep(&[rhs_raw]);
+        incomings.push((rhs_raw, builder.current_block));
+        builder.terminate(Terminator::Jump(merge_block));
+    } else {
+        builder.discard_scope();
+    }
+
+    // --- short-circuit block: yield the constant that the LHS already determined ---
+    builder.switch_to(short_block);
+    // `false && _` → false; `true || _` → true.
+    let short_val = builder.const_temp(Const::Bool(matches!(op, BinOp::Or)));
+    incomings.push((short_val, builder.current_block));
+    builder.terminate(Terminator::Jump(merge_block));
+
+    builder.switch_to(merge_block);
+    builder.emit(Instruction::Phi {
+        dst: result_dst,
+        ty: Type::Bool,
+        incomings,
+    });
     result_dst
 }
 
@@ -3319,6 +3610,7 @@ fn lower_function_expr_with_id(
         cell_slots: HashMap::new(),
         created_cells: Vec::new(),
         escaping_cells: std::collections::HashSet::new(),
+        escape_alias: HashMap::new(),
     };
 
     // Add entry block. Tag it with the function body's span so coverage records a
@@ -3379,6 +3671,30 @@ fn lower_function_expr_with_id(
     // surface type `Null`, but the cell (and the CellGet temp) is `Json`. Trusting the
     // stale `Null` would coerce the live Json value to a boxed null on return.
     let body_ty = inner_builder.temp_types.get(&raw_ret).cloned().unwrap_or_else(|| body.ty());
+    // A function result MUST be an OWNED (+1) reference — the uniform call convention has the
+    // caller `register_owned` the result and release it at scope exit. A BORROWED union/Json
+    // projection (`obj[k]` / `obj.field`) violates this: the lowerer deliberately does NOT own
+    // a union projection (`lin_object_get` returns an INTERIOR `*TaggedVal` into the container,
+    // not an ownable box — correct for transient in-place use), so if such a value ESCAPES as
+    // the body result, the callee hands back the interior pointer and the caller's release
+    // double-frees it once the container is released. Clone the borrowed box (`CloneBox` →
+    // `lin_tagged_clone`, the established "own a union value" primitive — see `own_for_read`)
+    // into a fresh owned +1 box so the result satisfies the convention. Only values NOT already
+    // owned in scope are cloned (a fresh alloc, a retained concrete projection, or an
+    // already-cloned cell/global read is left untouched — cloning it would leak). The transient
+    // read fast path (read a field, use it inline, don't escape) never reaches here, so it is
+    // not cloned. Skip when the block diverged (no live result temp).
+    let raw_ret = if !inner_builder.is_current_block_terminated()
+        && is_union_ty(&body_ty)
+        && !inner_builder.is_owned_in_scope(raw_ret)
+    {
+        let dst = inner_builder.alloc_temp(body_ty.clone());
+        inner_builder.emit(Instruction::CloneBox { dst, src: raw_ret, ty: body_ty.clone() });
+        inner_builder.register_owned(dst, body_ty.clone());
+        dst
+    } else {
+        raw_ret
+    };
     // Closure return ABI:
     // - `forced_ret` (set when this closure is a callback argument whose parameter declares
     //   a concrete return, e.g. groupBy's `keyFn: (Json) => String`): return exactly that

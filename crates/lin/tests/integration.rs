@@ -360,6 +360,95 @@ print(toString(length(acc)))
     assert_eq!(output, vec!["2"]);
 }
 
+// Regression: a fresh-alloc heap literal (array/object) passed to a Json/union parameter,
+// where the call RESULT ESCAPES (is returned / outlives the literal), must NOT have its
+// backing store released at the caller's scope exit while the escaping result still aliases
+// it. The lowerer registers the literal as owned in the caller scope and would release it on
+// exit; ownership must instead transfer into the escaping result (the eventual owner releases
+// it). Previously the premature scope-release fired, corrupting the array's length header and
+// crashing the returned value's later use with `capacity overflow` (a use-after-free).
+// Covers the array passthrough (identity `(acc) => acc`) and the accumulator-threading idiom
+// (recursive `build(i, n, acc)` returning the threaded `acc`).
+#[test]
+fn test_fresh_heap_arg_to_json_param_escapes_no_uaf() {
+    // Array passthrough: `id([1, 2])` returned out of `wrap`.
+    let passthrough = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val id = (acc: Json): Json => acc
+val wrap = (): Json => id([1, 2])
+print(toString(wrap()))
+"#);
+    assert_eq!(passthrough, vec!["[1, 2]"]);
+
+    // Accumulator-threading: `build(0, n, [])` returns the threaded `acc`.
+    let accumulator = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { push } from "std/array"
+
+val build = (i: Int32, n: Int32, acc: Json): Json =>
+  if i >= n then acc
+  else
+    push(acc, i * i)
+    build(i + 1, n, acc)
+val squares = (n: Int32): Json => build(0, n, [])
+print(toString(squares(4)))
+"#);
+    assert_eq!(accumulator, vec!["[0, 1, 4, 9]"]);
+
+    // Result BOUND to a `val` and then returned (block-scope escape, not just direct return) —
+    // the literal is owned in the block scope, so the block's own scope-release must also
+    // transfer ownership into the escaping result, not just the function-return release.
+    let bound = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val id = (acc: Json): Json => acc
+val wrap = (): Json =>
+  val x = id([1, 2])
+  x
+print(toString(wrap()))
+"#);
+    assert_eq!(bound, vec!["[1, 2]"]);
+
+    // INDIRECT (closure-value) call: the literal escapes through a call whose callee is a
+    // closure value (`f`), not a statically-known function.
+    let indirect = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val makeId = () => (acc: Json): Json => acc
+val wrap = (): Json =>
+  val f = makeId()
+  f([1, 2])
+print(toString(wrap()))
+"#);
+    assert_eq!(indirect, vec!["[1, 2]"]);
+
+    // Fresh object literal carrying a nested array, passed through and returned — the nested
+    // payload must survive too (a shallow box-aliasing guard would free the inner array early).
+    let nested = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val id = (acc: Json): Json => acc
+val wrap = (): Json => id({ "items": [1, 2, 3] })
+print(toString(wrap()))
+"#);
+    assert_eq!(nested, vec![r#"{"items": [1, 2, 3]}"#]);
+
+    // TRANSIENT result (consumed, not escaped) must still be released normally — guards against
+    // the keep-expansion over-suppressing the literal release and leaking.
+    let transient = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { length } from "std/array"
+
+val id = (acc: Json): Json => acc
+val use = (): Int32 =>
+  val x = id([1, 2])
+  length(x)
+print(toString(use()))
+"#);
+    assert_eq!(transient, vec!["2"]);
+}
+
 #[test]
 fn test_recursion() {
     let output = run(r#"import { print } from "std/io"
@@ -843,6 +932,49 @@ val c = false || false
 print(toString(c))
 "#);
     assert_eq!(output, vec!["true", "false", "false", "true", "true", "false"]);
+}
+
+#[test]
+fn test_logical_operators_short_circuit_evaluation() {
+    // Spec §24: `&&` / `||` are SHORT-CIRCUITING — the RHS must NOT be evaluated when the LHS
+    // already decides the result. This asserts EVALUATION order, not just the boolean value:
+    //  - a side-effecting RHS (a print) must be absent from the output when short-circuited;
+    //  - the canonical bounds-check guard `i < length(arr) && arr[i] > 0` must not index OOB.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { length } from "std/array"
+
+val boomTrue = (): Boolean =>
+  print("BOOM-AND")
+  true
+val boomFalse = (): Boolean =>
+  print("BOOM-OR")
+  false
+
+// false && _ : RHS must NOT run.
+val r1 = false && boomTrue()
+print(toString(r1))
+// true || _ : RHS must NOT run.
+val r2 = true || boomFalse()
+print(toString(r2))
+
+// Guard idiom: index is out of bounds, so the LHS is false and arr[i] must not be evaluated.
+val arr = [1, 2]
+val safeAnd = (i: Int32): Boolean =>
+  if i < length(arr) && arr[i] > 0 then true else false
+print(toString(safeAnd(5)))
+// `||` guard: LHS true short-circuits, so arr[i] must not be evaluated.
+val safeOr = (i: Int32): Boolean =>
+  if i >= length(arr) || arr[i] > 0 then true else false
+print(toString(safeOr(5)))
+
+print("end")
+"#);
+    // No "BOOM-AND" / "BOOM-OR" lines: the side-effecting RHS never ran.
+    assert!(!output.contains(&"BOOM-AND".to_string()), "&& RHS was evaluated: {:?}", output);
+    assert!(!output.contains(&"BOOM-OR".to_string()), "|| RHS was evaluated: {:?}", output);
+    // Guards are safe (no OOB crash) and yield false / true respectively; program reaches "end".
+    assert_eq!(output, vec!["false", "true", "false", "true", "end"]);
 }
 
 #[test]
@@ -1576,6 +1708,94 @@ val add5 = adder(5)
 print(toString(add5(10)))
 "#);
     assert_eq!(output, vec!["10", "15"]);
+}
+
+#[test]
+fn test_named_fn_as_opaque_function_value() {
+    // Regression: passing a TOP-LEVEL NAMED function where an opaque `Function` value is
+    // expected used to produce GARBAGE. The capture-less closure wrapper (`__cls_wrapb_*`)
+    // copied the named fn's CONCRETE param types (e.g. i32), but the uniform closure-call ABI
+    // invokes the wrapper with BOXED (ptr) args — so a TaggedVal* was reinterpreted as a scalar
+    // (or vice-versa) → garbage / misaligned deref. Now the wrapper takes all-`ptr` params and
+    // unboxes each to the body's concrete type, and every indirect call boxes its args uniformly.
+    // Covers: scalar Int32 (1-arg), String, and a 2-param named fn through an opaque `Function`.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val dbl = (x: Int32): Int32 => x * 2
+val apply = (f: Function, x: Int32): Int32 => f(x)
+print(toString(apply(dbl, 5)))
+
+val shout = (s: String): String => "${s}!"
+val applyStr = (f: Function, s: String): String => f(s)
+print(applyStr(shout, "hi"))
+
+val add = (a: Int32, b: Int32): Int32 => a + b
+val combine = (f: Function): Int32 => f(3, 4)
+print(toString(combine(add)))
+"#);
+    assert_eq!(output, vec!["10", "hi!", "7"]);
+}
+
+#[test]
+fn test_named_fn_in_map() {
+    // Regression (wrapper-ABI bug): `[1,2,3].map(namedFn)` passes the named function as a
+    // `Function` value to `map`, hitting the same boxed-vs-concrete closure-wrapper mismatch.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { map, for } from "std/array"
+
+val dbl = (x: Int32): Int32 => x * 2
+[1, 2, 3].map(dbl).for(v => print(toString(v)))
+"#);
+    assert_eq!(output, vec!["2", "4", "6"]);
+}
+
+#[test]
+fn test_named_fn_as_function_arg_to_multiparam_user_fn() {
+    // Regression: passing a top-level NAMED function as a `Function`-typed ARGUMENT to a
+    // multi-param USER function (alongside other heap/scalar params) used to DROP the arg.
+    // A bare `LocalGet` of a global-fn slot in value position fell through to a placeholder
+    // null temp with no defining instruction, so codegen's arg collection (filter_map over
+    // temp_map) silently dropped it — emitting 3 args for a 4-param call. A RECURSIVE callee
+    // then failed to build ("Incorrect number of arguments passed to called function!"); a
+    // NON-RECURSIVE callee built then SEGFAULTED when it invoked the missing Function arg.
+    // Fix: materialize the named fn as a closure VALUE (MakeClosure, no captures) like a
+    // lambda literal would. Covers recursive + non-recursive callees, Json + Int args.
+
+    // Recursive callee, Json args.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val leaf = (t: Json, p: Int32): Json => { "v": p }
+val combine = (t: Json, l: Json, p: Int32, f: Function): Json =>
+  if p >= 2 then { "v": l }
+  else
+    val r = f(t, p + 1)
+    combine(t, r, r["v"], f)
+val go = (t: Json): Json => combine(t, { "v": 0 }, 0, leaf)
+print(toString(go([])))
+"#);
+    assert_eq!(output, vec![r#"{"v": {"v": 2}}"#]);
+
+    // Non-recursive callee, Json args.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val leaf = (t: Json, p: Int32): Json => { "v": p }
+val combine = (t: Json, l: Json, p: Int32, f: Function): Json => f(t, p)
+val go = (t: Json): Json => combine(t, { "v": 0 }, 0, leaf)
+print(toString(go([])))
+"#);
+    assert_eq!(output, vec![r#"{"v": 0}"#]);
+
+    // Non-recursive callee, all-Int args.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val leaf = (t: Int32, p: Int32): Int32 => t + p
+val combine = (t: Int32, l: Int32, p: Int32, f: Function): Int32 => f(t, p)
+val go = (t: Int32): Int32 => combine(t, 0, 0, leaf)
+print(toString(go(9)))
+"#);
+    assert_eq!(output, vec!["9"]);
 }
 
 #[test]
@@ -2592,7 +2812,7 @@ counter.for(i => print(toString(i)))
 
 #[test]
 fn test_fs_write_read_roundtrip() {
-    let tmp = std::env::temp_dir().join("lin_ctest_rw.txt");
+    let tmp = std::env::temp_dir().join(format!("lin_ctest_rw_{}.txt", std::process::id()));
     let _ = fs::remove_file(&tmp);
     let path = tmp.display().to_string();
     let output = run(&format!(r#"import {{ print }} from "std/io"
@@ -2608,7 +2828,7 @@ print(content)
 
 #[test]
 fn test_fs_append_file() {
-    let tmp = std::env::temp_dir().join("lin_ctest_append.txt");
+    let tmp = std::env::temp_dir().join(format!("lin_ctest_append_{}.txt", std::process::id()));
     let _ = fs::remove_file(&tmp);
     let path = tmp.display().to_string();
     let output = run(&format!(r#"import {{ print }} from "std/io"
@@ -2625,7 +2845,7 @@ print(content)
 
 #[test]
 fn test_fs_exists() {
-    let tmp = std::env::temp_dir().join("lin_ctest_exists.txt");
+    let tmp = std::env::temp_dir().join(format!("lin_ctest_exists_{}.txt", std::process::id()));
     let _ = fs::remove_file(&tmp);
     let path = tmp.display().to_string();
     let output = run(&format!(r#"import {{ print }} from "std/io"
@@ -2653,7 +2873,7 @@ print(result["type"])
 
 #[test]
 fn test_fs_read_lines() {
-    let tmp = std::env::temp_dir().join("lin_ctest_lines.txt");
+    let tmp = std::env::temp_dir().join(format!("lin_ctest_lines_{}.txt", std::process::id()));
     let _ = fs::remove_file(&tmp);
     fs::write(&tmp, "alpha\nbeta\ngamma\n").unwrap();
     let path = tmp.display().to_string();
@@ -2673,7 +2893,7 @@ print(lines[2])
 
 #[test]
 fn test_fs_read_write_json() {
-    let tmp = std::env::temp_dir().join("lin_ctest_json.json");
+    let tmp = std::env::temp_dir().join(format!("lin_ctest_json_{}.json", std::process::id()));
     let _ = fs::remove_file(&tmp);
     let path = tmp.display().to_string();
     let output = run(&format!(r#"import {{ print }} from "std/io"
@@ -2692,7 +2912,7 @@ print(toString(loaded["version"]))
 
 #[test]
 fn test_fs_is_file() {
-    let tmp = std::env::temp_dir().join("lin_ctest_isfile.txt");
+    let tmp = std::env::temp_dir().join(format!("lin_ctest_isfile_{}.txt", std::process::id()));
     let _ = fs::remove_file(&tmp);
     let path = tmp.display().to_string();
     let output = run(&format!(r#"import {{ print }} from "std/io"
@@ -2725,7 +2945,7 @@ print(toString(isFile("{dir_path}")))
 
 #[test]
 fn test_fs_stat() {
-    let tmp = std::env::temp_dir().join("lin_ctest_stat.txt");
+    let tmp = std::env::temp_dir().join(format!("lin_ctest_stat_{}.txt", std::process::id()));
     let _ = fs::remove_file(&tmp);
     let path = tmp.display().to_string();
     fs::write(&tmp, "hello lin").unwrap();
@@ -2755,7 +2975,7 @@ print(s["type"])
 
 #[test]
 fn test_fs_list_dir() {
-    let tmp_dir = std::env::temp_dir().join("lin_ctest_listdir");
+    let tmp_dir = std::env::temp_dir().join(format!("lin_ctest_listdir_{}", std::process::id()));
     let _ = fs::remove_dir_all(&tmp_dir);
     fs::create_dir_all(&tmp_dir).unwrap();
     fs::write(tmp_dir.join("a.txt"), "").unwrap();
@@ -2786,7 +3006,7 @@ print(result["type"])
 
 #[test]
 fn test_fs_mkdir() {
-    let tmp_dir = std::env::temp_dir().join("lin_ctest_mkdir");
+    let tmp_dir = std::env::temp_dir().join(format!("lin_ctest_mkdir_{}", std::process::id()));
     let _ = fs::remove_dir_all(&tmp_dir);
     let dir_path = tmp_dir.display().to_string();
     let output = run(&format!(r#"import {{ print }} from "std/io"
@@ -2805,8 +3025,9 @@ print(toString(after))
 
 #[test]
 fn test_fs_mkdir_all() {
-    let tmp_dir = std::env::temp_dir().join("lin_ctest_mkdirall").join("a").join("b");
-    let _ = fs::remove_dir_all(std::env::temp_dir().join("lin_ctest_mkdirall"));
+    let root = std::env::temp_dir().join(format!("lin_ctest_mkdirall_{}", std::process::id()));
+    let tmp_dir = root.join("a").join("b");
+    let _ = fs::remove_dir_all(&root);
     let dir_path = tmp_dir.display().to_string();
     let output = run(&format!(r#"import {{ print }} from "std/io"
 import {{ toString }} from "std/string"
@@ -2815,13 +3036,13 @@ import {{ mkdir, isDir }} from "std/fs"
 mkdir("{dir_path}", {{ "parents": true }})
 print(toString(isDir("{dir_path}")))
 "#));
-    let _ = fs::remove_dir_all(std::env::temp_dir().join("lin_ctest_mkdirall"));
+    let _ = fs::remove_dir_all(&root);
     assert_eq!(output, vec!["true"]);
 }
 
 #[test]
 fn test_fs_delete_file() {
-    let tmp = std::env::temp_dir().join("lin_ctest_deletefile.txt");
+    let tmp = std::env::temp_dir().join(format!("lin_ctest_deletefile_{}.txt", std::process::id()));
     fs::write(&tmp, "hello").unwrap();
     let path = tmp.display().to_string();
     let output = run(&format!(r#"import {{ print }} from "std/io"
@@ -2851,8 +3072,8 @@ print(result["type"])
 
 #[test]
 fn test_fs_rename() {
-    let src = std::env::temp_dir().join("lin_ctest_rename_src.txt");
-    let dst = std::env::temp_dir().join("lin_ctest_rename_dst.txt");
+    let src = std::env::temp_dir().join(format!("lin_ctest_rename_src_{}.txt", std::process::id()));
+    let dst = std::env::temp_dir().join(format!("lin_ctest_rename_dst_{}.txt", std::process::id()));
     let _ = fs::remove_file(&src);
     let _ = fs::remove_file(&dst);
     fs::write(&src, "hello rename").unwrap();
@@ -4226,4 +4447,162 @@ print(toString(c))
 print(toString(doubled([5, 6, 7])))
 "#);
     assert_eq!(out, vec!["40000", "[10, 12, 14]"]);
+}
+
+#[test]
+fn test_union_projection_returned_no_double_free() {
+    // Regression: a Json/union projection (`obj[k]` / `obj.field`) RETURNED from a function
+    // double-freed. `lin_object_get` hands back a BORROWED INTERIOR `*TaggedVal` pointing into
+    // the container's entry array — NOT an ownable heap box. The lowerer deliberately does not
+    // own a union projection (correct for transient in-place use), but the uniform call
+    // convention has the caller treat a function result as OWNED (+1) and release it. When such
+    // a projection ESCAPES as the return value, the container release frees the interior value
+    // AND the caller's release frees it again → `free(): invalid pointer`. The fix clones a
+    // borrowed union projection (`CloneBox` → `lin_tagged_clone`) at the function return
+    // boundary so the result is a genuine owned +1 box. Each case below crashed with exit 1
+    // before the fix; the `run` harness asserts a successful exit, so a relapse fails the test.
+
+    // Projection returned directly from a named function (the minimal `pluck` repro).
+    let out = run(r#"import { print } from "std/io"
+val pluck = (x: Json): Json => x["name"]
+print(pluck({ "name": "Alice" }))
+"#);
+    assert_eq!(out, vec!["Alice"]);
+
+    // Projection returned from a map CALLBACK closure, result stored into an array then iterated:
+    // each element must be an owned box the array releases exactly once.
+    let out = run(r#"import { print } from "std/io"
+import { for, map } from "std/array"
+val records = [{ "name": "Alice" }, { "name": "Bob" }]
+records.map(r => r["name"]).for(n => print(n))
+"#);
+    assert_eq!(out, vec!["Alice", "Bob"]);
+
+    // Nested projection (`r["value"]["name"]`) through a map callback: the inner projection is a
+    // transient read, the outer escapes — only the escaping result is cloned.
+    let out = run(r#"import { print } from "std/io"
+import { map, for } from "std/array"
+val records = [{ "value": { "name": "Alice" } }, { "value": { "name": "Bob" } }]
+val names = records.map(r => r["value"]["name"])
+names.for(n => print(n))
+"#);
+    assert_eq!(out, vec!["Alice", "Bob"]);
+
+    // Projection bound to a `val` and THEN returned (a different escape route into the return
+    // boundary than a bare projection expression): the bound borrowed projection must still be
+    // cloned to an owned box before it leaves the scope.
+    let out = run(r#"import { print } from "std/io"
+val pluck = (x: Json): Json =>
+  val n = x["name"]
+  n
+print(pluck({ "name": "Carol" }))
+"#);
+    assert_eq!(out, vec!["Carol"]);
+
+    // Calling the projection-returning function many times in a loop must stay balanced (the
+    // per-call clone is released each iteration; a relapse to the borrowed-return double-free,
+    // or a per-iteration over-clone leak, would surface here / under the ASan CI leg).
+    let out = run(r#"import { print } from "std/io"
+import { range, for } from "std/array"
+import { toString } from "std/string"
+val pluck = (x: Json): Json => x["v"]
+var c = 0
+range(0, 2000).for(i =>
+  c = c + 1
+  print(toString(pluck({ "v": "x" })))
+)
+print(toString(c))
+"#);
+    assert_eq!(out.last().map(|s| s.as_str()), Some("2000"));
+}
+
+// Regression: the error-propagation idiom `val r = <owned Json call result>; if cond then r
+// else <fresh value>` returned from a function. When one branch yields the owned union local
+// `r` and the merge is unified to a CONCRETE representation, the then-branch used to UNBOX `r`
+// (`lin_unbox_ptr`) into an INTERIOR pointer aliasing `r`'s box payload WITHOUT a reference.
+// At the merge, the scope-release of `r` (`lin_tagged_release`) then freed that payload while
+// the merged result still aliased it — re-boxing the freed inner produced a box around freed
+// memory (a use-after-free; later reads crashed with a misaligned/null deref). The fix has the
+// escaping branch take an INDEPENDENT reference (clone-then-unbox, or clone the box when the
+// merge stays boxed) so the result owns its payload, and propagates that +1 up through the
+// block scope so the function-return path does not re-clone (which would leak per call).
+#[test]
+fn test_if_branch_returns_owned_json_local_no_uaf() {
+    // Minimal: then-branch returns the owned local `r`, else-branch is a fresh object.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val deep = (): Json => { "type": "failure" }
+val top = (b: Boolean): Json =>
+  val r = deep()
+  if b then r else { "type": "ok" }
+print(toString(top(true)))
+print(toString(top(false)))
+"#);
+    assert_eq!(out, vec![r#"{"type": "failure"}"#, r#"{"type": "ok"}"#]);
+
+    // The actual `if isFailure(r) then r else { ... }` idiom: the condition reads `r`, the
+    // failure path returns `r` unchanged, the success path projects from `r`.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val deep = (): Json => { "type": "failure", "error": "eof" }
+val top = (): Json =>
+  val r = deep()
+  if r["type"] == "failure" then r
+  else { "type": "success", "value": r["node"] }
+print(toString(top()))
+"#);
+    assert_eq!(out, vec![r#"{"type": "failure", "error": "eof"}"#]);
+
+    // Both branches are union (`r` and another call result `mk()`): the merge stays boxed and
+    // must clone the borrowed `r` so the scope-release of `r` does not dangle the result.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val mk = (): Json => { "type": "failure", "k": "v" }
+val pick = (i: Int32): Json =>
+  val r = mk()
+  if i > 0 then r else mk()
+print(toString(pick(5)))
+print(toString(pick(0)))
+"#);
+    assert_eq!(out, vec![r#"{"type": "failure", "k": "v"}"#, r#"{"type": "failure", "k": "v"}"#]);
+
+    // Multi-level propagation: `mid` returns `r` (from `deep`) on failure, `top` returns `r`
+    // (from `mid`) on failure — the owned union local is forwarded through two `if`-branches.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { length } from "std/array"
+val isFailure = (x: Json): Boolean => x["type"] == "failure"
+val deep = (arr: Json, pos: Int32): Json =>
+  if pos >= length(arr) then { "type": "failure", "error": "eof" }
+  else { "node": arr[pos], "pos": pos + 1 }
+val mid = (arr: Json, pos: Int32): Json =>
+  val r = deep(arr, pos)
+  if isFailure(r) then r
+  else { "node": r["node"], "pos": r["pos"] }
+val top = (arr: Json): Json =>
+  val r = mid(arr, 5)
+  if isFailure(r) then r
+  else { "type": "success", "value": r["node"] }
+print(toString(top([1, 2])))
+"#);
+    assert_eq!(out, vec![r#"{"type": "failure", "error": "eof"}"#]);
+
+    // Returned-in-a-loop with the result discarded: a per-call leak (the if-branch clone
+    // re-cloned by the function return) would surface here under the ASan CI leg; functionally
+    // it must just run to completion.
+    let out = run(r#"import { print } from "std/io"
+import { for, range } from "std/array"
+val mk = (): Json => { "type": "failure", "k": "v" }
+val pick = (i: Int32): Json =>
+  val r = mk()
+  if i > 0 then r else mk()
+val main = (): Null =>
+  range(0, 2000).for(i =>
+    val x = pick(i)
+    null
+  )
+  print("done")
+main()
+"#);
+    assert_eq!(out, vec!["done"]);
 }
