@@ -1,0 +1,268 @@
+import { split, join, startsWith, contains, replaceAll, trim, substring, indexOf, toLower } from "std/string"
+import { map, filter, reduce, for, push, range, length } from "std/array"
+
+// Slugify heading text: lowercase, spaces->hyphens
+val slugify = (text: String): String =>
+  val lower = toLower(text)
+  val s1 = replaceAll(lower, "`", "")
+  val s2 = replaceAll(s1, "*", "")
+  val s3 = replaceAll(s2, "_", "")
+  val s4 = replaceAll(s3, "(", "")
+  val s5 = replaceAll(s4, ")", "")
+  replaceAll(trim(s5), " ", "-")
+
+// Process inline code: `text` -> <code>text</code>
+val processInlineCode = (text: String): String =>
+  if contains(text, "`") then
+    val parts = split(text, "`")
+    val n = length(parts)
+    var result = ""
+    range(0, n).for(i =>
+      val part = parts[i]
+      val even = i % 2 == 0
+      if even then result = "${result}${part}"
+      else result = "${result}<code>${part}</code>"
+    )
+    result
+  else text
+
+// Process bold: **text** -> <strong>text</strong>
+val processInlineBold = (text: String): String =>
+  if contains(text, "**") then
+    val parts = split(text, "**")
+    val n = length(parts)
+    var result = ""
+    range(0, n).for(i =>
+      val part = parts[i]
+      val even = i % 2 == 0
+      if even then result = "${result}${part}"
+      else result = "${result}<strong>${part}</strong>"
+    )
+    result
+  else text
+
+// Process italic: _text_ -> <em>text</em>
+val processInlineItalic = (text: String): String =>
+  if contains(text, "_") then
+    val parts = split(text, "_")
+    val n = length(parts)
+    var result = ""
+    range(0, n).for(i =>
+      val part = parts[i]
+      val even = i % 2 == 0
+      if even then result = "${result}${part}"
+      else result = "${result}<em>${part}</em>"
+    )
+    result
+  else text
+
+// Process first link in text: [text](url) -> <a href="url">text</a>
+val processOneLink = (text: String): String =>
+  val idx = indexOf(text, "](")
+  if idx == -1 then text
+  else
+    val before = substring(text, 0, idx)
+    val after = substring(text, idx + 2, length(text))
+    val openBracket = indexOf(before, "[")
+    if openBracket == -1 then text
+    else
+      val linkText = substring(before, openBracket + 1, length(before))
+      val prefix = substring(before, 0, openBracket)
+      val closeP = indexOf(after, ")")
+      if closeP == -1 then text
+      else
+        val url = substring(after, 0, closeP)
+        val rest = substring(after, closeP + 1, length(after))
+        "${prefix}<a href=\"${url}\">${linkText}</a>${rest}"
+
+// Apply all inline formatting
+val processInline = (text: String): String =>
+  val s1 = processInlineCode(text)
+  val s2 = processInlineBold(s1)
+  val s3 = processInlineItalic(s2)
+  processOneLink(s3)
+
+// Render a fenced code block
+val renderCodeBlock = (codeLines: String[], langClass: String): String =>
+  val content = join(codeLines, "\n")
+  if length(langClass) > 0 then
+    "<pre><code class=\"language-${langClass}\">${content}</code></pre>"
+  else
+    "<pre><code>${content}</code></pre>"
+
+// Close any open list, returning updated html
+val closeList = (html: String, inList: Boolean, listOrdered: Boolean): String =>
+  if inList then
+    val tag = if listOrdered then "ol" else "ul"
+    "${html}</${tag}>\n"
+  else html
+
+// Close blockquote, returning updated html
+val closeBlockquote = (html: String, inBlockquote: Boolean): String =>
+  if inBlockquote then "${html}</blockquote>\n"
+  else html
+
+// Flush paragraph buffer
+val flushParagraph = (html: String, paragraphLines: String[]): String =>
+  if length(paragraphLines) > 0 then
+    "${html}<p>${processInline(join(paragraphLines, " "))}</p>\n"
+  else html
+
+// Process a heading line: returns html fragment
+val headingHtml = (line: String, level: Int32, prefixLen: Int32): String =>
+  val text = substring(line, prefixLen, length(line))
+  val slug = slugify(text)
+  val processed = processInline(text)
+  "<h${level} id=\"${slug}\">${processed}</h${level}>\n"
+
+// Detect if a line is an ordered list item: "1. text", "2. text", etc.
+val isOrderedListItem = (line: String): Boolean =>
+  if length(line) < 3 then false
+  else
+    val firstChar = substring(line, 0, 1)
+    val second = substring(line, 1, 2)
+    val containsDigit = contains("123456789", firstChar)
+    if containsDigit == false then false
+    else second == "."
+
+// Handle a line inside a code block
+val processCodeBlockLine = (st: Json, rawLine: String): Json =>
+  if startsWith(trim(rawLine), "```") then
+    val cb = renderCodeBlock(st["codeLines"], st["codeBlockLang"])
+    {
+      "html": "${st["html"]}${cb}\n",
+      "inCodeBlock": false,
+      "codeBlockLang": "",
+      "codeLines": [],
+      "inList": st["inList"],
+      "listOrdered": st["listOrdered"],
+      "inBlockquote": st["inBlockquote"],
+      "paragraphLines": st["paragraphLines"]
+    }
+  else
+    val newLines = st["codeLines"]
+    newLines.push(rawLine)
+    { ...st, "codeLines": newLines }
+
+// Handle a fence opening line
+val processFenceLine = (st: Json, trimmed: String): Json =>
+  val h1 = flushParagraph(st["html"], st["paragraphLines"])
+  val h2 = closeList(h1, st["inList"], st["listOrdered"])
+  val h3 = closeBlockquote(h2, st["inBlockquote"])
+  val lang = if length(trimmed) > 3 then trim(substring(trimmed, 3, length(trimmed))) else ""
+  {
+    "html": h3,
+    "inCodeBlock": true,
+    "codeBlockLang": lang,
+    "codeLines": [],
+    "inList": false,
+    "listOrdered": false,
+    "inBlockquote": false,
+    "paragraphLines": []
+  }
+
+// Handle an empty line
+val processEmptyLine = (st: Json): Json =>
+  val h1 = flushParagraph(st["html"], st["paragraphLines"])
+  val h2 = closeList(h1, st["inList"], st["listOrdered"])
+  val h3 = closeBlockquote(h2, st["inBlockquote"])
+  { ...st, "html": h3, "inList": false, "listOrdered": false, "inBlockquote": false, "paragraphLines": [] }
+
+// Handle a horizontal rule line
+val processHrLine = (st: Json): Json =>
+  val h1 = flushParagraph(st["html"], st["paragraphLines"])
+  val h2 = closeList(h1, st["inList"], st["listOrdered"])
+  val h3 = closeBlockquote(h2, st["inBlockquote"])
+  { ...st, "html": "${h3}<hr>\n", "inList": false, "listOrdered": false, "inBlockquote": false, "paragraphLines": [] }
+
+// Handle a heading line (any level)
+val processHeadingLine = (st: Json, line: String, level: Int32, prefixLen: Int32): Json =>
+  val h1 = flushParagraph(st["html"], st["paragraphLines"])
+  val h2 = closeList(h1, st["inList"], st["listOrdered"])
+  { ...st, "html": "${h2}${headingHtml(line, level, prefixLen)}", "inList": false, "listOrdered": false, "paragraphLines": [] }
+
+// Handle a h4/h5 heading (no list close needed)
+val processSmallHeadingLine = (st: Json, line: String, level: Int32, prefixLen: Int32): Json =>
+  val h1 = flushParagraph(st["html"], st["paragraphLines"])
+  { ...st, "html": "${h1}${headingHtml(line, level, prefixLen)}", "paragraphLines": [] }
+
+// Handle a blockquote line
+val processBlockquoteLine = (st: Json, line: String): Json =>
+  val h1 = flushParagraph(st["html"], st["paragraphLines"])
+  val h2 = closeList(h1, st["inList"], st["listOrdered"])
+  val text = substring(line, 2, length(line))
+  val openTag = if st["inBlockquote"] == true then "" else "<blockquote>\n"
+  val newHtml = "${h2}${openTag}<p>${processInline(text)}</p>\n"
+  { ...st, "html": newHtml, "inList": false, "listOrdered": false, "inBlockquote": true, "paragraphLines": [] }
+
+// Handle an unordered list item line
+val processUnorderedListLine = (st: Json, line: String): Json =>
+  val h1 = flushParagraph(st["html"], st["paragraphLines"])
+  val h2 = closeBlockquote(h1, st["inBlockquote"])
+  val openTag = if st["inList"] == false then "<ul>\n" else if st["listOrdered"] == true then "</ol>\n<ul>\n" else ""
+  val text = substring(line, 2, length(line))
+  { ...st, "html": "${h2}${openTag}<li>${processInline(text)}</li>\n", "inList": true, "listOrdered": false, "inBlockquote": false, "paragraphLines": [] }
+
+// Handle an ordered list item line
+val processOrderedListLine = (st: Json, line: String): Json =>
+  val h1 = flushParagraph(st["html"], st["paragraphLines"])
+  val h2 = closeBlockquote(h1, st["inBlockquote"])
+  val openTag = if st["inList"] == false then "<ol>\n" else if st["listOrdered"] == false then "</ul>\n<ol>\n" else ""
+  val dotPos = indexOf(line, ". ")
+  val text = if dotPos == -1 then line else substring(line, dotPos + 2, length(line))
+  { ...st, "html": "${h2}${openTag}<li>${processInline(text)}</li>\n", "inList": true, "listOrdered": true, "inBlockquote": false, "paragraphLines": [] }
+
+// Handle a plain paragraph line
+val processParagraphLine = (st: Json, line: String): Json =>
+  val h1 = closeList(st["html"], st["inList"], st["listOrdered"])
+  val h2 = closeBlockquote(h1, st["inBlockquote"])
+  val newParas = st["paragraphLines"]
+  newParas.push(line)
+  { ...st, "html": h2, "inList": false, "listOrdered": false, "inBlockquote": false, "paragraphLines": newParas }
+
+// Dispatch a single line to the appropriate handler
+val processLine = (st: Json, rawLine: String): Json =>
+  val inCB = st["inCodeBlock"]
+  if inCB == true then processCodeBlockLine(st, rawLine)
+  else
+    val line = rawLine
+    val trimmed = trim(line)
+    if startsWith(trimmed, "```") then processFenceLine(st, trimmed)
+    else if trimmed == "" then processEmptyLine(st)
+    else if trimmed == "---" then processHrLine(st)
+    else if startsWith(line, "##### ") then processSmallHeadingLine(st, line, 5, 6)
+    else if startsWith(line, "#### ") then processSmallHeadingLine(st, line, 4, 5)
+    else if startsWith(line, "### ") then processHeadingLine(st, line, 3, 4)
+    else if startsWith(line, "## ") then processHeadingLine(st, line, 2, 3)
+    else if startsWith(line, "# ") then processHeadingLine(st, line, 1, 2)
+    else if startsWith(line, "> ") then processBlockquoteLine(st, line)
+    else if startsWith(line, "- ") then processUnorderedListLine(st, line)
+    else if isOrderedListItem(line) then processOrderedListLine(st, line)
+    else processParagraphLine(st, line)
+
+// Main converter
+export val markdownToHtml = (source: String): String =>
+  val lines = split(source, "\n")
+  val numLines = length(lines)
+
+  val initState = {
+    "html": "",
+    "inCodeBlock": false,
+    "codeBlockLang": "",
+    "codeLines": [],
+    "inList": false,
+    "listOrdered": false,
+    "inBlockquote": false,
+    "paragraphLines": []
+  }
+
+  // Use range-based iteration to work around String[] for-iteration bug
+  val finalState = range(0, numLines).reduce(initState, (st, i) => processLine(st, lines[i]))
+
+  // Final flush
+  val h1 = flushParagraph(finalState["html"], finalState["paragraphLines"])
+  val h2 = closeList(h1, finalState["inList"], finalState["listOrdered"])
+  val h3 = closeBlockquote(h2, finalState["inBlockquote"])
+  if finalState["inCodeBlock"] == true then
+    "${h3}${renderCodeBlock(finalState["codeLines"], finalState["codeBlockLang"])}\n"
+  else h3
