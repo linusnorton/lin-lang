@@ -877,12 +877,98 @@ fn test_boolean_negation() {
 import { toString } from "std/string"
 
 val ready = true
-val notReady = ready == false
+val notReady = !ready
 print(toString(notReady))
 val also = false == false
 print(toString(also))
 "#);
     assert_eq!(output, vec!["false", "true"]);
+}
+
+#[test]
+fn test_logical_not_val_and_if() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val ready = true
+print(toString(!ready))
+val flag = false
+if !flag then print("taken") else print("not-taken")
+"#);
+    assert_eq!(output, vec!["false", "taken"]);
+}
+
+#[test]
+fn test_logical_not_in_match_guard() {
+    let output = run(r#"import { print } from "std/io"
+
+val cond = false
+val describe = (n: Int32): String =>
+  match n
+    has Int32 when !cond => "guard-true"
+    else => "guard-false"
+print(describe(1))
+"#);
+    assert_eq!(output, vec!["guard-true"]);
+}
+
+#[test]
+fn test_logical_not_precedence() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+// !a == b parses as (!a) == b
+print(toString(!true == false))
+val obj = { "ok": false }
+print(toString(!obj["ok"]))
+val isZero = (n: Int32): Boolean => n == 0
+print(toString(!isZero(5)))
+val a = false
+val b = true
+print(toString(!a && b))
+"#);
+    assert_eq!(output, vec!["true", "true", "true", "true"]);
+}
+
+#[test]
+fn test_logical_double_negation() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val x = true
+print(toString(!!x == x))
+print(toString(!!false))
+"#);
+    assert_eq!(output, vec!["true", "false"]);
+}
+
+#[test]
+fn test_logical_not_typevar_operand() {
+    // `!flag` where `flag` flows through a generic lambda parameter exercises
+    // the unbox-to-i1 path in IR lowering.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val negate = (flag) => !flag
+print(toString(negate(true)))
+print(toString(negate(false)))
+"#);
+    assert_eq!(output, vec!["false", "true"]);
+}
+
+#[test]
+fn test_logical_not_non_bool_error() {
+    let err = run_expect_err(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val x = !5
+print(toString(x))
+"#);
+    assert!(
+        err.contains("logical operator !") || err.contains("boolean operand"),
+        "got: {}",
+        err
+    );
 }
 
 #[test]
@@ -4703,4 +4789,57 @@ val main = (): Null =>
 main()
 "#);
     assert_eq!(out, vec!["done"]);
+}
+
+// Regression: `==` against a boxed-key projection operand was ORDER-DEPENDENT. Inside a
+// for/map callback, `m[k]` (with `k` the boxed callback param) is a boxed-Json projection,
+// not a raw value. `compile_eq` dispatched on the static operand type and called
+// `lin_string_eq`/etc. expecting a raw pointer, so it misread the box: `m[k] == "abc"` was
+// true but `"abc" == m[k]` was FALSE. The fix routes BOTH orderings through the tagged
+// runtime ops (lin_tagged_eq) when either operand is a boxed union, boxing the concrete
+// side — so the comparison is symmetric. This silently broke `schema[k]["type"] == "string"`
+// validation.
+#[test]
+fn eq_boxed_key_projection_is_order_symmetric() {
+    // String: boxed-key projection vs literal, both orderings.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { for } from "std/array"
+val m = { "host": "abc" }
+["host"].for(k =>
+  print(toString(m[k] == "abc"))
+  print(toString("abc" == m[k]))
+  print(toString(m[k] == "nope"))
+  print(toString("nope" == m[k]))
+)
+"#);
+    assert_eq!(out, vec!["true", "true", "false", "false"]);
+
+    // Int: boxed-key projection vs literal, both orderings.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { for } from "std/array"
+val m = { "n": 42 }
+["n"].for(k =>
+  print(toString(m[k] == 42))
+  print(toString(42 == m[k]))
+  print(toString(m[k] == 7))
+  print(toString(7 == m[k]))
+)
+"#);
+    assert_eq!(out, vec!["true", "true", "false", "false"]);
+
+    // Nested projection-in-closure config-validation shape: sch[k]["type"] == "string"
+    // compared both orderings (and `!=`).
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { for } from "std/array"
+val sch = { "host": { "type": "string" }, "port": { "type": "number" } }
+["host", "port"].for(k =>
+  print(toString(sch[k]["type"] == "string"))
+  print(toString("string" == sch[k]["type"]))
+  print(toString(sch[k]["type"] != "string"))
+)
+"#);
+    assert_eq!(out, vec!["true", "true", "false", "false", "false", "true"]);
 }

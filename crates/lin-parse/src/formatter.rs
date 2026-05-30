@@ -67,6 +67,7 @@ fn binop_symbol(op: &BinOp) -> &'static str {
 fn unaryop_symbol(op: &UnaryOp) -> &'static str {
     match op {
         UnaryOp::BNot => "~",
+        UnaryOp::Not => "!",
     }
 }
 

@@ -1610,12 +1610,21 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
         }
 
         TypedExpr::UnaryOp { op, operand, result_type, .. } => {
-            // The only surface unary op is `~` (bitwise not), which maps to IR `Not`
-            // (codegen emits `build_not`).
+            // Surface unary ops `~` (bitwise not) and `!` (logical not) both map to IR
+            // `Not` (codegen emits `build_not`): for an i1, bitwise-not == logical-not.
             let ir_op = match op {
                 lin_parse::ast::UnaryOp::BNot => crate::ir::UnaryOp::Not,
+                lin_parse::ast::UnaryOp::Not => crate::ir::UnaryOp::Not,
             };
-            let src = lower_expr(operand, builder, ctx);
+            // For logical `!` whose operand is not statically Bool (e.g. a boxed
+            // TypeVar), coerce/unbox to a raw i1 first so the Unary sees a real bool.
+            let src = if matches!(op, lin_parse::ast::UnaryOp::Not)
+                && !matches!(operand.ty(), Type::Bool)
+            {
+                lower_cond_as_bool(operand, builder, ctx)
+            } else {
+                lower_expr(operand, builder, ctx)
+            };
             let dst = builder.alloc_temp(result_type.clone());
             builder.emit(Instruction::Unary {
                 dst,
