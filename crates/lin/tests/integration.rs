@@ -1029,6 +1029,110 @@ print(toString(result))
 }
 
 #[test]
+fn test_default_args_basic() {
+    // Omitting a trailing optional argument fills it from its default.
+    let output = run(r#"import { print } from "std/io"
+
+val greet = (name: String, greeting: String = "Hello") => "${greeting}, ${name}"
+print(greet("World"))
+print(greet("World", "Hi"))
+"#);
+    assert_eq!(output, vec!["Hello, World", "Hi, World"]);
+}
+
+#[test]
+fn test_default_args_chained() {
+    // A default may reference earlier parameters, including earlier defaults.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val box = (w: Int32, h: Int32 = w, area: Int32 = w * h) => area
+print(toString(box(4)))
+print(toString(box(4, 3)))
+print(toString(box(4, 3, 99)))
+"#);
+    assert_eq!(output, vec!["16", "12", "99"]);
+}
+
+#[test]
+fn test_default_args_object() {
+    let output = run(r#"import { print } from "std/io"
+
+val config = (name: String, opts: Json = { "v": false }) => "${name}:${opts}"
+print(config("a"))
+print(config("b", { "v": true }))
+"#);
+    assert_eq!(output, vec!["a:{\"v\": false}", "b:{\"v\": true}"]);
+}
+
+#[test]
+fn test_default_args_indirect_value() {
+    // Default-fill works when the function is held as a first-class value
+    // (the closure carries a descriptor so the indirect call fills defaults).
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val scale = (x: Int32, factor: Int32 = 2) => x * factor
+val g = scale
+print(toString(g(5)))
+print(toString(g(5, 3)))
+"#);
+    assert_eq!(output, vec!["10", "15"]);
+}
+
+#[test]
+fn test_default_args_cross_module() {
+    // An imported function's defaults are filled by an adapter emitted in the
+    // defining module and called by symbol from the importer.
+    let dir = std::env::temp_dir().join(format!("lin_da_xmod_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("lib.lin"),
+        "export val scale = (x: Int32, factor: Int32 = 2) => x * factor\n").unwrap();
+    let main = format!(r#"import {{ print }} from "std/io"
+import {{ toString }} from "std/string"
+import {{ scale }} from "{}/lib"
+print(toString(scale(5)))
+print(toString(scale(5, 3)))
+"#, dir.to_str().unwrap());
+    let output = run(&main);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(output, vec!["10", "15"]);
+}
+
+#[test]
+fn test_default_args_trailing_comma_still_curries() {
+    // A trailing comma requests partial application even when defaults exist,
+    // rather than filling the default.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val scale = (x: Int32, factor: Int32 = 2) => x * factor
+val triple = scale(3,)
+print(toString(triple(4)))
+"#);
+    assert_eq!(output, vec!["12"]);
+}
+
+#[test]
+fn test_default_args_too_few_is_error() {
+    // Supplying fewer than the required (non-defaulted) arguments is an error.
+    let err = run_expect_err(r#"import { print } from "std/io"
+val f = (a: Int32, b: Int32 = 1) => a + b
+print(f())
+"#);
+    assert!(err.contains("Too few arguments"), "got: {}", err);
+}
+
+#[test]
+fn test_default_args_required_after_optional_is_error() {
+    // A required parameter may not follow one with a default value.
+    let err = run_expect_err(r#"
+val bad = (a: Int32, b: Int32 = 1, c: Int32) => a + b + c
+"#);
+    assert!(err.contains("cannot follow a parameter with a default"), "got: {}", err);
+}
+
+#[test]
 fn test_iter_builtin() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
