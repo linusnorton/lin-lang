@@ -10,6 +10,7 @@ use inkwell::values::{
     BasicMetadataValueEnum, BasicValueEnum, FunctionValue, PointerValue,
 };
 use inkwell::{AddressSpace, IntPredicate, FloatPredicate, OptimizationLevel};
+use inkwell::attributes::AttributeLoc;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -430,6 +431,30 @@ impl<'ctx> Codegen<'ctx> {
     }
 
     // -------------------------------------------------------------------------
+    // Function attributes
+    // -------------------------------------------------------------------------
+
+    /// Attach a set of named enum function-level attributes to `fn_value`.
+    ///
+    /// Only attributes that are sound for *user-emitted Lin functions* should be
+    /// passed here. Lin uses value-based error handling, so user functions never
+    /// unwind — `nounwind` is safe. We deliberately do NOT mark runtime (`lin_*`)
+    /// `extern "C"` declarations `nounwind`, because the Rust runtime is built with
+    /// the default `panic = "unwind"`; a panic crossing a `nounwind` boundary is UB.
+    fn add_fn_attrs(&self, fn_value: FunctionValue<'ctx>, names: &[&str]) {
+        for name in names {
+            let kind_id = inkwell::attributes::Attribute::get_named_enum_kind_id(name);
+            // get_named_enum_kind_id returns 0 for an unknown attribute name; skip those
+            // rather than create an invalid (string-less) attribute.
+            if kind_id == 0 {
+                continue;
+            }
+            let attr = self.context.create_enum_attribute(kind_id, 0);
+            fn_value.add_attribute(AttributeLoc::Function, attr);
+        }
+    }
+
+    // -------------------------------------------------------------------------
     // LLVM type mapping
     // -------------------------------------------------------------------------
 
@@ -568,6 +593,7 @@ impl<'ctx> Codegen<'ctx> {
             existing
         } else {
             let wf = self.module.add_function(&wrapper_name, wrapper_fn_ty, None);
+            self.add_fn_attrs(wf, &["nounwind"]);
             let saved_block = self.builder.get_insert_block().unwrap();
             let entry = self.context.append_basic_block(wf, "entry");
             self.builder.position_at_end(entry);
@@ -1133,6 +1159,7 @@ impl<'ctx> Codegen<'ctx> {
         // application is callable through an opaque Function value like any other closure.
         let wrapper_fn_ty = ptr_ty.fn_type(&wrapper_param_tys, false);
         let wrapper_fn = self.module.add_function(&wrapper_name, wrapper_fn_ty, None);
+        self.add_fn_attrs(wrapper_fn, &["nounwind"]);
 
         let cls_struct_ty = self.closure_struct_type();
         let cls_ptr = self.builder.build_call(self.rt_alloc, &[self.context.i64_type().const_int(32, false).into()], "papp_cls")
@@ -1220,6 +1247,7 @@ impl<'ctx> Codegen<'ctx> {
         }
         let wrapper_fn_ty = ptr_ty.fn_type(&wrapper_param_types, false);
         let wrapper_fn = self.module.add_function(&wrapper_name, wrapper_fn_ty, None);
+        self.add_fn_attrs(wrapper_fn, &["nounwind"]);
 
         let saved_block = self.builder.get_insert_block().unwrap();
         let wrapper_entry = self.context.append_basic_block(wrapper_fn, "entry");
@@ -1682,12 +1710,23 @@ impl<'ctx> Codegen<'ctx> {
             let llvm_fn = if matches!(ret_ty, Type::Null | Type::Never) {
                 let fn_ty = void_ty.fn_type(&param_types, false);
                 if let Some(existing) = self.module.get_function(&name) { existing }
-                else { self.module.add_function(&name, fn_ty, None) }
+                else {
+                    let f = self.module.add_function(&name, fn_ty, None);
+                    // User-emitted Lin functions use value-based errors and never
+                    // unwind, so `nounwind` is sound. (Runtime `lin_*` decls are not
+                    // marked — the Rust runtime is `panic = "unwind"`.)
+                    self.add_fn_attrs(f, &["nounwind"]);
+                    f
+                }
             } else {
                 let ret_llvm = self.llvm_type(ret_ty);
                 let fn_ty = ret_llvm.fn_type(&param_types, false);
                 if let Some(existing) = self.module.get_function(&name) { existing }
-                else { self.module.add_function(&name, fn_ty, None) }
+                else {
+                    let f = self.module.add_function(&name, fn_ty, None);
+                    self.add_fn_attrs(f, &["nounwind"]);
+                    f
+                }
             };
             self.named_fns.insert(name.clone(), llvm_fn);
             ir_fn_to_llvm.insert(func.id, llvm_fn);
