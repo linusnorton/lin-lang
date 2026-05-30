@@ -1,0 +1,15 @@
+// Config loader: combine defaults + validation into a single load step that
+// returns a tagged result the caller pattern-matches on.
+
+import { applyDefaults, validate } from "./schema"
+import { length } from "std/array"
+import { join } from "std/string"
+
+// Load a raw config object: apply defaults, validate, and return either
+// { "type": "success", "value": <complete config> } or
+// { "type": "failure", "error": <joined messages> }.
+export val load = (raw: Json): Json =>
+  val cfg = applyDefaults(raw)
+  val errors = validate(cfg)
+  if length(errors) == 0 then { "type": "success", "value": cfg }
+  else { "type": "failure", "error": errors.join("; ") }
