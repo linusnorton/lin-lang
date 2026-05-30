@@ -85,8 +85,12 @@ pub unsafe extern "C" fn lin_exit(code: i32) -> ! {
     std::process::exit(code);
 }
 
+// `extern "C-unwind"`: inside an async boundary `runtime_fault` panics and must unwind THROUGH
+// this C-ABI frame back to the thread boundary's catch_unwind (a plain `extern "C"` fn aborts
+// the process on unwind since Rust 1.81). Outside a boundary it still process::exit's, never
+// unwinding, so the ABI change is invisible there.
 #[no_mangle]
-pub unsafe extern "C" fn lin_panic(msg: *const LinString, file_id: i32, offset: i32) {
+pub unsafe extern "C-unwind" fn lin_panic(msg: *const LinString, file_id: i32, offset: i32) {
     let slice = std::slice::from_raw_parts((*msg).data.as_ptr(), (*msg).len as usize);
     let string = std::str::from_utf8_unchecked(slice);
     // Inside an async boundary this unwinds to the thread boundary (caught → Error);

@@ -170,6 +170,26 @@ pub unsafe extern "C" fn lin_object_set(obj: *mut LinObject, key: *mut LinString
     (*obj).len = len + 1;
 }
 
+/// Append an entry taking OWNERSHIP of an already-owned `key` and `value` (no retain). The
+/// caller must not release either afterwards. Assumes `key` does not already exist (used by
+/// the thread-transfer deep-copy path, which builds a fresh object from distinct keys). Grows
+/// the entry buffer as needed.
+pub unsafe fn object_push_owned(obj: *mut LinObject, key: *mut LinString, value: TaggedVal) {
+    let len = (*obj).len;
+    let cap = (*obj).cap;
+    if len == cap {
+        let new_cap = cap * 2;
+        let old_layout = entries_layout(cap);
+        let new_layout = entries_layout(new_cap);
+        (*obj).entries = realloc((*obj).entries as *mut u8, old_layout, new_layout.size()) as *mut LinObjectEntry;
+        (*obj).cap = new_cap;
+    }
+    let slot = (*obj).entries.add(len as usize);
+    (*slot).key = key;
+    (*slot).value = value;
+    (*obj).len = len + 1;
+}
+
 /// Get a field value as a pointer to TaggedVal. Returns null if key not found.
 #[no_mangle]
 pub unsafe extern "C" fn lin_object_get(obj: *const LinObject, key: *const LinString) -> *const TaggedVal {
@@ -189,7 +209,7 @@ pub unsafe extern "C" fn lin_object_get(obj: *const LinObject, key: *const LinSt
 /// Copy all fields from `src` into `dst`, overwriting existing keys.
 /// Used to implement object spread: `{ ...src, ... }`.
 #[no_mangle]
-pub unsafe extern "C" fn lin_object_merge(dst: *mut LinObject, src: *const LinObject) {
+pub unsafe extern "C-unwind" fn lin_object_merge(dst: *mut LinObject, src: *const LinObject) {
     if src.is_null() {
         crate::fault::runtime_fault("Runtime error: cannot spread null into object");
     }

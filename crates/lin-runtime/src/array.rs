@@ -81,6 +81,32 @@ pub unsafe extern "C" fn lin_array_alloc(initial_cap: u64) -> *mut LinArray {
     ptr
 }
 
+/// Deep-copy a FLAT scalar array (elem_tag != 0xFF): allocate a fresh header + raw element
+/// buffer of the same width and copy the bytes verbatim. Flat arrays hold no pointers, so a
+/// byte copy is a complete deep copy. Used by the thread-transfer path (transfer.rs).
+pub unsafe fn lin_array_clone_flat(src: *const LinArray) -> *mut LinArray {
+    let len = (*src).len;
+    let cap = (*src).cap.max(4);
+    let elem_tag = (*src).elem_tag;
+    let (esize, ealign) = flat_elem_size_align(elem_tag);
+    let ptr = alloc(array_layout()) as *mut LinArray;
+    (*ptr).refcount = 1;
+    (*ptr).elem_tag = elem_tag;
+    (*ptr)._pad3 = [0; 3];
+    (*ptr).len = len;
+    (*ptr).cap = cap;
+    let data_layout = Layout::from_size_align_unchecked(esize * cap as usize, ealign);
+    (*ptr).data = alloc(data_layout) as *mut LinArrayElem;
+    if len > 0 {
+        std::ptr::copy_nonoverlapping(
+            (*src).data as *const u8,
+            (*ptr).data as *mut u8,
+            esize * len as usize,
+        );
+    }
+    ptr
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn lin_array_free(arr: *mut LinArray) {
     let cap = (*arr).cap as usize;
@@ -348,7 +374,7 @@ pub unsafe extern "C" fn lin_flat_to_tagged_f64(flat: *const LinArray) -> *mut L
 
 /// Get a pointer to the element payload at index. Supports negative indices (Python-style).
 #[no_mangle]
-pub unsafe extern "C" fn lin_array_get(arr: *const LinArray, idx: i64) -> *mut LinArrayElem {
+pub unsafe extern "C-unwind" fn lin_array_get(arr: *const LinArray, idx: i64) -> *mut LinArrayElem {
     let len = (*arr).len as i64;
     let actual = if idx < 0 { len + idx } else { idx };
     if actual < 0 || actual >= len {
@@ -411,7 +437,7 @@ pub unsafe extern "C" fn lin_array_length(arr: *const LinArray) -> i64 {
 /// Get element at index as a heap-allocated TaggedVal*, handling both flat and tagged arrays.
 /// The caller is responsible for eventual deallocation. Returns null on OOB.
 #[no_mangle]
-pub unsafe extern "C" fn lin_array_get_tagged(arr: *const LinArray, idx: i64) -> *mut crate::tagged::TaggedVal {
+pub unsafe extern "C-unwind" fn lin_array_get_tagged(arr: *const LinArray, idx: i64) -> *mut crate::tagged::TaggedVal {
     use crate::tagged::*;
     if arr.is_null() { return std::ptr::null_mut(); }
     let len = (*arr).len as i64;
@@ -767,7 +793,7 @@ pub unsafe extern "C" fn lin_flat_array_push_i32(arr: *mut LinArray, val: i32) {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn lin_flat_array_get_i32(arr: *const LinArray, idx: i64) -> i32 {
+pub unsafe extern "C-unwind" fn lin_flat_array_get_i32(arr: *const LinArray, idx: i64) -> i32 {
     let len = (*arr).len as i64;
     let actual = if idx < 0 { len + idx } else { idx };
     if actual < 0 || actual >= len {
@@ -827,7 +853,7 @@ pub unsafe extern "C" fn lin_flat_array_push_i64(arr: *mut LinArray, val: i64) {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn lin_flat_array_get_i64(arr: *const LinArray, idx: i64) -> i64 {
+pub unsafe extern "C-unwind" fn lin_flat_array_get_i64(arr: *const LinArray, idx: i64) -> i64 {
     let len = (*arr).len as i64;
     let actual = if idx < 0 { len + idx } else { idx };
     if actual < 0 || actual >= len {
@@ -887,7 +913,7 @@ pub unsafe extern "C" fn lin_flat_array_push_f32(arr: *mut LinArray, val: f32) {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn lin_flat_array_get_f32(arr: *const LinArray, idx: i64) -> f32 {
+pub unsafe extern "C-unwind" fn lin_flat_array_get_f32(arr: *const LinArray, idx: i64) -> f32 {
     let len = (*arr).len as i64;
     let actual = if idx < 0 { len + idx } else { idx };
     if actual < 0 || actual >= len {
@@ -947,7 +973,7 @@ pub unsafe extern "C" fn lin_flat_array_push_f64(arr: *mut LinArray, val: f64) {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn lin_flat_array_get_f64(arr: *const LinArray, idx: i64) -> f64 {
+pub unsafe extern "C-unwind" fn lin_flat_array_get_f64(arr: *const LinArray, idx: i64) -> f64 {
     let len = (*arr).len as i64;
     let actual = if idx < 0 { len + idx } else { idx };
     if actual < 0 || actual >= len {

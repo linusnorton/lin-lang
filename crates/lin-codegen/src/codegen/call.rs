@@ -324,7 +324,7 @@ impl<'ctx> Codegen<'ctx> {
 
     /// Make a closure struct {i32 rc=1, i32 _pad, fn_ptr, env_ptr} with optional captured env.
     pub(crate) fn make_closure_struct(&mut self, fn_ptr: BasicValueEnum<'ctx>, captures: &[BasicValueEnum<'ctx>]) -> BasicValueEnum<'ctx> {
-        self.make_closure_struct_desc(fn_ptr, captures, None)
+        self.make_closure_struct_desc_caps(fn_ptr, captures, None, None)
     }
 
     /// Like `make_closure_struct`, but also stores a default-argument descriptor pointer at
@@ -335,6 +335,23 @@ impl<'ctx> Codegen<'ctx> {
         fn_ptr: BasicValueEnum<'ctx>,
         captures: &[BasicValueEnum<'ctx>],
         descriptor: Option<PointerValue<'ctx>>,
+    ) -> BasicValueEnum<'ctx> {
+        self.make_closure_struct_desc_caps(fn_ptr, captures, descriptor, None)
+    }
+
+    /// Full closure builder. `capture_kinds`, when present, gives one `transfer::CAP_*` byte per
+    /// capture; a static capture descriptor `{u32 count, u8 kinds[count]}` is emitted and its
+    /// pointer stored at the env's offset-0 word (otherwise a redundant size, read by no one).
+    /// The async spawn path uses that descriptor to deep-copy the env across a thread boundary
+    /// (Option C, ADR-042). When `capture_kinds` is None the env offset-0 word stays the size
+    /// (legacy behaviour; such a closure simply isn't transferable and the spawn path runs it
+    /// inline).
+    pub(crate) fn make_closure_struct_desc_caps(
+        &mut self,
+        fn_ptr: BasicValueEnum<'ctx>,
+        captures: &[BasicValueEnum<'ctx>],
+        descriptor: Option<PointerValue<'ctx>>,
+        capture_kinds: Option<&[u8]>,
     ) -> BasicValueEnum<'ctx> {
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         let i64_ty = self.context.i64_type();
@@ -362,8 +379,17 @@ impl<'ctx> Codegen<'ctx> {
             let env_size_bytes = 8u64 + (n as u64 * 8); // size header + 8 bytes per capture (ptr/i64)
             let env_size_val = i64_ty.const_int(env_size_bytes, false);
             let env_mem = self.builder.call(self.rt.alloc, &[env_size_val.into()], "ir_env").try_as_basic_value().unwrap_basic().into_pointer_value();
-            // Write size at offset 0.
-            self.builder.store(env_mem, env_size_val);
+            // Offset 0: a capture descriptor pointer (for thread-transfer deep copy) when
+            // capture kinds are provided, otherwise the redundant size header (read by no one).
+            match capture_kinds {
+                Some(kinds) => {
+                    let desc = self.emit_capture_descriptor(kinds);
+                    self.builder.store(env_mem, desc);
+                }
+                None => {
+                    self.builder.store(env_mem, env_size_val);
+                }
+            }
             // Write captures at offsets 8, 16, ...
             for (i, &cap) in captures.iter().enumerate() {
                 let offset = 8u64 + (i as u64 * 8);
@@ -388,6 +414,61 @@ impl<'ctx> Codegen<'ctx> {
             self.builder.store(env_size_gep, env_size_val);
         }
         cls_mem.into()
+    }
+
+    /// The `transfer::CAP_*` kind for a captured value of type `ty`, describing how the runtime
+    /// must transfer that env slot across a thread boundary. MUST match `transfer.rs`'s codes
+    /// and the env storage representation chosen by `llvm_type`:
+    ///   scalars → CAP_SCALAR (8-byte value); Str → CAP_STR; Array/FixedArray → CAP_ARRAY;
+    ///   Object → CAP_OBJECT; Union/TypeVar/Named/Null → CAP_TAGGED (boxed TaggedVal*, also
+    ///   covers the null Json value); Function/Iterator → CAP_OPAQUE (not deep-copyable).
+    pub(crate) fn capture_kind(ty: &Type) -> u8 {
+        // Keep in lockstep with crate::transfer CAP_* constants.
+        const CAP_SCALAR: u8 = 0;
+        const CAP_STR: u8 = 1;
+        const CAP_ARRAY: u8 = 2;
+        const CAP_OBJECT: u8 = 3;
+        const CAP_TAGGED: u8 = 4;
+        const CAP_OPAQUE: u8 = 5;
+        match ty {
+            Type::Str => CAP_STR,
+            Type::Array(_) | Type::FixedArray(_) => CAP_ARRAY,
+            Type::Object(_) => CAP_OBJECT,
+            Type::Union(_) | Type::TypeVar(_) | Type::Named(_) | Type::Null => CAP_TAGGED,
+            Type::Function { .. } | Type::Iterator(_) => CAP_OPAQUE,
+            Type::Bool
+            | Type::Int8 | Type::Int16 | Type::Int32 | Type::Int64
+            | Type::UInt8 | Type::UInt16 | Type::UInt32 | Type::UInt64
+            | Type::Float32 | Type::Float64 => CAP_SCALAR,
+            Type::Never => CAP_SCALAR,
+        }
+    }
+
+    /// Emit (and cache) a static read-only capture-descriptor global `{ i32 count, [count x i8]
+    /// kinds }` and return a pointer to it. Used by the async spawn path to deep-copy a closure
+    /// env across a thread boundary.
+    fn emit_capture_descriptor(&mut self, kinds: &[u8]) -> PointerValue<'ctx> {
+        let i8_ty = self.context.i8_type();
+        let i32_ty = self.context.i32_type();
+        // Cache key: the kind sequence, so identical descriptors are shared.
+        let key: String = format!("__capdesc_{}", kinds.iter().map(|k| (b'0' + k) as char).collect::<String>());
+        if let Some(g) = self.module.get_global(&key) {
+            return g.as_pointer_value();
+        }
+        let count_const = i32_ty.const_int(kinds.len() as u64, false);
+        let kind_consts: Vec<_> = kinds.iter().map(|&k| i8_ty.const_int(k as u64, false)).collect();
+        let kinds_arr = i8_ty.const_array(&kind_consts);
+        let desc_ty = self.context.struct_type(&[i32_ty.into(), kinds_arr.get_type().into()], false);
+        let desc_val = self.context.const_struct(&[count_const.into(), kinds_arr.into()], false);
+        let global = self.module.add_global(desc_ty, None, &key);
+        global.set_initializer(&desc_val);
+        global.set_constant(true);
+        // Match the default-argument descriptor globals (codegen/mod.rs): a plain named constant
+        // with default linkage, NO unnamed_addr. Setting unnamed_addr pushes the small descriptor
+        // into the mergeable `.rodata.cstN` section, whose entries can't take a 32-bit absolute
+        // relocation under PIE (R_X86_64_32S link error). A uniquely-named constant lands in
+        // ordinary .rodata and links cleanly under the default reloc model.
+        global.as_pointer_value()
     }
 
 }

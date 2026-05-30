@@ -26,6 +26,41 @@ val s = suite("std/async", [
     close(w)
     expect(reply).toBe(42)
   ),
+
+  test("async captures string val (deep-copied across thread)", () =>
+    val name = "world"
+    val p = async(() => "hello ${name}")
+    expect(await(p)).toBe("hello world")
+  ),
+
+  test("async captures array val", () =>
+    val xs = [10, 20, 30]
+    val p = async(() => xs[1])
+    expect(await(p)).toBe(20)
+  ),
+
+  test("fault in thunk is caught as Error at await (div by zero)", () =>
+    val z = 0
+    val p = async(() => 42 / z)
+    val r = await(p)
+    // The fault surfaces as an Error object { type: "error", message: ... };
+    // the program continues rather than aborting (spec §32.2.2).
+    expect(r["type"]).toBe("error")
+  ),
+
+  test("fault in thunk: array out of bounds caught as Error", () =>
+    val arr = [1, 2, 3]
+    val p = async(() => arr[99])
+    val r = await(p)
+    expect(r["type"]).toBe("error")
+  ),
+
+  test("program continues after a caught async fault", () =>
+    val z = 0
+    val bad = await(async(() => 1 / z))
+    val good = await(async(() => 7 + 1))
+    expect(good).toBe(8)
+  ),
 ])
 
 run(s)

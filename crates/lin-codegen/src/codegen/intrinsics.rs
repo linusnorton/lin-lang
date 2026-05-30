@@ -247,19 +247,19 @@ impl<'ctx> Codegen<'ctx> {
                 } else { ptr_ty.const_null().into() }
             }
             Intrinsic::Async => {
-                // async(thunk): call the thunk closure synchronously (it returns a boxed
-                // Json result), then wrap in a LinPromise*. The thunk may arrive boxed (a
-                // Json-typed parameter, as in std/async's `async(f: Json)`) — unbox to the
-                // raw closure struct before calling.
+                // async(thunk): hand the UNEVALUATED thunk closure to the runtime, which spawns
+                // an OS thread, deep-copies the captured env (Option C), runs the thunk inside a
+                // fault boundary, and returns a LinPromise*. The thunk may arrive boxed (a
+                // Json-typed parameter, as in std/async's `async(f: Json)`) — unbox to the raw
+                // closure struct first.
                 let thunk = args.last().copied().unwrap_or_else(|| ptr_ty.const_null().into());
                 let thunk_ty = arg_tys.last().cloned().unwrap_or(Type::Null);
                 let thunk = if Self::is_union_type(&thunk_ty) && thunk.is_pointer_value() {
                     self.builder.call(self.rt.unbox_ptr, &[thunk.into()], "ir_async_cls").try_as_basic_value().unwrap_basic()
                 } else { thunk };
-                let result = self.call_thunk_value(thunk);
-                let make_promise = self.get_or_declare_fn("lin_make_promise",
+                let spawn_fn = self.get_or_declare_fn("lin_async_spawn",
                     ptr_ty.fn_type(&[ptr_ty.into()], false));
-                self.builder.call(make_promise, &[result.into()], "ir_promise").try_as_basic_value().unwrap_basic()
+                self.builder.call(spawn_fn, &[thunk.into()], "ir_async_spawn").try_as_basic_value().unwrap_basic()
             }
             Intrinsic::Await => {
                 let promise = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());

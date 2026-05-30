@@ -23,4 +23,5 @@ pub mod string;
 pub mod tagged;
 pub mod template;
 pub mod time;
+pub mod transfer;
 pub mod tty;

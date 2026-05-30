@@ -1785,6 +1785,80 @@ print(toString(reply))
 }
 
 #[test]
+fn test_async_real_parallelism() {
+    // Two thunks that each sleep 150ms. With real OS threads the wall-clock should be
+    // ~150ms (overlap), not ~300ms (sequential). Assert it completed well under the
+    // sequential bound — generous to avoid CI flakiness, but still proves overlap.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { async, await } from "std/async"
+import { sleep, now } from "std/time"
+
+val start = now()
+val p1 = async(() =>
+  sleep(150)
+  1
+)
+val p2 = async(() =>
+  sleep(150)
+  2
+)
+val r1 = await(p1)
+val r2 = await(p2)
+val elapsed = now() - start
+print(toString(r1 + r2))
+if elapsed < 250 then print("PARALLEL") else print("SEQUENTIAL")
+"#);
+    assert_eq!(output, vec!["3", "PARALLEL"],
+        "two 150ms thunks should overlap (real threads), completing in <250ms");
+}
+
+#[test]
+fn test_async_fault_isolation_div_by_zero() {
+    // A runtime fault (division by zero) inside an async thunk must be caught at the thread
+    // boundary and surface as an Error value at await — the program continues (spec §32.2.2),
+    // it does not abort.
+    let output = run(r#"import { print } from "std/io"
+import { async, await } from "std/async"
+
+val z = 0
+val p = async(() => 42 / z)
+val r = await(p)
+print(r["type"])
+print("continued")
+"#);
+    assert_eq!(output, vec!["error", "continued"]);
+}
+
+#[test]
+fn test_async_fault_isolation_oob() {
+    // Array out-of-bounds inside a thunk is likewise caught as an Error at await.
+    let output = run(r#"import { print } from "std/io"
+import { async, await } from "std/async"
+
+val arr = [1, 2, 3]
+val p = async(() => arr[99])
+val r = await(p)
+print(r["type"])
+print("ok")
+"#);
+    assert_eq!(output, vec!["error", "ok"]);
+}
+
+#[test]
+fn test_async_string_capture_transferred() {
+    // A captured String val must be deep-copied across the thread boundary and usable there.
+    let output = run(r#"import { print } from "std/io"
+import { async, await } from "std/async"
+
+val name = "world"
+val p = async(() => "hello ${name}")
+print(await(p))
+"#);
+    assert_eq!(output, vec!["hello world"]);
+}
+
+#[test]
 fn test_iterator_restart() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"

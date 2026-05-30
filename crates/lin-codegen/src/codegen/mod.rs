@@ -152,6 +152,12 @@ impl<'ctx> Codegen<'ctx> {
     pub(crate) fn mark_user_fn_nounwind(&self, f: FunctionValue<'ctx>) {
         if !self.uses_async {
             self.add_fn_attrs(f, &["nounwind"]);
+        } else {
+            // Async program: a thunk fault unwinds through Lin frames to the thread boundary.
+            // The frame must therefore emit an unwind table (`uwtable`) so the unwinder can
+            // walk through it; without it a plain `call` to a faulting runtime fn that unwinds
+            // is treated as a non-unwinding panic and aborts the process.
+            self.add_fn_attrs(f, &["uwtable"]);
         }
     }
 
@@ -1107,7 +1113,19 @@ impl<'ctx> Codegen<'ctx> {
                                         .iter()
                                         .filter_map(|c| temp_map.get(c).copied())
                                         .collect();
-                                    self.make_closure_struct_desc(fn_ptr.into(), &capture_vals, descriptor)
+                                    // Capture kinds (for thread-transfer env deep-copy) from the
+                                    // captured temps' IR types. Only emitted when the program uses
+                                    // async (the descriptor is dead weight otherwise).
+                                    let capture_kinds: Option<Vec<u8>> = if self.uses_async {
+                                        Some(captures.iter().map(|c| {
+                                            let ty = func.temp_types.get(c).cloned().unwrap_or(Type::Null);
+                                            Self::capture_kind(&ty)
+                                        }).collect())
+                                    } else { None };
+                                    self.make_closure_struct_desc_caps(
+                                        fn_ptr.into(), &capture_vals, descriptor,
+                                        capture_kinds.as_deref(),
+                                    )
                                 };
                                 temp_map.insert(*dst, cls);
                             }
