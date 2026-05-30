@@ -29,9 +29,25 @@ trap 'rm -rf "$TMPDIR"' EXIT
 mkdir -p "$OUTDIR"
 
 # Build the compiler once, in release, so we're not timing a debug `lin`.
+#
+# CRITICAL: force a fresh `lin-runtime` archive. Every benchmark binary is the
+# compiler's object file linked against target/release/liblin_runtime.a. Cargo's
+# staleness detection cannot be trusted here — a runtime archive built at an
+# earlier commit (or in another worktree's target/) gets silently linked, which
+# once produced a phantom 2.5x "regression" that was entirely a stale archive.
+# Removing the archive before building guarantees it matches the current source.
+# Set FAST_BUILD=1 to skip this if you know the runtime is current (e.g. repeated
+# runs of the same tree without source changes).
 echo "Building lin (release)..." >&2
-cargo build --release -p lin >&2
+if [[ "${FAST_BUILD:-}" != "1" ]]; then
+  rm -f target/release/liblin_runtime.a target/release/deps/liblin_runtime-*.a
+fi
+cargo build --release -p lin-runtime -p lin >&2
 LIN="target/release/lin"
+# Record the runtime archive's checksum in the results header so two result
+# files can be compared with confidence they linked the same runtime.
+RT_ARCHIVE="$(find target/release -maxdepth 1 -name liblin_runtime.a | head -1)"
+RT_SUM="$( [[ -n "$RT_ARCHIVE" ]] && md5sum "$RT_ARCHIVE" | cut -d' ' -f1 || echo unknown)"
 
 opt_env=()
 opt_note="O2 (default)"
@@ -46,6 +62,7 @@ result_file="$OUTDIR/$LABEL.txt"
   echo "# label:   $LABEL"
   echo "# runs:    $RUNS"
   echo "# opt:     $opt_note"
+  echo "# runtime: $RT_SUM"
   echo "# columns: name  min_ms  median_ms"
 } > "$result_file"
 

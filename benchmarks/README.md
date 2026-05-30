@@ -13,7 +13,16 @@ benchmarks/run.sh recursion       # only benchmarks whose name matches "recursio
 RUNS=10 benchmarks/run.sh         # more samples (default 5)
 LABEL=baseline benchmarks/run.sh  # name the results file (default: git short sha)
 NO_OPT=1 benchmarks/run.sh        # compile benchmarks with LIN_NO_OPT=1
+FAST_BUILD=1 benchmarks/run.sh    # skip the forced runtime rebuild (see below)
 ```
+
+By default the runner **deletes and rebuilds `liblin_runtime.a`** before timing.
+This is deliberate: every benchmark binary links that archive, and cargo's
+staleness detection cannot be relied on across commits or worktrees — a stale
+archive once produced a phantom 2.5x "regression" that vanished once the runtime
+was rebuilt from current source. The results header records the archive's md5
+(`# runtime:`) so two result files prove they linked the same runtime. Use
+`FAST_BUILD=1` only for repeated runs of an unchanged tree.
 
 Each benchmark is run once un-timed to warm caches, then `RUNS` timed runs; we
 report the **min** (most reproducible for CPU-bound work) and **median** wall-clock
@@ -35,6 +44,15 @@ diff benchmarks/results/before.txt benchmarks/results/after.txt
 Because absolute numbers depend on the machine, only compare runs taken on the
 same hardware in the same session. Commit a results file only as a dated
 reference point, not as a pass/fail gate.
+
+**Measure a change on a branch in this same tree, not in a separate worktree.**
+Comparing two worktrees' `target/` dirs is how the stale-runtime trap bit us:
+each tree builds its own archive and they can drift. The reliable workflow is to
+`LABEL=before` on the current branch, switch to the branch with your change in
+the *same* checkout, rebuild (the forced runtime rebuild handles this), then
+`LABEL=after`. Confirm the two result files share the same `# runtime:` line is
+*expected to differ* (that's the point) but that nothing else in the environment
+changed.
 
 ## What each benchmark targets
 
