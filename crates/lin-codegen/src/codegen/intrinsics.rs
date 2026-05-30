@@ -818,10 +818,14 @@ impl<'a> DescEncoder<'a> {
             Type::UInt64 => { self.put_u8(KIND_INT); self.put_u8(8); self.put_u8(0); }
             Type::Float32 => { self.put_u8(KIND_FLOAT); self.put_u8(4); }
             Type::Float64 => { self.put_u8(KIND_FLOAT); self.put_u8(8); }
-            // Json / unconstrained TypeVar / opaque handles / functions / iterators: accept any.
-            Type::TypeVar(_) | Type::Iterator(_) | Type::Function { .. } | Type::Never => {
-                self.put_u8(KIND_JSON)
-            }
+            // Json / unconstrained TypeVar / opaque handles / functions / iterators / Shared:
+            // accept any. `Shared<T>` is an opaque mutable-state box (ADR-044), not a JSON shape,
+            // so a `fromJson` target containing it imposes no structural check.
+            Type::TypeVar(_)
+            | Type::Iterator(_)
+            | Type::Function { .. }
+            | Type::Never
+            | Type::Shared(_) => self.put_u8(KIND_JSON),
             Type::Array(inner) => {
                 self.put_u8(KIND_ARRAY);
                 let slot = self.reserve_u32();
