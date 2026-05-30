@@ -1815,6 +1815,22 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                     PatternTest::Always => builder.const_temp(Const::Bool(true)),
                 };
             }
+            // `is <Named>` resolving to an object shape (e.g. `Error`, or a user object-type
+            // alias like `Person`): a bare tag check matches ANY object, which is too loose and
+            // unsound — narrowing then types missing fields as present, faulting at runtime.
+            // Check the required fields are present, mirroring the match-arm path (HasPattern).
+            if let TypedPattern::TypeCheck(Type::Object(fields), _) = pattern {
+                if !fields.is_empty() {
+                    let dst = builder.alloc_temp(Type::Bool);
+                    let required_fields: Vec<String> = fields.keys().cloned().collect();
+                    builder.emit(Instruction::HasPattern {
+                        dst,
+                        val: val_temp,
+                        pattern: HasDesc { required_fields },
+                    });
+                    return dst;
+                }
+            }
             let dst = builder.alloc_temp(Type::Bool);
             let (check_ty, _span) = pattern_type_check(pattern);
             builder.emit(Instruction::IsType {

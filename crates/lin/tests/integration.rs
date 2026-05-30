@@ -5119,10 +5119,10 @@ print(if bad is Error then "bad:ERR" else "bad:OK")
 
 #[test]
 fn test_from_json_match_is_error_idiom() {
-    // The agreed idiom: `match result | is Error => .. | is Person => ..`. Error MUST be the
-    // first arm (union first-match-wins: `is Person` is a bare object tag check that also
-    // matches the Error object — see ADR-047). Exhaustiveness accepts `is Error` as covering
-    // the Error variant of `Person | Error`.
+    // The idiom `match result | is Error => .. | is Person => ..`. As of ADR-050 the arm order
+    // is no longer load-bearing (`is Person` checks required fields, so it does not match the
+    // Error object), but the Error-first form remains valid. Exhaustiveness accepts `is Error`
+    // as covering the Error variant of `Person | Error`.
     let out = run(r#"import { print } from "std/io"
 import { fromJson } from "std/json"
 type Person = { "name": String, "age": Int32 }
@@ -5228,4 +5228,41 @@ print(pick("hi"))
 print(pick(42))
 "#);
     assert_eq!(out, vec!["hi", "not-a-string"]);
+}
+
+#[test]
+fn test_is_objecttype_expr_checks_required_fields() {
+    // Regression (ADR-050): the EXPRESSION form `x is Person` must check that the object has
+    // Person's required fields, not just that it is some object (bare TAG_OBJECT). Previously a
+    // non-Person object matched, then the narrowed `x["name"]` faulted/returned null.
+    let out = run(r#"import { print } from "std/io"
+type Person = { "name": String, "age": Int32 }
+val full = { "name": "Ada", "age": 36 }
+val partial = { "name": "Bob" }
+val other = { "foo": "bar" }
+print(if full is Person then "full:${full["name"]}" else "full:no")
+print(if partial is Person then "partial:yes" else "partial:no")
+print(if other is Person then "other:yes" else "other:no")
+"#);
+    assert_eq!(out, vec!["full:Ada", "partial:no", "other:no"]);
+}
+
+#[test]
+fn test_is_person_first_arm_no_longer_faults() {
+    // Regression (ADR-050): with required-field checking, `is Person` as the FIRST arm no longer
+    // swallows a decode-error object — the ADR-049 ordering footgun is gone. A decode failure
+    // (which lacks name/age) falls through to the Error arm instead of faulting on r["name"].
+    let out = run(r#"import { print } from "std/io"
+import { fromJson } from "std/json"
+type Person = { "name": String, "age": Int32 }
+val describe = (r: Person | Error): Null =>
+  match r
+    is Person => print("ok:${r["name"]}")
+    is Error => print("err")
+val main = (): Null =>
+  describe(Person.fromJson({ "name": "Ada", "age": 36 }))
+  describe(Person.fromJson({ "name": "Bob", "age": "old" }))
+main()
+"#);
+    assert_eq!(out, vec!["ok:Ada", "err"]);
 }
