@@ -7,37 +7,55 @@ val s = suite("std/async", [
   test("async/await basic value", () =>
     val p = async(() => 42)
     val result = await(p)
-    expect(result).toBe(42)
+    val checks = [
+      expect(result).toBe(42)
+    ]
+    checks
   ),
 
   test("async captures val binding", () =>
     val x = 10
     val p = async(() => x * 3)
-    expect(await(p)).toBe(30)
+    val checks = [
+      expect(await(p)).toBe(30)
+    ]
+    checks
   ),
 
   test("parallel runs all tasks", () =>
     val results = parallel([() => 1, () => 2, () => 3])
-    expect(toString(results)).toBe("[1, 2, 3]")
+    val checks = [
+      expect(toString(results)).toBe("[1, 2, 3]")
+    ]
+    checks
   ),
 
   test("worker request/reply", () =>
     val w = worker(msg => msg * 2, () => null)
     val reply = request(w, 21)
     close(w)
-    expect(reply).toBe(42)
+    val checks = [
+      expect(reply).toBe(42)
+    ]
+    checks
   ),
 
   test("async captures string val (deep-copied across thread)", () =>
     val name = "world"
     val p = async(() => "hello ${name}")
-    expect(await(p)).toBe("hello world")
+    val checks = [
+      expect(await(p)).toBe("hello world")
+    ]
+    checks
   ),
 
   test("async captures array val", () =>
     val xs = [10, 20, 30]
     val p = async(() => xs[1])
-    expect(await(p)).toBe(20)
+    val checks = [
+      expect(await(p)).toBe(20)
+    ]
+    checks
   ),
 
   test("fault in thunk is caught as Error at await (div by zero)", () =>
@@ -46,21 +64,30 @@ val s = suite("std/async", [
     val r = await(p)
     // The fault surfaces as an Error object { type: "error", message: ... };
     // the program continues rather than aborting (spec §32.2.2).
-    expect(r["type"]).toBe("error")
+    val checks = [
+      expect(r["type"]).toBe("error")
+    ]
+    checks
   ),
 
   test("fault in thunk: array out of bounds caught as Error", () =>
     val arr = [1, 2, 3]
     val p = async(() => arr[99])
     val r = await(p)
-    expect(r["type"]).toBe("error")
+    val checks = [
+      expect(r["type"]).toBe("error")
+    ]
+    checks
   ),
 
   test("program continues after a caught async fault", () =>
     val z = 0
     val bad = await(async(() => 1 / z))
     val good = await(async(() => 7 + 1))
-    expect(good).toBe(8)
+    val checks = [
+      expect(good).toBe(8)
+    ]
+    checks
   ),
 
   test("race resolves with first to complete", () =>
@@ -74,7 +101,10 @@ val s = suite("std/async", [
         "fast"
       )
     ]))
-    expect(w).toBe("fast")
+    val checks = [
+      expect(w).toBe("fast")
+    ]
+    checks
   ),
 
   test("timeout expires to null when too slow", () =>
@@ -82,21 +112,27 @@ val s = suite("std/async", [
       sleep(200)
       "done"
     )
-    expect(await(timeout(slow, 20))).toBe(null)
+    val checks = [
+      expect(await(timeout(slow, 20))).toBe(null)
+    ]
+    checks
   ),
 
-  test("timeout passes the value through when fast", () =>
+  test("timeout passes the value through when fast", () => [
     expect(await(timeout(async(() => 5), 1000))).toBe(5)
-  ),
+  ]),
 
-  test("retry returns value on first success", () =>
+  test("retry returns value on first success", () => [
     expect(await(retry(() => 7, 3))).toBe(7)
-  ),
+  ]),
 
   test("retry surfaces Error when all attempts fail", () =>
     val z = 0
     val r = await(retry(() => 1 / z, 3))
-    expect(r["type"]).toBe("error")
+    val checks = [
+      expect(r["type"]).toBe("error")
+    ]
+    checks
   ),
 ])
 

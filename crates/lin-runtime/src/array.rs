@@ -609,6 +609,86 @@ pub unsafe extern "C" fn lin_array_concat_into(dst: *mut LinArray, src: *const L
     }
 }
 
+/// Concatenate `a ++ b`, PRESERVING a flat element representation when both inputs are
+/// flat arrays of the same element type. Mirrors `lin_array_slice_dyn`: the pure-Lin
+/// `concat` allocated a tagged result (lin_array_allocate), so concatenating two flat
+/// `UInt8[]` produced a tagged array — `c[i]` read correctly via the elem_tag-aware get,
+/// but byte-level consumers (`u32FromBe`, fs write, FFI) that read `(*arr).data as *const
+/// u8` saw 16-byte TaggedVal elements instead of packed bytes. When the two arrays share a
+/// flat `elem_tag`, build a flat result of that type; otherwise fall back to a tagged
+/// concat. Inputs cross the boundary as `Json` (TaggedVal*(Array)) or raw `LinArray*`.
+#[no_mangle]
+pub unsafe extern "C" fn lin_array_concat_dyn(a: *const u8, b: *const u8) -> *mut u8 {
+    use crate::tagged::*;
+    unsafe fn unwrap(p: *const u8) -> *const LinArray {
+        if p.is_null() { return std::ptr::null(); }
+        if *p == TAG_ARRAY { (*(p as *const TaggedVal)).payload as *const LinArray }
+        else { p as *const LinArray }
+    }
+    let la = unwrap(a);
+    let lb = unwrap(b);
+    let ta = if la.is_null() { 0xFF } else { (*la).elem_tag };
+    let tb = if lb.is_null() { 0xFF } else { (*lb).elem_tag };
+    let total = (if la.is_null() { 0 } else { (*la).len }) + (if lb.is_null() { 0 } else { (*lb).len });
+
+    // Both flat and same element type → flat result of that type.
+    if ta == tb && ta != 0xFF {
+        // (alloc_fn, concat_into_fn) for the shared flat element tag.
+        macro_rules! flat_cat {
+            ($alloc:ident, $cat:ident) => {{
+                let out = $alloc(total.max(1));
+                if !la.is_null() { $cat(out, la); }
+                if !lb.is_null() { $cat(out, lb); }
+                return alloc_tagged(TAG_ARRAY, out as u64);
+            }};
+        }
+        match ta {
+            TAG_INT32   => flat_cat!(lin_flat_array_alloc_i32, lin_flat_array_concat_into_i32),
+            TAG_INT64   => flat_cat!(lin_flat_array_alloc_i64, lin_flat_array_concat_into_i64),
+            TAG_FLOAT32 => flat_cat!(lin_flat_array_alloc_f32, lin_flat_array_concat_into_f32),
+            TAG_FLOAT64 => flat_cat!(lin_flat_array_alloc_f64, lin_flat_array_concat_into_f64),
+            TAG_UINT8   => flat_cat!(lin_flat_array_alloc_u8,  lin_flat_array_concat_into_u8),
+            TAG_INT8    => flat_cat!(lin_flat_array_alloc_i8,  lin_flat_array_concat_into_i8),
+            TAG_UINT16  => flat_cat!(lin_flat_array_alloc_u16, lin_flat_array_concat_into_u16),
+            TAG_INT16   => flat_cat!(lin_flat_array_alloc_i16, lin_flat_array_concat_into_i16),
+            TAG_UINT32  => flat_cat!(lin_flat_array_alloc_u32, lin_flat_array_concat_into_u32),
+            TAG_UINT64  => flat_cat!(lin_flat_array_alloc_u64, lin_flat_array_concat_into_u64),
+            _ => {} // unknown flat tag: fall through to the tagged path
+        }
+    }
+
+    // Mixed or tagged element types → tagged result. A flat source is first widened to a
+    // tagged array (lin_flat_to_tagged_* boxes its raw scalars) so concat_into can copy
+    // its elements as TaggedVals; a tagged source is appended directly.
+    let out = lin_array_alloc(total.max(4));
+    unsafe fn append_tagged(out: *mut LinArray, src: *const LinArray) {
+        if src.is_null() { return; }
+        let et = (*src).elem_tag;
+        if et == 0xFF {
+            lin_array_concat_into(out, src);
+            return;
+        }
+        let widened: *mut LinArray = match et {
+            TAG_INT32   => lin_flat_to_tagged_i32(src),
+            TAG_INT64   => lin_flat_to_tagged_i64(src),
+            TAG_FLOAT32 => lin_flat_to_tagged_f32(src),
+            TAG_FLOAT64 => lin_flat_to_tagged_f64(src),
+            TAG_UINT8   => lin_flat_to_tagged_u8(src),
+            TAG_INT8    => lin_flat_to_tagged_i8(src),
+            TAG_UINT16  => lin_flat_to_tagged_u16(src),
+            TAG_INT16   => lin_flat_to_tagged_i16(src),
+            TAG_UINT32  => lin_flat_to_tagged_u32(src),
+            TAG_UINT64  => lin_flat_to_tagged_u64(src),
+            _ => { lin_array_concat_into(out, src); return; }
+        };
+        lin_array_concat_into(out, widened);
+        lin_array_free(widened);
+    }
+    append_tagged(out, la);
+    append_tagged(out, lb);
+    alloc_tagged(TAG_ARRAY, out as u64)
+}
+
 /// Copy all i32 elements from `src` flat array into `dst` flat array.
 #[no_mangle]
 pub unsafe extern "C" fn lin_flat_array_concat_into_i32(dst: *mut LinArray, src: *const LinArray) {
@@ -653,52 +733,57 @@ pub unsafe extern "C" fn lin_flat_array_concat_into_f64(dst: *mut LinArray, src:
     }
 }
 
-/// Read element `i` of `arr` as a by-value `TaggedVal`, honoring the array's `elem_tag`
-/// (flat scalar storage of width 1/2/4/8, or 16-byte tagged `LinArrayElem`). This does NOT
-/// allocate and does NOT retain pointer payloads — it is a read-only view for comparison.
-/// Mirrors the scalar-widening rules of `lin_array_get_tagged`.
-#[inline]
-unsafe fn array_elem_value(arr: *const LinArray, i: usize) -> crate::tagged::TaggedVal {
+/// Load element `i` of `arr` into a `TaggedVal` (by value, no heap allocation), handling
+/// BOTH tagged arrays (`elem_tag == 0xFF`, elements already laid out as TaggedVal) and flat
+/// scalar arrays (raw i8/i16/i32/i64/f32/f64/bool elements). Used by `lin_array_eq` so it can
+/// compare any array — including flat ones reached by recursion through a nested heap array.
+unsafe fn array_elem_as_tagged(arr: *const LinArray, i: usize) -> crate::tagged::TaggedVal {
     use crate::tagged::*;
-    let mk = |tag: u8, payload: u64| TaggedVal { tag, _pad: [0; 7], payload };
-    match (*arr).elem_tag {
-        TAG_INT32 => mk(TAG_INT32, *((*arr).data as *const i32).add(i) as i64 as u64),
-        TAG_INT64 => mk(TAG_INT64, *((*arr).data as *const i64).add(i) as u64),
-        TAG_FLOAT32 => mk(TAG_FLOAT32, (*((*arr).data as *const f32).add(i)).to_bits() as u64),
-        TAG_FLOAT64 => mk(TAG_FLOAT64, (*((*arr).data as *const f64).add(i)).to_bits()),
-        TAG_UINT8 => mk(TAG_INT32, *((*arr).data as *const u8).add(i) as i64 as u64),
-        TAG_INT8 => mk(TAG_INT32, *((*arr).data as *const i8).add(i) as i64 as u64),
-        TAG_UINT16 => mk(TAG_INT32, *((*arr).data as *const u16).add(i) as i64 as u64),
-        TAG_INT16 => mk(TAG_INT32, *((*arr).data as *const i16).add(i) as i64 as u64),
-        TAG_UINT32 => mk(TAG_INT64, *((*arr).data as *const u32).add(i) as u64),
-        TAG_UINT64 => mk(TAG_UINT64, *((*arr).data as *const u64).add(i)),
-        _ => {
-            // Tagged array: elem IS a LinArrayElem (== TaggedVal layout).
-            let elem = (*arr).data.add(i);
-            mk((*elem).tag, (*elem).payload)
-        }
+    let mut tv: TaggedVal = std::mem::zeroed();
+    let et = (*arr).elem_tag;
+    if et == 0xFF {
+        // Tagged element: copy the in-place TaggedVal-layout element directly.
+        let elem = (*arr).data.add(i) as *const TaggedVal;
+        return *elem;
     }
+    // Flat scalar element: read the raw value of the right width and box it inline.
+    match et {
+        TAG_INT32 => { tv.tag = TAG_INT32; tv.payload = (*((*arr).data as *const i32).add(i)) as i64 as u64; }
+        TAG_INT64 => { tv.tag = TAG_INT64; tv.payload = (*((*arr).data as *const i64).add(i)) as u64; }
+        TAG_FLOAT32 => { tv.tag = TAG_FLOAT32; tv.payload = (*((*arr).data as *const f32).add(i)).to_bits() as u64; }
+        TAG_FLOAT64 => { tv.tag = TAG_FLOAT64; tv.payload = (*((*arr).data as *const f64).add(i)).to_bits(); }
+        TAG_UINT8 => { tv.tag = TAG_INT32; tv.payload = (*((*arr).data as *const u8).add(i)) as i64 as u64; }
+        TAG_INT8 => { tv.tag = TAG_INT32; tv.payload = (*((*arr).data as *const i8).add(i)) as i64 as u64; }
+        TAG_UINT16 => { tv.tag = TAG_INT32; tv.payload = (*((*arr).data as *const u16).add(i)) as i64 as u64; }
+        TAG_INT16 => { tv.tag = TAG_INT32; tv.payload = (*((*arr).data as *const i16).add(i)) as i64 as u64; }
+        TAG_UINT32 => { tv.tag = TAG_INT64; tv.payload = (*((*arr).data as *const u32).add(i)) as u64; }
+        TAG_UINT64 => { tv.tag = TAG_UINT64; tv.payload = *((*arr).data as *const u64).add(i); }
+        TAG_BOOL => { tv.tag = TAG_BOOL; tv.payload = (*((*arr).data as *const u8).add(i)) as u64; }
+        _ => { tv.tag = TAG_NULL; }
+    }
+    tv
 }
 
-/// Structural array equality (element-by-element), handling flat scalar AND tagged arrays,
-/// including mixed representations (e.g. a flat `Int32[]` vs a tagged `Json[]` of ints).
-/// Element comparison is deep for nested strings/arrays/objects (via `lin_tagged_eq`), and
-/// cross-numeric by value (Int == Float), matching `lin_tagged_eq`'s scalar rules.
+/// Structural array equality (element-by-element, deep). Works for tagged AND flat scalar
+/// arrays, and is the recursion target for nested arrays (a TAG_ARRAY element routes here
+/// via `lin_tagged_eq`). Each element is compared via `lin_tagged_eq`, so scalars compare by
+/// value (incl. cross-numeric) and heap elements (String/Array/Object) recurse deeply. A raw
+/// payload `!=` would compare heap elements by POINTER — wrong for distinct-but-equal values.
 #[no_mangle]
 pub unsafe extern "C" fn lin_array_eq(a: *const LinArray, b: *const LinArray) -> u8 {
     if a == b { return 1; }
     if a.is_null() || b.is_null() { return 0; }
     let len = (*a).len;
     if len != (*b).len { return 0; }
-    // Fast path: both tagged with identical scalar elem_tag → original cheap loop is safe
-    // (both walk 16-byte strides) but `lin_tagged_eq` is just as correct, so use the general
-    // path uniformly — the per-element copy is cheap and avoids the flat-stride OOB bug.
+    // Compare element-by-element via `lin_tagged_eq` uniformly (handles flat and tagged,
+    // scalars by value, heap elements deeply); the per-element TaggedVal copy is cheap and
+    // avoids reading a flat scalar buffer with the 16-byte tagged stride.
     for i in 0..len as usize {
-        let av = array_elem_value(a, i);
-        let bv = array_elem_value(b, i);
+        let ae = array_elem_as_tagged(a, i);
+        let be = array_elem_as_tagged(b, i);
         if crate::tagged::lin_tagged_eq(
-            &av as *const crate::tagged::TaggedVal as *const u8,
-            &bv as *const crate::tagged::TaggedVal as *const u8,
+            &ae as *const crate::tagged::TaggedVal as *const u8,
+            &be as *const crate::tagged::TaggedVal as *const u8,
         ) == 0 {
             return 0;
         }
