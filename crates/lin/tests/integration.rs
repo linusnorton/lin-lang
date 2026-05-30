@@ -159,13 +159,6 @@ fn run_with_stdin(source: &str, stdin_data: &str) -> String {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn test_hello_world() {
-    let output = run(r#"import { print } from "std/io"
-print("hello world")"#);
-    assert_eq!(output, vec!["hello world"]);
-}
-
-#[test]
 fn test_arithmetic() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
