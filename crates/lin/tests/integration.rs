@@ -2841,3 +2841,123 @@ print(toString(u32FromBe(bytes, 0)))   // 4294967295
 "#);
     assert_eq!(out, vec!["4294967295"]);
 }
+
+// ===========================================================================
+// std/net — UDP and TCP sockets (Milestone 21, Layer 2)
+//
+// These exercise REAL loopback sockets. They are consolidated into single test
+// functions (one for UDP, one for TCP) so that all socket work for a given
+// protocol runs single-threaded with deterministic ordering, and so that fixed
+// high ports don't collide across parallel test threads.
+// ===========================================================================
+
+#[test]
+fn test_net_udp_loopback_roundtrip() {
+    // Bind one UDP socket and send a datagram to itself, then recvFrom it.
+    // udpBind binds a fixed port (the API doesn't surface an OS-assigned port),
+    // so we use a high port and send to 127.0.0.1:<port>.
+    let out = run(r#"import { udpBind, udpSendTo, udpRecv, udpRecvFrom, udpSetNonblocking, udpClose } from "std/net"
+import { print } from "std/io"
+import { toString } from "std/string"
+
+val port = 39201
+val sock = udpBind(port)
+print("bound: ${toString(sock["type"] != "error")}")
+
+// Non-blocking recv with no data pending must return Null.
+val nb = udpSetNonblocking(sock, true)
+val empty: UInt8[] = [0, 0, 0, 0]
+val none = udpRecv(sock, empty)
+print("empty-recv-null: ${toString(none == null)}")
+
+// Back to blocking for the round-trip.
+val nb2 = udpSetNonblocking(sock, false)
+val msg: UInt8[] = [72, 105, 33, 10]
+val sent = udpSendTo(sock, "127.0.0.1", port, msg)
+print("sent: ${toString(sent)}")
+
+val buf: UInt8[] = [0, 0, 0, 0, 0, 0, 0, 0]
+val res = udpRecvFrom(sock, buf)
+print("len: ${toString(res["len"])}")
+print("addr: ${toString(res["addr"])}")
+print("b0: ${toString(buf[0])}")
+print("b1: ${toString(buf[1])}")
+print("b2: ${toString(buf[2])}")
+print("b3: ${toString(buf[3])}")
+
+val c = udpClose(sock)
+"#);
+    assert_eq!(
+        out,
+        vec![
+            "bound: true",
+            "empty-recv-null: true",
+            "sent: 4",
+            "len: 4",
+            "addr: 127.0.0.1",
+            "b0: 72",
+            "b1: 105",
+            "b2: 33",
+            "b3: 10",
+        ]
+    );
+}
+
+#[test]
+fn test_net_tcp_loopback_echo() {
+    // Single-threaded TCP ordering: listen, connect (blocking — the kernel
+    // completes the handshake into the listener backlog), then a blocking accept
+    // immediately returns the pending connection. The server then reads the
+    // client's bytes. After the client closes, the server's recv returns 0.
+    let out = run(r#"import { tcpListen, tcpAccept, tcpConnect, tcpRecv, tcpSend, tcpClose } from "std/net"
+import { print } from "std/io"
+import { toString } from "std/string"
+
+val port = 39202
+val listener = tcpListen(port)
+print("listening: ${toString(listener["type"] != "error")}")
+
+val client = tcpConnect("127.0.0.1", port)
+print("connected: ${toString(client["type"] != "error")}")
+
+val accepted = tcpAccept(listener)
+val server = accepted["fd"]
+print("accepted: ${toString(accepted["type"] != "error")}")
+
+val payload: UInt8[] = [76, 105, 110, 33]
+val sent = tcpSend(client, payload)
+print("sent: ${toString(sent)}")
+
+val buf: UInt8[] = [0, 0, 0, 0, 0, 0]
+val n = tcpRecv(server, buf)
+print("recv: ${toString(n)}")
+print("b0: ${toString(buf[0])}")
+print("b1: ${toString(buf[1])}")
+print("b2: ${toString(buf[2])}")
+print("b3: ${toString(buf[3])}")
+
+// Close the client; the server's next recv must return 0 (peer closed).
+val cc = tcpClose(client)
+val buf2: UInt8[] = [0, 0, 0, 0]
+val n2 = tcpRecv(server, buf2)
+print("recv-after-close: ${toString(n2)}")
+
+val sc = tcpClose(server)
+val lc = tcpClose(listener)
+"#);
+    assert_eq!(
+        out,
+        vec![
+            "listening: true",
+            "connected: true",
+            "accepted: true",
+            "sent: 4",
+            "recv: 4",
+            "b0: 76",
+            "b1: 105",
+            "b2: 110",
+            "b3: 33",
+            "recv-after-close: 0",
+        ]
+    );
+}

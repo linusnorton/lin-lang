@@ -11,6 +11,7 @@ pub mod io;
 pub mod json;
 pub mod math;
 pub mod memory;
+pub mod net;
 pub mod number;
 pub mod object;
 pub mod path;
