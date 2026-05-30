@@ -201,5 +201,8 @@ jobs:
           # The runtime intentionally retains program-lifetime globals; TSan only flags races.
           TSAN_OPTIONS: report_signal_unsafe=0
         run: |
-          cargo +nightly test -p lin-runtime -Zbuild-std \
+          # --lib: run the unit-test suite (which holds the multi-threaded race tests). Doctests
+          # are skipped — under -Zbuild-std rustdoc can't reconcile the sanitizer ABI across a
+          # transitive dependency, an artifact unrelated to the race-class guard.
+          cargo +nightly test -p lin-runtime -Zbuild-std --lib \
             --target x86_64-unknown-linux-gnu
