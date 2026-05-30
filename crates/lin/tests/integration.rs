@@ -3065,3 +3065,79 @@ val lc = tcpClose(listener)
         ]
     );
 }
+
+// ===========================================================================
+// std/proc — subprocesses, and std/tty — raw terminal (Milestone 21, Layer 3)
+//
+// std/proc is deterministic: we spawn a real `sh -c` process, read its piped
+// stdout, and wait for its exit code. std/tty cannot be exercised under the
+// test harness (stdin is a pipe, not a TTY); we only assert that rawMode on a
+// non-TTY returns an Error object gracefully (no panic / no crash).
+// ===========================================================================
+
+#[test]
+fn test_proc_spawn_read_wait() {
+    // Spawn `sh -c 'printf hello'`, read its stdout into a buffer, assert the
+    // bytes, then wait for exit code 0. `sh -c` is the most portable spawn.
+    let out = run(r#"import { spawn, readStdout, wait } from "std/proc"
+import { print } from "std/io"
+import { toString } from "std/string"
+
+val h = spawn(["sh", "-c", "printf hello"])
+print("spawned: ${toString(h["type"] != "error")}")
+
+val buf: UInt8[] = [0, 0, 0, 0, 0, 0, 0, 0]
+val n = readStdout(h, buf)
+print("n: ${toString(n)}")
+print("b0: ${toString(buf[0])}")
+print("b1: ${toString(buf[1])}")
+print("b2: ${toString(buf[2])}")
+print("b3: ${toString(buf[3])}")
+print("b4: ${toString(buf[4])}")
+
+val code = wait(h)
+print("code: ${toString(code)}")
+"#);
+    assert_eq!(
+        out,
+        vec![
+            "spawned: true",
+            "n: 5",
+            "b0: 104", // 'h'
+            "b1: 101", // 'e'
+            "b2: 108", // 'l'
+            "b3: 108", // 'l'
+            "b4: 111", // 'o'
+            "code: 0",
+        ]
+    );
+}
+
+#[test]
+fn test_proc_wait_exit_code() {
+    // `sh -c 'exit 3'` exits with code 3.
+    let out = run(r#"import { spawn, wait } from "std/proc"
+import { print } from "std/io"
+import { toString } from "std/string"
+
+val h = spawn(["sh", "-c", "exit 3"])
+val code = wait(h)
+print("code: ${toString(code)}")
+"#);
+    assert_eq!(out, vec!["code: 3"]);
+}
+
+#[test]
+fn test_tty_rawmode_on_non_tty_returns_error() {
+    // Under the test harness stdin is not a TTY, so tcgetattr fails and rawMode
+    // must return an Error object (type == "error") rather than panicking. We
+    // assert "error" (not crash) without depending on the exact message.
+    let out = run(r#"import { rawMode } from "std/tty"
+import { print } from "std/io"
+import { toString } from "std/string"
+
+val r = rawMode(true)
+print("type: ${toString(r["type"])}")
+"#);
+    assert_eq!(out, vec!["type: error"]);
+}

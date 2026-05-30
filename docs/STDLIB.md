@@ -19,6 +19,8 @@ This document specifies the standard library for the Lin language. All modules a
 | [`std/path`](#stdpath) | Path string manipulation |
 | [`std/http`](#stdhttp) | HTTP client and server |
 | [`std/net`](#stdnet) | UDP and TCP sockets |
+| [`std/proc`](#stdproc) | Subprocess spawn / stdout / wait |
+| [`std/tty`](#stdtty) | Raw terminal mode and key reads |
 | [`std/async`](#stdasync) | Async, concurrency and workers |
 | [`std/env`](#stdenv) | Environment variables |
 | [`std/process`](#stdprocess) | External process execution |
@@ -3069,6 +3071,66 @@ val n2 = tcpRecv(server, buf)                  // 0 — peer closed
 tcpClose(server)
 tcpClose(listener)
 ```
+
+---
+
+## std/proc
+
+Spawn and manage child processes. A process is an opaque integer handle (spec §35.4, §35.6) — an `Int64` the runtime interprets, not an OS pid (the handle is a monotonic id, so it is immune to pid-reuse races). Every fallible call returns the `T | Error` result shape.
+
+```txt
+spawn:       (argv: String[])              => Int64 | Error     // opaque process handle
+readStdout:  (handle: Int64, buf: UInt8[]) => Int32 | Error     // bytes read; 0 = EOF
+kill:        (handle: Int64)               => Null | Error
+wait:        (handle: Int64)               => Int32 | Error     // exit code
+```
+
+`argv[0]` is the program (looked up on `PATH` or an absolute path); the rest are arguments. The child's stdin is connected to `/dev/null`, its stdout is captured into a pipe (so `readStdout` works), and its stderr is inherited from the parent.
+
+`readStdout` fills a **caller-owned** `UInt8[]` and returns the number of bytes read, reading incrementally from the same pipe across calls; `0` means end-of-stream. `wait` blocks until the child exits, returns its exit code (`-1` if it was terminated by a signal), and reaps the process — after `wait` the handle is no longer valid. `kill` sends SIGKILL; killing an already-exited child is tolerated and returns `Null`.
+
+### Example — capture a subprocess's output
+
+```txt
+import { spawn, readStdout, wait } from "std/proc"
+import { print } from "std/io"
+
+val h = spawn(["sh", "-c", "printf hello"])
+val buf: UInt8[] = [0, 0, 0, 0, 0, 0, 0, 0]
+val n = readStdout(h, buf)          // n == 5
+print("read ${n} bytes, first = ${buf[0]}")   // read 5 bytes, first = 104 ('h')
+val code = wait(h)                  // 0
+print("exited ${code}")
+```
+
+---
+
+## std/tty
+
+Raw terminal mode and non-blocking key input on stdin (spec §35.7).
+
+```txt
+rawMode:  (on: Boolean)  => Null | Error    // enable/disable terminal raw mode
+readKey:  ()             => Int32 | Null    // keycode, or Null if no key available (non-blocking)
+```
+
+`rawMode(true)` puts the terminal into raw mode: canonical line buffering and echo are disabled, and reads become non-blocking. The original terminal settings are saved and restored exactly by `rawMode(false)`. If stdin is not a terminal (e.g. a pipe), `rawMode` returns an `Error` object rather than panicking.
+
+`readKey` reads a single byte from stdin without blocking: it returns the byte value (`0..255`) as an `Int32`, or `Null` if no key is currently available. Multi-byte sequences (arrow keys, function keys) arrive one byte at a time, so a reader reassembles escape sequences itself.
+
+### Example — poll for a key in raw mode
+
+```txt
+import { rawMode, readKey } from "std/tty"
+import { print } from "std/io"
+
+rawMode(true)            // disable canonical mode + echo; reads are non-blocking
+val k = readKey()        // a byte value, or null if nothing was typed
+if k != null then print("key: ${k}") else print("no key ready")
+rawMode(false)           // restore the original terminal settings
+```
+
+A real application polls `readKey` repeatedly (typically via a `range(...).for(...)` driven loop with `std/time` `sleepMicros` between polls), treating `null` as "nothing yet" and acting on byte values as keys.
 
 ---
 

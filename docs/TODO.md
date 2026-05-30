@@ -634,8 +634,8 @@ Sequenced in layers. Layer 1 (bytes + bitwise) is the keystone — everything el
 
 ### Layer 3 — Subprocess and raw terminal
 
-- [ ] **Subprocess intrinsics** — `lin_proc_spawn(String[])`, `lin_proc_read_stdout`, `lin_proc_kill`, `lin_proc_wait`; opaque `Int64` handle. **`std/proc`**: `spawn`, `readStdout`, `kill`, `wait`.
-- [ ] **Raw-TTY intrinsics** — `lin_tty_raw_mode(Boolean)`, `lin_tty_read_key()` (non-blocking). **`std/tty`**: `rawMode`, `readKey` (`Int32 | Null`).
+- [x] **Subprocess intrinsics** — `lin_proc_spawn(String[])`, `lin_proc_read_stdout`, `lin_proc_kill`, `lin_proc_wait`; opaque `Int64` handle. **`std/proc`**: `spawn`, `readStdout`, `kill`, `wait`.
+- [x] **Raw-TTY intrinsics** — `lin_tty_raw_mode(Boolean)`, `lin_tty_read_key()` (non-blocking). **`std/tty`**: `rawMode`, `readKey` (`Int32 | Null`).
 
 ### Layer 4 — Timing, signals; FFI and Worker for the rest
 
@@ -657,7 +657,7 @@ Sequenced in layers. Layer 1 (bytes + bitwise) is the keystone — everything el
 - [ ] `std/bytes` round-trips: `u32ToBe`/`u32FromBe`, `f32ToBits`/`f32FromBits`, the 8-byte two-f32 control packet.
 - [x] `std/net`: UDP loopback send/recv; non-blocking recv returns `Null` when no data.
 - [x] `std/net`: TCP loopback — listener accepts a connection, echoes bytes back to a connected client; `recv` returns `0` after the peer closes.
-- [ ] `std/proc`: spawn a process, read its stdout to EOF, exit code via `wait`.
+- [x] `std/proc`: spawn a process, read its stdout to EOF, exit code via `wait`.
 - [ ] `examples/`: a NAL-parser / RTP-packetizer fixture (the protocol core, no OS), plus a UDP echo fixture.
 
 ---
