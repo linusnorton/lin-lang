@@ -340,6 +340,26 @@ print(toString(c()))
     assert_eq!(output, vec!["1", "2", "3"]);
 }
 
+// Regression: an Array (or any heap value) passed as an argument to an INDIRECT call
+// through a closure value must be boxed to Json to match the closure's `Json` parameter,
+// exactly as the named/imported call paths do. Previously the indirect-call lowering passed
+// the raw `LinArray*` instead of a boxed `TaggedVal*`, so the callee read its tag/payload
+// from garbage and mutations through it were silently lost (the array stayed empty).
+#[test]
+fn test_array_passed_to_closure_value_mutates() {
+    let output = run(r#"import { print } from "std/io"
+import { push, length } from "std/array"
+import { toString } from "std/string"
+
+val acc = []
+val f = (a: Json) => push(a, 1)
+f(acc)
+f(acc)
+print(toString(length(acc)))
+"#);
+    assert_eq!(output, vec!["2"]);
+}
+
 #[test]
 fn test_recursion() {
     let output = run(r#"import { print } from "std/io"
@@ -789,6 +809,60 @@ val nan = 0.0 / 0.0
 print(toString(nan))
 "#);
     assert_eq!(output, vec!["inf", "-inf", "NaN"]);
+}
+
+#[test]
+fn test_float32_widens_to_float64() {
+    // A Float32 must widen to Float64 (fpext) across every numeric context, per spec §26
+    // (widening is always to a type that represents both). Codegen's Coerce had no
+    // float→float arm and its binary-op path didn't reconcile two floats of different
+    // widths, so each of these failed with "Call parameter type does not match" /
+    // "Both operands ... not of the same type". 0.5 is exact in both f32 and f64.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { toFloat32 } from "std/number"
+
+val a: Float32 = toFloat32(0.5)
+
+// (C) Float32 -> Float64 binding (Coerce).
+val b: Float64 = a
+print(toString(b))                 // 0.5
+
+// (A) Float32 argument to a Float64 parameter.
+val takesF64 = (x: Float64): Float64 => x * 2.0
+print(toString(takesF64(a)))       // 1.0
+
+// (B) Float32 + Float64 arithmetic widens to Float64.
+print(toString(a + 1.0))           // 1.5
+print(toString(a + a))             // 1.0 (f32 + f32 still works)
+
+// Narrowing back is explicit via toFloat32 and must still round-trip.
+val c: Float32 = toFloat32(b)
+print(toString(c))                 // 0.5
+"#);
+    assert_eq!(output, vec!["0.5", "1.0", "1.5", "1.0", "0.5"]);
+}
+
+#[test]
+fn test_float_constants_link_under_pie() {
+    // Float constants land in .rodata and, with a non-PIC reloc model, emit
+    // R_X86_64_32S absolute relocations that the system `cc`'s default PIE link
+    // rejects ("can not be used when making a PIE object"). Codegen uses RelocMode::PIC
+    // so this links. A function returning different float arrays per branch is the
+    // shape that reliably surfaced it. Regression for the PIE link failure.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val pick = (k: Int32): Float64[] =>
+  if k == 1 then [0.5, 1.5]
+  else if k == 2 then [2.5, 3.5]
+  else [0.0, 0.0]
+
+print(toString(pick(1)[0]))
+print(toString(pick(2)[1]))
+print(toString(pick(9)[0]))
+"#);
+    assert_eq!(output, vec!["0.5", "3.5", "0.0"]);
 }
 
 #[test]
@@ -1494,6 +1568,30 @@ data.for(x =>
 )
 "#);
     assert_eq!(output, vec!["a", "b", "a", "b", "a", "b"]);
+}
+
+// A line-leading `[` after a statement inside an inline lambda body starts a NEW array-literal
+// statement, not a postfix index on the previous expression. Inside `()` the line break is
+// suppressed as a token (ADR-004), so the parser relies on each token's `newline_before` flag.
+// Without this, `f` below parsed as `push(acc, 4)[ ... ]` and the body's value was the index
+// result (Null) instead of the array. Mirrors the post-Dedent `[` suppression of ADR-011.
+#[test]
+fn test_line_leading_array_after_statement_in_inline_lambda() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { push, length } from "std/array"
+
+val f = (): Json =>
+  val acc = [1, 2, 3]
+  push(acc, 4)
+  [
+    length(acc),
+    acc[0]
+  ]
+
+print(toString(f()))
+"#);
+    assert_eq!(output, vec!["[4, 1]"]);
 }
 
 #[test]
