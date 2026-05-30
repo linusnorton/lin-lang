@@ -1,0 +1,82 @@
+import { expect, toBe, toSucceed, toFail, toFailWith, test, suite, run } from "std/test"
+import { calc } from "./calc"
+import { tokenize } from "./lexer"
+import { parse } from "./parser"
+import { length } from "std/array"
+
+// The value of a successful calc, or -999999 sentinel for a failure (so a single
+// `toBe` covers the end-to-end happy path concisely).
+val valueOf = (src: String): Int32 =>
+  val r = calc(src)
+  if r["type"] == "success" then r["value"] else -999999
+
+val s = suite("calc", [
+  // --- End-to-end evaluation: the whole tokenize->parse->eval pipeline ---
+  test("evaluates a single number", () => [
+    expect(valueOf("42")).toBe(42)
+  ]),
+  test("respects * over + precedence", () => [
+    expect(valueOf("2 + 3 * 4")).toBe(14)
+  ]),
+  test("parentheses override precedence", () => [
+    expect(valueOf("(2 + 3) * 4")).toBe(20)
+  ]),
+  test("subtraction is left-associative", () => [
+    expect(valueOf("10 - 3 - 2")).toBe(5)
+  ]),
+  test("division is left-associative", () => [
+    expect(valueOf("100 / 5 / 2")).toBe(10)
+  ]),
+  test("deeply nested expression", () => [
+    expect(valueOf("2 * (3 + (4 - 1)) * 2")).toBe(24)
+  ]),
+  test("whitespace is ignored", () => [
+    expect(valueOf("  1+2  *  3 ")).toBe(7)
+  ]),
+  test("a chain of additions", () => [
+    expect(valueOf("1 + 2 + 3 + 4 + 5")).toBe(15)
+  ]),
+
+  // --- Recoverable failures (tagged results, not aborts) ---
+  test("division by zero is a recoverable failure", () => [
+    expect(calc("7 / 0")).toFailWith("division by zero")
+  ]),
+  test("nested division by zero propagates", () => [
+    expect(calc("1 + (6 / (3 - 3))")).toFailWith("division by zero")
+  ]),
+  test("incomplete expression fails to parse", () => [
+    expect(calc("1 +")).toFail()
+  ]),
+  test("unknown character fails to parse", () => [
+    expect(calc("1 @ 2")).toFail()
+  ]),
+  test("unbalanced paren fails to parse", () => [
+    expect(calc("(1 + 2")).toFail()
+  ]),
+  test("trailing input fails to parse", () => [
+    expect(calc("1 2")).toFail()
+  ]),
+  test("a valid expression succeeds", () => [
+    expect(calc("3 * 3")).toSucceed()
+  ]),
+
+  // --- Lexer unit checks (string/char handling, token-stream shape) ---
+  test("tokenizes a multi-digit number as one token", () => [
+    expect(length(tokenize("123"))).toBe(1),
+    expect(tokenize("123")[0]["text"]).toBe("123")
+  ]),
+  test("tokenizes operators and parens", () => [
+    expect(length(tokenize("(1+2)"))).toBe(5)
+  ]),
+
+  // --- Parser unit checks (AST shape, precedence in the tree) ---
+  test("parse builds a precedence-correct tree", () =>
+    val ast = parse(tokenize("2 + 3 * 4"))["value"]
+    [
+      expect(ast["kind"]).toBe("binop"),
+      expect(ast["op"]).toBe("+"),
+      expect(ast["right"]["op"]).toBe("*")
+    ]
+  ),
+])
+run(s)
