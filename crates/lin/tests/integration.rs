@@ -2769,6 +2769,35 @@ print(toString(e))   // 18446744073709551615
 }
 
 #[test]
+fn test_signed_widening_sign_extends() {
+    // Widening a signed integer to a wider type must SIGN-extend: `0 - 1` is an Int32 -1
+    // (0xFFFFFFFF); storing it into an Int64 slot must give -1, not 4294967295. Regression
+    // for a Coerce path that zero-extended unconditionally. Unsigned widening must still
+    // zero-extend (a UInt8 200 → UInt32 stays 200), so both directions are checked.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val a: Int64 = 0 - 1
+val b: Int64 = 5 - 10
+val c: Int32 = 0 - 1
+val big: Int64 = 3000000000
+
+val u8v: UInt8 = 200
+val uwide: UInt32 = u8v
+val u16v: UInt16 = 65000
+val uwide2: UInt64 = u16v
+
+print(toString(a))       // -1
+print(toString(b))       // -5
+print(toString(c))       // -1
+print(toString(big))     // 3000000000 (positive widening unaffected)
+print(toString(uwide))   // 200 (unsigned still zero-extends)
+print(toString(uwide2))  // 65000
+"#);
+    assert_eq!(out, vec!["-1", "-5", "-1", "3000000000", "200", "65000"]);
+}
+
+#[test]
 fn test_unsigned_int_cross_compare() {
     // A boxed UInt32 (now stored as TAG_INT64) still compares correctly against a boxed Int32,
     // both for equality and ordering of large values.
