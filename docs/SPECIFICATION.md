@@ -206,7 +206,7 @@ There is no unary minus operator on arbitrary expressions in this version of the
 val negated = 0 - x
 ```
 
-The only unary operator is bitwise `~` (§35.2); there is no unary minus.
+There are two unary operators — bitwise `~` (§35.2) and logical `!` (§24.1, §35.2); there is no unary minus.
 
 ## 4. Values
 
@@ -1425,7 +1425,7 @@ Closures capture bindings from their defining scope. Mutable bindings are captur
 ```txt
 +   -   *   /   %
 ==  !=  >   <   >=  <=
-&&  ||
+&&  ||  !
 &   |   ^   <<  >>  ~      (bitwise — see §35.2)
 ```
 
@@ -1435,10 +1435,10 @@ These are built-in operators, not ordinary functions. They are not available thr
 
 The bitwise operators `&`, `|`, `^`, `<<`, `>>` require integer operands; `~` is unary. They are specified in §35.2. In type-expression position `|` remains the union separator (§8.4); the two never overlap syntactically.
 
-The **only** unary operator is bitwise `~` (§35.2). There is no unary minus (see §3.7 for negative literals) and no boolean negation operator; boolean negation must be done explicitly:
+There are two unary operators: bitwise `~` (§35.2) and logical `!`. There is no unary minus (see §3.7 for negative literals). Logical `!b` requires a `Bool` operand and yields `Bool`:
 
 ```txt
-val notReady = ready == false
+val notReady = !ready
 ```
 
 ### 24.2 Precedence
@@ -1447,7 +1447,7 @@ Precedence follows the standard convention used by C-family languages, from high
 
 ```txt
 1.  ()  []  .          (call, index, dot application)
-2.  ~                  (unary bitwise not)
+2.  ~  !               (unary bitwise not, unary logical not; right-associative)
 3.  *  /  %
 4.  +  -
 5.  <<  >>             (bitwise shift)
@@ -1460,7 +1460,7 @@ Precedence follows the standard convention used by C-family languages, from high
 12. ||
 ```
 
-All binary arithmetic, comparison, and bitwise operators are left-associative. `&&` and `||` are left-associative and short-circuiting.
+All binary arithmetic, comparison, and bitwise operators are left-associative. `&&` and `||` are left-associative and short-circuiting. The unary operators `~` and `!` are right-associative and bind tighter than `*` but looser than postfix, so `!a == b` parses as `(!a) == b`.
 
 ## 25. Type Narrowing
 
@@ -2341,11 +2341,11 @@ Lin provides the bitwise binary operators and one unary operator:
 ~    bitwise not       (unary)
 ```
 
-`~` is the **only** unary operator in the language; it is the single exception to the "no unary operators" rule of §3.7/§24.1.
+There are two unary operators in the language: bitwise `~` (here) and logical `!` (§24.1). They are the exceptions to the "no unary minus" rule of §3.7/§24.1.
 
-**Typing.** Bitwise and shift operators require **integer** operands; a floating-point operand is a compile-time error. For `&`, `|`, `^`, the result type is the widened integer type of the two operands (§26). For `<<` and `>>`, the result type is the type of the left operand and the right operand may be any integer. For `~x`, the result type is the type of `x`.
+**Typing.** Bitwise and shift operators require **integer** operands; a floating-point operand is a compile-time error. For `&`, `|`, `^`, the result type is the widened integer type of the two operands (§26). For `<<` and `>>`, the result type is the type of the left operand and the right operand may be any integer. For `~x`, the result type is the type of `x`. The logical-not operator `!x` requires a `Bool` operand and yields `Bool`.
 
-**Precedence.** The new operators slot into the §24.2 ladder as shown there: shifts bind tighter than comparison; `&`, `^`, `|` bind between equality and `&&`, in that order (tightest first). `~` binds tighter than `*`.
+**Precedence.** The new operators slot into the §24.2 ladder as shown there: shifts bind tighter than comparison; `&`, `^`, `|` bind between equality and `&&`, in that order (tightest first). `~` and `!` bind tighter than `*` (and are right-associative).
 
 ```txt
 val nalType = header & 0x1F            // extract low 5 bits

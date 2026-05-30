@@ -213,6 +213,18 @@ impl Checker {
                     ));
                 }
             }
+            UnaryOp::Not => {
+                if matches!(operand_ty, Type::Bool) {
+                    Type::Bool
+                } else if matches!(operand_ty, Type::TypeVar(_)) {
+                    Type::Bool
+                } else {
+                    return Err(Diagnostic::error(
+                        span,
+                        format!("logical operator ! requires a boolean operand, got {}", operand_ty),
+                    ));
+                }
+            }
         };
 
         Ok(TypedExpr::UnaryOp {
