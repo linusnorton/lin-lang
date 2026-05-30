@@ -182,6 +182,12 @@ pub extern "C" fn lin_int_to_string(n: i64) -> *mut LinString {
 }
 
 #[no_mangle]
+pub extern "C" fn lin_uint_to_string(n: u64) -> *mut LinString {
+    let s = n.to_string();
+    unsafe { lin_string_from_bytes(s.as_ptr(), s.len() as u32) }
+}
+
+#[no_mangle]
 pub extern "C" fn lin_float_to_string(f: f64) -> *mut LinString {
     let s = if f.fract() == 0.0 && f.abs() < 1e15 {
         format!("{:.1}", f)
@@ -346,6 +352,7 @@ pub unsafe fn tagged_to_json_string(tagged: *const TaggedVal) -> String {
     if tag == TAG_BOOL { return if payload != 0 { "true" } else { "false" }.to_string(); }
     if tag == TAG_INT32 { return (payload as i32).to_string(); }
     if tag == TAG_INT64 { return (payload as i64).to_string(); }
+    if tag == crate::tagged::TAG_UINT64 { return payload.to_string(); }
     if tag == TAG_FLOAT32 {
         let f = f32::from_bits(payload as u32);
         return format!("{}", f);
@@ -493,6 +500,7 @@ unsafe fn tagged_to_key_string(tagged: *const TaggedVal) -> String {
         TAG_BOOL => format!("b:{}", if payload != 0 { "true" } else { "false" }),
         TAG_INT32 => format!("i:{}", payload as i32),
         TAG_INT64 => format!("I:{}", payload as i64),
+        TAG_UINT64 => format!("U:{}", payload),
         TAG_FLOAT32 => format!("f:{}", f32::from_bits(payload as u32)),
         TAG_FLOAT64 => format!("F:{}", f64::from_bits(payload)),
         TAG_STR => {
@@ -630,6 +638,8 @@ pub unsafe extern "C" fn lin_tagged_to_string(tagged: *const TaggedVal) -> *mut 
         lin_int_to_string(payload as i32 as i64)
     } else if tag == TAG_INT64 {
         lin_int_to_string(payload as i64)
+    } else if tag == crate::tagged::TAG_UINT64 {
+        lin_uint_to_string(payload)
     } else if tag == TAG_FLOAT32 {
         let f = f32::from_bits(payload as u32);
         lin_float_to_string(f as f64)

@@ -360,8 +360,8 @@ unsafe fn tagged_val_eq(a: *const crate::tagged::TaggedVal, b: *const crate::tag
     if at == TAG_NULL && bt == TAG_NULL { return true; }
     if at == TAG_NULL || bt == TAG_NULL { return false; }
     // Cross-numeric: widen to f64 so Int32(1) == Int64(1).
-    let at_is_num = at >= TAG_INT32 && at <= TAG_FLOAT64;
-    let bt_is_num = bt >= TAG_INT32 && bt <= TAG_FLOAT64;
+    let at_is_num = (at >= TAG_INT32 && at <= TAG_FLOAT64) || at == crate::tagged::TAG_UINT64;
+    let bt_is_num = (bt >= TAG_INT32 && bt <= TAG_FLOAT64) || bt == crate::tagged::TAG_UINT64;
     if at_is_num && bt_is_num && at != bt {
         return tagged_as_f64(at, ap) == tagged_as_f64(bt, bp);
     }
@@ -369,6 +369,7 @@ unsafe fn tagged_val_eq(a: *const crate::tagged::TaggedVal, b: *const crate::tag
     if at == TAG_BOOL { return ap == bp; }
     if at == TAG_INT32 { return (ap as i32) == (bp as i32); }
     if at == TAG_INT64 { return (ap as i64) == (bp as i64); }
+    if at == crate::tagged::TAG_UINT64 { return ap == bp; }
     if at == TAG_FLOAT32 {
         let af = f32::from_bits(ap as u32);
         let bf = f32::from_bits(bp as u32);
