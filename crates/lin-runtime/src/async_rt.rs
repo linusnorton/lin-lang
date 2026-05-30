@@ -284,7 +284,19 @@ pub unsafe extern "C" fn lin_await_promise(promise: *mut LinPromise) -> *mut u8 
         let _ = h.join();
     }
     match result {
-        Ok(v) => v,
+        Ok(v) => {
+            // Auto-flatten nested promises (spec §32.2.3): if the thunk itself returned a
+            // Promise (boxed TAG_PROMISE), resolve through it. The inner promise's result
+            // ownership transfers out; we free the now-redundant outer TAG_PROMISE box shell.
+            if !v.is_null() && (*(v as *const crate::tagged::TaggedVal)).tag == crate::tagged::TAG_PROMISE {
+                let inner_promise = (*(v as *const crate::tagged::TaggedVal)).payload as *mut LinPromise;
+                let flattened = lin_await_promise(inner_promise);
+                crate::tagged::lin_tagged_free_box(v);
+                flattened
+            } else {
+                v
+            }
+        }
         Err(msg) => make_error_tagged(&msg),
     }
 }

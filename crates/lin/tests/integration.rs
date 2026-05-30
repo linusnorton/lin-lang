@@ -2071,6 +2071,53 @@ print(toString(total))
 }
 
 #[test]
+fn test_await_flattens_nested_promise() {
+    // §32.2.3: await auto-flattens — a thunk that itself returns a Promise resolves through.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { async, await } from "std/async"
+
+print(toString(await(async(() => async(() => 42)))))
+print(toString(await(async(() => async(() => async(() => 7))))))
+"#);
+    assert_eq!(output, vec!["42", "7"]);
+}
+
+#[test]
+fn test_is_error_matches_faulted_thunk() {
+    // §32.2.2: a thunk fault surfaces as an Error value; `is Error` discriminates it, and a
+    // successful result falls through to `else`.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { async, await } from "std/async"
+
+val z = 0
+match await(async(() => 42 / z))
+  is Error => print("error")
+  else => print("value")
+
+match await(async(() => 99))
+  is Error => print("error")
+  else => print("value")
+"#);
+    assert_eq!(output, vec!["error", "value"]);
+}
+
+#[test]
+fn test_is_error_does_not_match_plain_object() {
+    // `is Error` is a structural shape check on {type, message} — a plain object without those
+    // fields must NOT match (a bare object-tag check would wrongly match any object).
+    let output = run(r#"import { print } from "std/io"
+
+val obj = { "name": "alice", "age": 30 }
+match obj
+  is Error => print("error")
+  else => print("not error")
+"#);
+    assert_eq!(output, vec!["not error"]);
+}
+
+#[test]
 fn test_frozen_concurrent_reads() {
     // A frozen array read concurrently by many threads — immortal RC makes non-atomic
     // retain/release no-ops, so reads are race-free without copying or locking.

@@ -3202,6 +3202,24 @@ val [users, posts] = await([
 ])
 ```
 
+`await` auto-flattens nested promises (§32.2.3): if the thunk itself returns a `Promise`, `await`
+resolves through every layer (`await(async(() => async(() => 42)))` is `42`).
+
+If the thunk faults (array out of bounds, division by zero, …), the fault is caught at the thread
+boundary and surfaces as an `Error` value (an object `{ "type": "error", "message": String }`)
+rather than halting the program. Discriminate it with the built-in `Error` type:
+
+```txt
+match await(p)
+  is Error => print("failed: ${result["message"]}")
+  else     => use(result)
+```
+
+> Note: the spec also says the checker should *reject* using an uninspected `Error` result as a
+> plain `T` (§32.2.2). That static check is not yet enforced — the async surface is `Json`-typed,
+> so `await(p)` returns `Json` and coerces freely; it needs parametric `Promise<T>` typing
+> (ADR-046). `is Error` gives the runtime discrimination meanwhile.
+
 ---
 
 ### close
