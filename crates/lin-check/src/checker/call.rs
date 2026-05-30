@@ -148,10 +148,22 @@ impl Checker {
 
         let (typed_args, result_type) = match &func_ty {
             Type::Function { params, ret, required } => {
-                // Opaque `Function` annotation: all params and ret are TypeVar.
-                // Accept any number of arguments and return a fresh TypeVar.
-                let is_opaque = params.iter().all(|p| matches!(p, Type::TypeVar(_)))
-                    && matches!(ret.as_ref(), Type::TypeVar(_));
+                // Opaque `Function` annotation (resolve.rs: `func([TypeVar(MAX)], TypeVar(MAX))`):
+                // a bare `Function` type means "any function" — accept any arity and return a
+                // fresh inference var. This must NOT match a *concrete* signature that merely
+                // returns `Json` (`TypeVar(MAX)`), e.g. `(): Json` or `(path: String): Json`:
+                // those have a KNOWN return type (Json) that must flow through the Json→concrete
+                // cast-hole gate (ADR-046), not be freshened into a permissive inference var.
+                // The opaque annotation is uniquely identified by having ≥1 param that is the
+                // Json wildcard `TypeVar(MAX)` (a real signature never spells a param as Json's
+                // sentinel — Json params are written `Json`, which is also TypeVar(MAX), but
+                // such functions take Json IN and the freshen-return behaviour was only ever
+                // intended for the bare `Function` annotation). We therefore require a non-empty
+                // param list whose params are ALL TypeVar(MAX) AND a TypeVar(MAX) return.
+                let all_params_json = !params.is_empty()
+                    && params.iter().all(|p| matches!(p, Type::TypeVar(n) if *n == u32::MAX));
+                let ret_is_typevar_max = matches!(ret.as_ref(), Type::TypeVar(n) if *n == u32::MAX);
+                let is_opaque = all_params_json && ret_is_typevar_max;
                 if is_opaque {
                     let mut typed_args = Vec::new();
                     for arg in args {

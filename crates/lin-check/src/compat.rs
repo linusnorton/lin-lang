@@ -191,6 +191,15 @@ pub fn is_exact_match(value_type: &Type, target_type: &Type) -> bool {
 /// structured decodes: Json flowing into `Int64`/`Int32`/`UInt8[]`/etc. is the language's
 /// pervasive opaque-handle / buffer / polymorphic-return pattern, which has no `fromJson`
 /// remedy and predates this change.
+///
+/// A *total* scope (rejecting ANY `Json -> concrete T`, scalars/arrays included) was tried and
+/// empirically rejected: it broke the stdlib's pervasive polymorphic-return idiom where
+/// `slice`/`concat`/`accept`/`wait`/etc. return `Json` and the result is assigned to a concrete
+/// `val` (`val sub: UInt8[] = slice(bytes, 1, 4)`, `val code: Int64 = wait(pid)`), and it broke
+/// `is`-narrowing into a concrete branch (`if j is String then j else ""`, whose narrowed value
+/// is still statically `Json`). Those have no `fromJson` remedy and forcing one is hostile, so
+/// the gate is scoped to the genuine hazard — unchecked *structured object* decodes. See
+/// ADR-046 for the full empirical break list.
 fn requires_structured_decode(target: &Type, env: Option<&TypeEnv>, depth: &mut usize) -> bool {
     if *depth > 32 {
         return false;

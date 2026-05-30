@@ -4294,13 +4294,52 @@ print("${e["path"]}")
     assert_eq!(out, vec!["error", "HAS_MSG", "$.age"]);
 }
 
+#[test]
+fn test_from_json_is_error_discriminates() {
+    // `is Error` (ADR-047) distinguishes a decode FAILURE from a successfully-decoded value:
+    // the Error object carries `"type": "error"`, a decoded Person does not. `is Error`
+    // desugars to the value-constrained object pattern `{ "type": "error", .. }`.
+    let out = run(r#"import { print } from "std/io"
+import { fromJson } from "std/json"
+type Person = { "name": String, "age": Int32 }
+val good = Person.fromJson({ "name": "Ada", "age": 36 })
+val bad = Person.fromJson({ "name": "Bob", "age": "old" })
+print(if good is Error then "good:ERR" else "good:OK")
+print(if bad is Error then "bad:ERR" else "bad:OK")
+"#);
+    assert_eq!(out, vec!["good:OK", "bad:ERR"]);
+}
+
+#[test]
+fn test_from_json_match_is_error_idiom() {
+    // The agreed idiom: `match result | is Error => .. | is Person => ..`. Error MUST be the
+    // first arm (union first-match-wins: `is Person` is a bare object tag check that also
+    // matches the Error object — see ADR-047). Exhaustiveness accepts `is Error` as covering
+    // the Error variant of `Person | Error`.
+    let out = run(r#"import { print } from "std/io"
+import { fromJson } from "std/json"
+type Person = { "name": String, "age": Int32 }
+val describe = (r: Person | Error): Null =>
+  match r
+    is Error => print("err:${r["message"]}")
+    is Person => print("ok:${r["name"]}")
+val main = (): Null =>
+  describe(Person.fromJson({ "name": "Ada", "age": 36 }))
+  describe(Person.fromJson({ "name": "Bob", "age": "old" }))
+main()
+"#);
+    assert_eq!(out.len(), 2);
+    assert_eq!(out[0], "ok:Ada");
+    assert!(out[1].starts_with("err:"), "expected decode error, got {}", out[1]);
+}
+
 // Cast-hole closing (ADR-046): Json -> concrete structured object is now a type error.
 
 #[test]
 fn test_json_to_concrete_now_errors() {
-    // A Json-typed value assigned to a structured concrete object is now a type error (ADR-046):
-    // it must be decoded via fromJson or narrowed. The value must be explicitly Json-typed (a
-    // fresh inference var stays permissive by design).
+    // The TWO-STEP form: a Json-typed identifier assigned to a structured concrete object is a
+    // type error (ADR-046). NOTE: this form already worked before the headline fix — see
+    // test_json_call_result_to_concrete_now_errors for the real call-result hazard.
     let err = run_expect_err(r#"type Person = { "name": String, "age": Int32 }
 val j: Json = { "name": "Bob", "age": 30 }
 val p: Person = j
@@ -4308,6 +4347,40 @@ val p: Person = j
     assert!(
         err.contains("Person") || err.contains("4294967295") || err.to_lowercase().contains("json"),
         "expected a Json->Person type error, got:\n{}",
+        err
+    );
+}
+
+#[test]
+fn test_json_call_result_to_concrete_now_errors() {
+    // HEADLINE case (ADR-046): the RHS is a *call* whose return type is Json (here the stdlib
+    // `readJson`), assigned to a structured concrete object. This must be a type error. Before
+    // the fix this type-checked clean because the bidirectional `val` path propagated the
+    // expected concrete type down and a zero/Json-param function was misclassified as opaque,
+    // freshening its Json return into a permissive inference var.
+    let err = run_expect_err(r#"import { readJson } from "std/fs"
+type Person = { "name": String, "age": Int32 }
+val p: Person = readJson("p.json")
+"#);
+    assert!(
+        err.contains("Person") || err.contains("4294967295") || err.to_lowercase().contains("json"),
+        "expected a Json call-result -> Person type error, got:\n{}",
+        err
+    );
+}
+
+#[test]
+fn test_json_local_call_result_to_concrete_now_errors() {
+    // Same headline hazard with a LOCAL Json-returning function (zero params). The opaque-
+    // Function misclassification used to freshen its `Json` return for zero-param functions,
+    // letting `val p: Person = getJson()` slip through. Must now error.
+    let err = run_expect_err(r#"type Person = { "name": String, "age": Int32 }
+val getJson = (): Json => { "name": "Bob", "age": 30 }
+val p: Person = getJson()
+"#);
+    assert!(
+        err.contains("Person") || err.contains("4294967295") || err.to_lowercase().contains("json"),
+        "expected a local Json call-result -> Person type error, got:\n{}",
         err
     );
 }

@@ -2233,11 +2233,20 @@ object — it stops at the first error and does not collect all of them. The `Er
 ```
 
 `path` is a JSONPath-ish location of the mismatch, e.g. `$.address.city` or `$[2]`. Detect a
-decode failure with the **discriminant** `result["type"] == "error"` (recommended), not
-`x is Error`: `Error` is a structural object alias, so `is Error` is a tag check that matches
-*any* object (see ADR-047).
+decode failure with `is Error` or, equivalently, the discriminant `result["type"] == "error"`.
+`is Error` is special-cased to check the `"type": "error"` discriminant (not just the object
+tag), so it distinguishes a decode failure from a successfully-decoded value (see ADR-047).
 
 ```txt
+// Idiomatic: match on `T | Error`. The `is Error` arm MUST come first — a structural object
+// type like `Person` is matched by a bare object tag check, so a later `is Person` arm would
+// also catch the Error object (union first-match-wins, ADR-047).
+val describe = (r: Person | Error): Null =>
+  match r
+    is Error => print("decode failed at ${r["path"]}: ${r["message"]}")
+    is Person => print("hello, ${r["name"]}")
+
+// Equivalent, using the discriminant directly:
 val r = Person.fromJson(input)
 if r["type"] == "error" then
   print("decode failed at ${r["path"]}: ${r["message"]}")

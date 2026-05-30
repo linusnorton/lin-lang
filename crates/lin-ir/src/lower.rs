@@ -1553,6 +1553,17 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
             let raw = lower_expr(expr, builder, ctx);
             // The tag check needs a boxed TaggedVal*; box a concrete value first.
             let val_temp = box_to_json(raw, &val_ty, builder);
+            // An object pattern (`is { .. }`, and the desugared `is Error`) is a structural
+            // shape + value-constraint check, NOT a bare tag check. `pattern_type_check` maps
+            // an object pattern to `Type::Never` (tag 0xFF) which would never match — route it
+            // through the shared object-pattern test (field presence + discriminant equality),
+            // the same path match-arm `is { .. }` uses.
+            if matches!(pattern, TypedPattern::Object { .. }) {
+                return match lower_object_pattern_test(pattern, val_temp, builder, ctx) {
+                    PatternTest::Cond(t) => t,
+                    PatternTest::Always => builder.const_temp(Const::Bool(true)),
+                };
+            }
             let dst = builder.alloc_temp(Type::Bool);
             let (check_ty, _span) = pattern_type_check(pattern);
             builder.emit(Instruction::IsType {
