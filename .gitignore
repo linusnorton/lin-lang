@@ -3,6 +3,6 @@
 /build
 .lin-cache/
 .claude/worktrees/
-examples/lib/*.a
-examples/lib/*.o
+examples/ffi/*.a
+examples/ffi/*.o
 benchmarks/results/

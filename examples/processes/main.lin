@@ -1,0 +1,19 @@
+// processes — spawn a subprocess, read its stdout into a byte buffer, and wait for
+// its exit code. Exercises std/proc (spawn/readStdout/wait) and flat UInt8[] buffers.
+//
+// Run:   lin run examples/processes/main.lin
+// Test:  lin test examples/processes/   (the recoverable parts; exit-code/byte
+//        assertions over a real subprocess live in the Rust integration suite)
+
+import { spawn, readStdout, wait } from "std/proc"
+import { print } from "std/io"
+import { toString } from "std/string"
+
+val h = spawn(["sh", "-c", "printf 'Hi'"])
+val buf: UInt8[] = [0, 0, 0, 0, 0, 0, 0, 0]
+val n = readStdout(h, buf)
+print("bytes read: ${toString(n)}")
+print("byte0: ${toString(buf[0])}")
+print("byte1: ${toString(buf[1])}")
+val code = wait(h)
+print("exit code: ${toString(code)}")

@@ -1,0 +1,26 @@
+// ffi — calling C functions from Lin via `import foreign`.
+//
+// This example links against a small C static library (mathlib.c). Build it first,
+// then build+run this program:
+//
+//   cc -c examples/ffi/mathlib.c -o examples/ffi/mathlib.o
+//   ar rcs examples/ffi/libmathlib.a examples/ffi/mathlib.o
+//   lin build examples/ffi/main.lin -o ffi && ./ffi
+//
+// FFI works only via `lin build` (it emits LLVM `declare`s and passes the library
+// path to the linker). See crates/lin-runtime/lin.h for the C/C++ interop header.
+// CI does not run this through the plain `lin run` loop (it needs the prebuilt .a);
+// the authoritative end-to-end FFI check lives in the Rust integration suite
+// (test_ffi_end_to_end_c_library), which compiles the C and links it.
+
+import { print } from "std/io"
+
+import foreign "examples/ffi/libmathlib.a"
+  val add: (Int32, Int32) => Int32
+  val square: (Float64) => Float64
+
+val sum = add(3, 4)
+print("3 + 4 = ${sum}")
+
+val sq = square(2.5)
+print("2.5^2 = ${sq}")
