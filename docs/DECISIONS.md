@@ -385,3 +385,37 @@ Implementation:
 **Rationale**: The trap with shared read-only data is that a read-only function compiled once against `T` does **non-atomic** `retain`/`release` on its parameter; run on N threads sharing one value, those refcount writes race even though the contents are never written. Making the graph immortal turns retain/release into guarded no-ops that only *read* the sentinel — and a race needs a writer, so concurrent reads of the count are race-free. Therefore the read-only function's existing non-atomic RC runs correctly on a shared frozen value **with no recompilation, no lock, and no atomics**. This is the interned-string immortality trick (already shipped) generalized from one string to a whole graph. Validated by a multi-threaded test (a frozen array read concurrently by N threads) under ASan.
 
 **Consequence**: **Immortal ⇒ never freed.** `frozen` is for load-once, program-lifetime reference data (one O(size) seal at startup); a `frozen()` value created-and-discarded in a loop **leaks** — documented in STDLIB.md. The **mutation-inference read-only coercion** (the §2.3.2 rule that lets a `Frozen<T>` be passed to a `T` parameter *iff the callee doesn't mutate it*, rejecting mutating callees at compile time) is **deferred** — it needs a dedicated `Type::Frozen` variant plus an interprocedural per-parameter mutation-inference pass cached in `ModuleSignature`. Today `frozen(v): T` returns the plain type, so reads "just work", but *mutating* a frozen value is not a compile error — the mutation is silently a no-op on the immortal node (and lost) rather than diagnosed. The runtime immortality/zero-copy-share semantics are fully enforced and safe. A frozen graph is acyclic and immutable, so unlike `Shared<T>` it adds no deadlock and no new cycle hazard.
+
+## ADR-046: `Error` built-in type + `is Error`; `await`'s `T | Error` wrapping deferred
+
+**Decision**: `Error` is a built-in type resolving to the structural shape
+`{ "type": String, "message": String }` (`resolve.rs::error_type`) — the conventional error
+value (spec §19) and the exact object the async runtime builds when a thunk faults
+(`{ "type": "error", "message": <msg> }`). `is Error` (and any `is <ObjectShape>`) lowers to a
+**field-presence** check (`HasPattern` on the object's keys) rather than a bare tag check, so it
+matches error-shaped objects specifically instead of every object. This makes the spec's §32.2.2
+pattern work:
+
+```txt
+match await(p)
+  is Error => print("failed: ${result}")
+  else     => use(result)
+```
+
+**Rationale**: `Error` has no special control-flow behaviour (§19), so a structural object type is
+the faithful model — it composes in unions and narrows by shape. Routing object-shaped `is`
+checks through the existing `HasPattern` machinery reuses the same field-presence test as
+`is { .. }`, with no new runtime support.
+
+**Consequence (deferred)**: The other half of §32.2.2 — `async` wrapping its result as
+`Promise<T | Error>` so the checker **rejects using an uninspected `Error` as a plain `T`** — is
+**not implemented**, and is not a localized change. The entire async surface is `Json`-typed
+through the stdlib wrappers (`async = (f: Json): Json`, `await = (p: Json): Json`); there is no
+parametric `Promise<T>` tracking (there never was — the synchronous stub was `Json`-typed too).
+`await(p)` therefore returns `Json`, which coerces freely to any type, so the "reject uninspected
+Error" rule cannot be enforced without first making `async`/`await` **generic over the thunk's
+return type** — a parametric-opaque-type feature spanning the checker's inference, the intrinsic
+signatures, and module signatures. That is its own project; until then `is Error` gives users the
+*runtime* discrimination the spec intends, and a fault is always a well-formed `Error` object,
+just not statically forced to be handled. Likewise §32.2.3 nested-promise auto-flatten IS now
+implemented (runtime: `await` recurses through a `TAG_PROMISE` result).

@@ -104,6 +104,14 @@ val s = suite("std/async", [
     checks
   ),
 
+  test("await flattens a nested promise (§32.2.3)", () =>
+    val p = async(() => async(() => 42))
+    val checks = [
+      expect(await(p)).toBe(42)
+    ]
+    checks
+  ),
+
   test("program continues after a caught async fault", () =>
     val z = 0
     val bad = await(async(() => 1 / z))

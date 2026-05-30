@@ -2774,6 +2774,19 @@ fn lower_match_pattern(
         // never matched). Bindings always match; the value is bound in lower_match_bindings.
         TypedMatchPattern::Is(TypedPattern::Binding(..))
         | TypedMatchPattern::Is(TypedPattern::Wildcard(..)) => PatternTest::Always,
+        // `is <Named>` where the name resolves to an object shape (e.g. the built-in `Error`,
+        // or a user object-type alias): a bare tag check matches ANY object, which is too loose.
+        // Check the object's required fields are present, mirroring `is { .. }`.
+        TypedMatchPattern::Is(TypedPattern::TypeCheck(Type::Object(fields), _)) if !fields.is_empty() => {
+            let required_fields: Vec<String> = fields.keys().cloned().collect();
+            let dst = builder.alloc_temp(Type::Bool);
+            builder.emit(Instruction::HasPattern {
+                dst,
+                val: scrut,
+                pattern: HasDesc { required_fields },
+            });
+            PatternTest::Cond(dst)
+        }
         TypedMatchPattern::Is(tp) => {
             let (check_ty, _) = pattern_type_check(tp);
             let dst = builder.alloc_temp(Type::Bool);
