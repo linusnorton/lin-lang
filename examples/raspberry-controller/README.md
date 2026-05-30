@@ -28,7 +28,7 @@ space  →  stop (both 0)            ESC    →  zero speeds and quit
 | `std/tty` | `rawMode` / `readKey` — raw-mode, non-blocking keyboard |
 | `std/math` | `clamp` / `round` — quantise + clamp speeds |
 | `std/time` | `sleep` — the 20 Hz tick |
-| `std/array` | `push` / `range` / `for` — assemble the byte buffer, loop |
+| `std/array` | `concat` / `length` / `range` / `for` — build the byte buffer, loop |
 
 ## Structure
 
@@ -50,9 +50,10 @@ To drive a real car, call `runController("<pi-ip>", 3000)` instead of `demo()`.
 
 ## Notes
 
-- The 8-byte packet is assembled with `push` rather than `std/array.concat`,
-  because `concat` does not yet preserve a flat `UInt8[]`'s element width (see
-  `docs/TODO.md`).
-- The step size is written inline (`0.1`) rather than as a module-level `val`,
-  because a top-level non-function `val` referenced inside an *imported* function
-  currently mis-lowers (see `docs/TODO.md`).
+- The 8-byte packet is built with `concat(f32ToBe(left), f32ToBe(right))`, which
+  preserves the flat `UInt8[]` element type — so `udpSendTo` and `f32FromBe` read
+  packed bytes. (Earlier this needed a manual `push` loop; `concat` now dispatches
+  on the runtime element type.)
+- Motor speeds are computed as `Float64` and narrowed with `toFloat32` before
+  `f32ToBe` — there is no implicit float narrowing, so this explicit cast is the
+  only way to obtain the `Float32` the wire format requires.
