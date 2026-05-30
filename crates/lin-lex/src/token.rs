@@ -64,6 +64,7 @@ pub enum TokenKind {
     Amp,      // & (bitwise and)
     Caret,    // ^ (bitwise xor)
     Tilde,    // ~ (bitwise not)
+    Bang,     // ! (logical not)
 
     // Delimiters
     LParen,
