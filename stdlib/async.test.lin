@@ -1,6 +1,6 @@
 import { expect, toBe, test, suite, run } from "std/test"
 import { toString } from "std/string"
-import { async, await, parallel, race, timeout, retry, threadPool, poolAsync, worker, request, close, shared, get, set, withLock } from "std/async"
+import { async, await, parallel, race, timeout, retry, threadPool, poolAsync, worker, request, close, shared, get, set, withLock, frozen } from "std/async"
 import { push, length } from "std/array"
 import { sleep } from "std/time"
 
@@ -199,6 +199,18 @@ val s = suite("std/async", [
     ])
     [
       expect(length(get(box))).toBe(3)
+    ]
+  ),
+
+  test("frozen graph read concurrently by many threads", () =>
+    val table = frozen([10, 20, 30, 40, 50])
+    val results = parallel([
+      () => length(table),
+      () => length(table),
+      () => length(table)
+    ])
+    [
+      expect(results.toString()).toBe("[5, 5, 5]")
     ]
   ),
 ])

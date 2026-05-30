@@ -126,6 +126,13 @@ pub unsafe extern "C" fn lin_array_release(arr: *mut LinArray) {
     if arr.is_null() {
         return;
     }
+    // Frozen (immortal) arrays carry a saturated refcount and must never be freed or
+    // decremented — they are deep-frozen, shared read-only across threads, and program-lifetime
+    // (Frozen<T>, ADR-045). The read-only guard makes retain/release no-ops, so concurrent reads
+    // of a frozen graph from N threads never write the refcount → race-free with non-atomic RC.
+    if (*arr).refcount >= crate::string::IMMORTAL_RC {
+        return;
+    }
     // Zero refcount ⇒ double-release (ownership bug); the decrement below would wrap u32.
     // Debug/ASan-only guard, no release-build cost.
     debug_assert!((*arr).refcount > 0, "lin_array_release: refcount underflow (double free)");

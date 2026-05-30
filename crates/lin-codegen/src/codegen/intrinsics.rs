@@ -428,6 +428,32 @@ impl<'ctx> Codegen<'ctx> {
                     self.unbox_tagged_val_to_type(tagged, ret_ty)
                 } else { tagged }
             }
+            // frozen(v) → deep immortal seal of v's graph; returns v with its ORIGINAL type
+            // (readers use the plain type transparently). For a concrete heap value (raw
+            // LinArray*/LinObject*/LinString*) we box it just to hand a TaggedVal* to lin_freeze,
+            // which seals the graph in place; we then return the ORIGINAL value `v` unchanged.
+            // For a boxed/union value we freeze it directly and return the same box.
+            Intrinsic::Freeze => {
+                let v = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let v_ty = arg_tys.first().cloned().unwrap_or(Type::Null);
+                let freeze_fn = self.get_or_declare_fn("lin_freeze", ptr_ty.fn_type(&[ptr_ty.into()], false));
+                if Self::is_union_type(&v_ty) {
+                    // Already a boxed TaggedVal* — freeze it and return the same box.
+                    self.builder.call(freeze_fn, &[v.into()], "ir_freeze").try_as_basic_value().unwrap_basic()
+                } else if v.is_pointer_value() {
+                    // Concrete heap value: box transiently to seal the graph, free the transient
+                    // box shell, return the original concrete pointer (its graph is now frozen).
+                    let boxed = self.box_value(v, &v_ty);
+                    self.builder.call(freeze_fn, &[boxed.into()], "ir_freeze");
+                    if boxed.is_pointer_value() {
+                        self.builder.call(self.rt.tagged_release, &[boxed.into()], "");
+                    }
+                    v
+                } else {
+                    // Scalar: nothing to freeze; return as-is.
+                    v
+                }
+            }
             // w.request(msg) → lin_worker_request(w, boxed msg) → result (unboxed if concrete).
             Intrinsic::Request => {
                 let worker_boxed = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());

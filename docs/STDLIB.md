@@ -3357,6 +3357,32 @@ gap (last-writer-wins); use `withLock` when the update must be atomic.
 
 ---
 
+### frozen
+
+```txt
+val frozen: <T>(T) -> T
+```
+
+`frozen(v)` deep-freezes a transferable graph into shared **read-only** state (ADR-045 §2.3.2):
+every heap node is sealed immortal+immutable, so many threads can read it concurrently with
+**zero copies, no lock, and no atomics**. The value keeps its plain type, so readers use it
+transparently:
+
+```txt
+val timetable = frozen(loadTimetable())
+val routes = parallel(
+  journeys.map(j => () => planJourney(timetable, j))   // shared by reference, not copied
+)
+```
+
+> **Immortal ⇒ never freed.** Use `frozen` for load-once, program-lifetime reference data (a
+> timetable, routing table, config). A `frozen()` value created and discarded in a loop leaks.
+> The compile-time read-only coercion / mutation-inference (rejecting a frozen value passed to a
+> mutating parameter) is deferred (ADR-045): mutating a frozen value is currently a silent no-op
+> rather than a compile error. Concurrent reads are fully safe.
+
+---
+
 ### worker
 
 ```txt

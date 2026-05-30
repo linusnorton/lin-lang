@@ -182,6 +182,9 @@ impl Checker {
                 Type::TypeVar(9136),
                 Type::func(vec![Type::TypeVar(9137)], Type::TypeVar(9138)),
             ], Type::TypeVar(9138)));
+        // frozen: <T>(T) => T  (deep immortal seal; the value keeps its plain type so readers use
+        // it transparently). Frozen<T> read-only coercion / mutation-inference is deferred (ADR-045).
+        self.define_intrinsic("lin_freeze", Type::func(vec![Type::TypeVar(9140)], Type::TypeVar(9140)));
         // worker: ((Msg) => Reply, () => Null) => Worker
         self.define_intrinsic("lin_worker", Type::func(vec![
                 Type::func(vec![Type::TypeVar(9107)], Type::TypeVar(9108)),

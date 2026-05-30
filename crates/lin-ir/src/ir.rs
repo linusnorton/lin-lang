@@ -112,6 +112,8 @@ pub enum Intrinsic {
     SharedGet,
     SharedSet,
     SharedWithLock,
+    // Frozen<T> — opt-in shared read-only state (ADR-043 §2.3.2): deep immortal seal of a graph.
+    Freeze,
     Request,
     Message,
     Close,

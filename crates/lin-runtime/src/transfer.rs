@@ -43,6 +43,12 @@ pub(crate) unsafe fn clone_array(src: *const LinArray) -> *mut LinArray {
     if src.is_null() {
         return std::ptr::null_mut();
     }
+    // Frozen (immortal) arrays are immutable and shared read-only across threads — share by
+    // reference (zero-copy), never deep-copy through (Frozen<T>, ADR-045). Safe because their
+    // contents and refcount are never written.
+    if (*src).refcount >= IMMORTAL_RC {
+        return src as *mut LinArray;
+    }
     let len = (*src).len;
     let elem_tag = (*src).elem_tag;
     if elem_tag != 0xFF {
@@ -65,6 +71,10 @@ pub(crate) unsafe fn clone_array(src: *const LinArray) -> *mut LinArray {
 unsafe fn clone_object(src: *const LinObject) -> *mut LinObject {
     if src.is_null() {
         return std::ptr::null_mut();
+    }
+    // Frozen objects: share by reference, zero-copy (see clone_array).
+    if (*src).refcount >= IMMORTAL_RC {
+        return src as *mut LinObject;
     }
     let len = (*src).len;
     let dst = crate::object::lin_object_alloc(len.max(4));

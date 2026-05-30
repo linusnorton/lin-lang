@@ -73,11 +73,13 @@ unsafe fn retain_tagged_payload(tv: &TaggedVal) {
         }
         TAG_ARRAY => {
             let a = payload as *mut crate::array::LinArray;
-            if !a.is_null() { (*a).refcount += 1; }
+            // Skip frozen (immortal) arrays — their refcount must never be written (read-only,
+            // shared across threads). Mirror of the string immortal guard.
+            if !a.is_null() && (*a).refcount < crate::string::IMMORTAL_RC { (*a).refcount += 1; }
         }
         TAG_OBJECT => {
             let o = payload as *mut LinObject;
-            if !o.is_null() { (*o).refcount += 1; }
+            if !o.is_null() && (*o).refcount < crate::string::IMMORTAL_RC { (*o).refcount += 1; }
         }
         TAG_SHARED => {
             // Atomic refcount on the Shared box (cross-thread-shared).
@@ -482,6 +484,11 @@ unsafe fn lin_array_eq_deep(a: *const crate::array::LinArray, b: *const crate::a
 #[no_mangle]
 pub unsafe extern "C" fn lin_object_release(obj: *mut LinObject) {
     if obj.is_null() {
+        return;
+    }
+    // Frozen (immortal) objects: saturated refcount, never freed/decremented (Frozen<T>,
+    // ADR-045). Guard makes retain/release no-ops so concurrent reads are race-free.
+    if (*obj).refcount >= crate::string::IMMORTAL_RC {
         return;
     }
     // Zero refcount ⇒ double-release (ownership bug); the decrement below would wrap u32.

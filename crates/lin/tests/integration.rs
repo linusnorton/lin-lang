@@ -2012,6 +2012,57 @@ print(r["type"])
 }
 
 #[test]
+fn test_frozen_concurrent_reads() {
+    // A frozen array read concurrently by many threads — immortal RC makes non-atomic
+    // retain/release no-ops, so reads are race-free without copying or locking.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { frozen, parallel } from "std/async"
+import { length } from "std/array"
+
+val table = frozen([10, 20, 30, 40, 50])
+val results = parallel([
+  () => length(table),
+  () => length(table),
+  () => length(table),
+  () => length(table)
+])
+print(toString(results))
+"#);
+    assert_eq!(output, vec!["[5, 5, 5, 5]"]);
+}
+
+#[test]
+fn test_frozen_object_read() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { frozen } from "std/async"
+
+val config = frozen({ "host": "localhost", "port": 8080 })
+print(toString(config["host"]))
+print(toString(config["port"]))
+"#);
+    assert_eq!(output, vec!["localhost", "8080"]);
+}
+
+#[test]
+fn test_frozen_survives_in_async() {
+    // A frozen value is immortal and shared by reference into the thunk; both the worker and
+    // the parent read it correctly.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { frozen, async, await } from "std/async"
+import { length } from "std/array"
+
+val data = frozen([1, 2, 3])
+val p = async(() => length(data))
+print(toString(await(p)))
+print(toString(length(data)))
+"#);
+    assert_eq!(output, vec!["3", "3"]);
+}
+
+#[test]
 fn test_shared_get_set() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"

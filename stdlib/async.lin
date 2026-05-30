@@ -47,3 +47,8 @@ export val set = (s: Json, v: Json): Null =>
 
 export val withLock = (s: Json, f: Json): Json =>
   lin_shared_with_lock(s, f)
+
+// Frozen<T> — opt-in shared READ-ONLY state (ADR-043 §2.3.2). Deep-freezes a transferable
+// graph into an immortal, immutable, lock-free-readable value; readers use the plain type.
+export val frozen = (v: Json): Json =>
+  lin_freeze(v)

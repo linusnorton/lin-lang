@@ -1765,6 +1765,7 @@ fn lower_intrinsic_call(
         "lin_shared_get" => Intrinsic::SharedGet,
         "lin_shared_set" => Intrinsic::SharedSet,
         "lin_shared_with_lock" => Intrinsic::SharedWithLock,
+        "lin_freeze" => Intrinsic::Freeze,
         "lin_worker" => Intrinsic::Worker,
         "lin_request" => Intrinsic::Request,
         "lin_message" => Intrinsic::Message,
