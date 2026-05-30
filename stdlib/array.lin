@@ -111,14 +111,14 @@ export val some = (arr: Json, f: Function): Boolean =>
   var result = false
   lin_while(arr, item =>
     if f(item) then result = true
-    result == false
+    !result
   )
   result
 
 export val every = (arr: Json, f: Function): Boolean =>
   var result = true
   lin_while(arr, item =>
-    if f(item) == false then result = false
+    if !f(item) then result = false
     result
   )
   result
@@ -219,7 +219,7 @@ export val dropWhile = (arr: Json, f: Function): Json =>
   val result = []
   var dropping = true
   arr.for(item =>
-    val keep = dropping == false || f(item) == false
+    val keep = !dropping || !f(item)
     dropping = if keep then false else dropping
     if keep then push(result, item)
   )

@@ -287,8 +287,8 @@ impl Parser {
         left
     }
 
-    // Unary `~` (bitwise not) — the only unary operator. Binds tighter than `*`, looser
-    // than postfix. Right-associative so `~~x` parses as `~(~x)`.
+    // Unary `~` (bitwise not) and `!` (logical not). Both bind tighter than `*`, looser
+    // than postfix. Right-associative so `~~x` parses as `~(~x)` and `!!x` as `!(!x)`.
     pub(crate) fn parse_unary_expr(&mut self) -> Expr {
         if self.check(TokenKind::Tilde) {
             let span = self.current_span();
@@ -297,6 +297,17 @@ impl Parser {
             let operand = self.parse_unary_expr();
             return Expr::UnaryOp {
                 op: UnaryOp::BNot,
+                operand: Box::new(operand),
+                span,
+            };
+        }
+        if self.check(TokenKind::Bang) {
+            let span = self.current_span();
+            self.advance();
+            self.skip_newlines();
+            let operand = self.parse_unary_expr();
+            return Expr::UnaryOp {
+                op: UnaryOp::Not,
                 operand: Box::new(operand),
                 span,
             };

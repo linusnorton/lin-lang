@@ -331,3 +331,11 @@ Implementation:
 **Rationale**: Adding comment-preservation would require either (a) threading comment tokens through the AST — significant structural change with no benefit to the compiler — or (b) a separate comment-reattachment pass that heuristically associates comments with nearby AST nodes based on source positions. Both approaches are complex and fragile. The formatter's primary use case (CI canonicality checks, auto-formatting on save) does not require comment preservation. Users who care about comments should commit before formatting.
 
 **Consequence**: Running `lin fmt` on a file that has comments will silently drop them. This is documented behaviour. Future work: a comment-preserving pass that uses `Span` information to reattach comments to the nearest following AST node.
+
+## ADR-047: Logical `!` as the second unary operator
+
+**Decision**: Add a prefix logical-not operator `!` (e.g. `if !ready`, `match ... when !cond`, `val x = !flag`). It sits at the same precedence level as bitwise `~` — tighter than `*`, looser than postfix — and is right-associative, so `!!x` parses as `!(!x)` and `!a == b` parses as `(!a) == b`. Both its operand and its result are `Bool`. A non-`Bool`, non-`TypeVar` operand is a compile-time error. Negated *patterns* (e.g. `is !true`) are explicitly out of scope.
+
+**Rationale**: The previous spec stated `~` was the only unary operator and that boolean negation had to be written `ready == false`. That boilerplate appeared throughout the stdlib (`std/array`) and user code. `!` removes it. Implementation is cheap because it reuses the existing unary pipeline end-to-end: the lexer emits a new `Bang` token, the AST gains `UnaryOp::Not`, and IR lowering maps `UnaryOp::Not` to the same `crate::ir::UnaryOp::Not` as `~` — for an `i1`, a bitwise-not *is* a logical-not, so codegen's existing `build_not` arm needs no change. When the operand is not statically `Bool` (e.g. a boxed `TypeVar` flowing through a generic lambda), the lowering routes it through `lower_cond_as_bool` first to unbox/coerce to a raw `i1` before the `Unary` instruction.
+
+**Consequence**: This supersedes the prior "the only unary operator is `~`" statement in §3.7, §24.1, and §35.2 of the specification. The language now has exactly two unary operators (`~` bitwise, `!` logical); there is still no unary minus.
