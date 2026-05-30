@@ -138,6 +138,21 @@ pub fn lower_import_module(module: &TypedModule, module_key: &str) -> LinModule 
     }
     ctx.global_fn_slots = global_fn_slots.clone();
 
+    // Register every top-level NON-FUNCTION `val` so references to it from inside an exported
+    // function body resolve to its zero-arg `{module_key}_{name}__val` wrapper (emitted below),
+    // exactly as a *cross-module* importer would resolve the binding. An imported module has no
+    // `main`, so unlike `lower_module` it cannot publish these to LLVM globals + module-init;
+    // instead each read recomputes the value through its wrapper (cheap, and the same recompute
+    // contract the importing module already relies on). This MUST run before lowering function
+    // bodies (and before emitting the wrappers, whose initialisers may reference sibling vals).
+    for stmt in &module.statements {
+        if let TypedStmt::Val { slot, value, ty, name: Some(name), .. } = stmt {
+            if matches!(value, TypedExpr::Function { .. }) { continue; }
+            let wrapper = format!("{}_{}__val", module_key, name);
+            ctx.import_val_slots.insert(*slot, (wrapper, ty.clone()));
+        }
+    }
+
     // Mutable-capture pre-scan (heap cells) — same as the main lowering.
     for stmt in &module.statements {
         collect_mutable_capture_slots_stmt(stmt, &mut ctx.mutable_cell_slots);
@@ -1178,15 +1193,42 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
             if let Some(cell_ty) = builder.cell_slots.get(slot).cloned() {
                 if let Some(&cell) = builder.slots.get(slot) {
                     let v = coerce_to_slot_type(val_temp, &value.ty(), &cell_ty, builder);
+                    // When the slot is a union and the value was concrete, `coerce_to_slot_type`
+                    // allocated a FRESH transient `TaggedVal*` box `v` wrapping the raw value (the
+                    // raw value keeps its own +1, released at scope exit). We clone `v` once for the
+                    // cell's owned reference and once for the assignment result, then free the
+                    // orphaned `v` shell (its inner is owned by the raw value's scope-exit release).
+                    // Mirrors the Var-init path's `coerce_and_own_store` and the global path below.
+                    let made_fresh_box = is_union_ty(&cell_ty)
+                        && !is_union_ty(&value.ty())
+                        && type_repr_differs(&value.ty(), &cell_ty);
                     // The cell owns an INDEPENDENT reference to its value: take an owned copy on
                     // store so it survives the producing scope's own release, and codegen
                     // releases the cell's OLD reference on reassignment (fixing the
                     // per-reassignment leak). Concrete rc: retain `v` in place (the stored
                     // pointer is `v` with rc+1). Union: clone the box (`stored` is a fresh
                     // TaggedVal* the cell exclusively owns) so release-old never frees a
-                    // borrowed box. The LocalSet expression result stays `v` (a borrowed view).
+                    // borrowed box.
                     let stored = own_for_store(v, &cell_ty, builder);
-                    builder.emit(Instruction::CellSet { cell, value: stored, ty: cell_ty });
+                    builder.emit(Instruction::CellSet { cell, value: stored, ty: cell_ty.clone() });
+                    // The assignment EXPRESSION result must be an INDEPENDENTLY-owned value (not the
+                    // transient box `v`): a discarding caller (e.g. the `for` callback-return
+                    // release) can then reclaim it without touching the cell's distinct reference.
+                    // `own_for_read` clones the box (union) / retains (concrete rc) and registers it
+                    // for scope-exit release.
+                    if needs_owning(&cell_ty) {
+                        let result = own_for_read(v, &cell_ty, builder);
+                        // Free the transient coercion box shell AFTER both clones read it (freeing
+                        // earlier would be a use-after-free of the shell). A fresh box implies a
+                        // union slot, so this only runs on the owning path. `result` is a distinct
+                        // box, so freeing `v`'s shell can't touch it.
+                        if made_fresh_box {
+                            builder.emit(Instruction::FreeBoxShell { val: v });
+                        }
+                        return result;
+                    }
+                    // Non-owning cell: `made_fresh_box` is impossible (it requires a union slot),
+                    // so there is no transient box to free and `v` is the raw value itself.
                     return v;
                 }
             }
@@ -1195,6 +1237,16 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
             // to the global's declared representation first.
             if let Some(gty) = ctx.global_val_slots.get(slot).cloned() {
                 let v = coerce_to_slot_type(val_temp, &value.ty(), &gty, builder);
+                // When the slot is a union and the value was concrete, `coerce_to_slot_type`
+                // allocated a FRESH transient `TaggedVal*` box `v` wrapping the raw value (the
+                // raw value keeps its own +1, released at scope exit). Below we clone `v` once for
+                // the global's owned reference and once for the assignment result; the original
+                // `v` shell is then an orphan and must have its 16-byte shell freed (its inner is
+                // owned by the raw value's scope-exit release, NOT by `v`). Mirrors the Var-init
+                // path's `coerce_and_own_store`. When no fresh box was made (already-union value,
+                // or non-union slot), nothing extra is freed.
+                let made_fresh_box =
+                    is_union_ty(&gty) && !is_union_ty(&value.ty()) && type_repr_differs(&value.ty(), &gty);
                 // The global owns an INDEPENDENT reference to its value (symmetric owning model,
                 // mirroring the captured-cell path above). For unions this CLONES the box
                 // (`own_for_store` → `CloneBox`/`lin_tagged_clone`) so the global gets its OWN
@@ -1210,8 +1262,19 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                 // box (union) / retains (concrete rc) and registers it for scope-exit release, so
                 // when the result is NOT discarded by a loop it is still reclaimed at teardown.
                 if needs_owning(&gty) {
-                    return own_for_read(v, &gty, builder);
+                    let result = own_for_read(v, &gty, builder);
+                    // Free the transient coercion box shell AFTER cloning it for both the store
+                    // (`own_for_store`) and the result (`own_for_read`) — freeing it earlier would
+                    // be a use-after-free of the shell those clones read. A fresh box implies a
+                    // union slot, so this only runs on the owning path here. (`result` is a
+                    // distinct, independently-owned box, so freeing `v`'s shell can't touch it.)
+                    if made_fresh_box {
+                        builder.emit(Instruction::FreeBoxShell { val: v });
+                    }
+                    return result;
                 }
+                // Non-owning slot: `made_fresh_box` is impossible (it requires a union slot), so
+                // there is no transient box to free and `v` is the raw value itself.
                 return v;
             }
             builder.slots.insert(*slot, val_temp);
@@ -2605,6 +2668,14 @@ fn lower_match_pattern(
         TypedMatchPattern::Is(tp @ TypedPattern::Object { .. }) => {
             lower_object_pattern_test(tp, scrut, builder, ctx)
         }
+        // `is <name>` (a binding) and `is _` (wildcard) match ANY value unconditionally —
+        // they are named/anonymous catch-alls, not type checks. The generic arm below would
+        // call pattern_type_check, which returns the binding's declared type (= the
+        // scrutinee's static type, often Json) and emit an `IsType` tag check that can fail
+        // for a concrete value inside a Json scrutinee (e.g. `match req["path"] is p when …`
+        // never matched). Bindings always match; the value is bound in lower_match_bindings.
+        TypedMatchPattern::Is(TypedPattern::Binding(..))
+        | TypedMatchPattern::Is(TypedPattern::Wildcard(..)) => PatternTest::Always,
         TypedMatchPattern::Is(tp) => {
             let (check_ty, _) = pattern_type_check(tp);
             let dst = builder.alloc_temp(Type::Bool);
@@ -2708,8 +2779,22 @@ fn lower_typed_pattern_bindings(
 ) {
     match pattern {
         TypedPattern::Binding(slot, ty, _) => {
+            // The match scrutinee is boxed to Json/union (`box_to_json` at match entry).
+            // If this binding has a CONCRETE type (e.g. `is n` where n: Int32), binding it
+            // directly to the boxed pointer would later reinterpret the pointer as the
+            // scalar (ptrtoint) — so a guard like `when n > 5` compares a heap address, not
+            // the value, and is effectively always true. Unbox via Coerce when the
+            // scrutinee is boxed but the binding is concrete; a plain Bind (alias) is
+            // correct when types already match (e.g. a Json scrutinee bound to Json).
+            let scrut_ty = builder.temp_types.get(&scrut).cloned().unwrap_or(Type::TypeVar(u32::MAX));
             let t = builder.alloc_temp(ty.clone());
-            builder.emit(Instruction::Bind { dst: t, src: scrut, ty: ty.clone() });
+            if is_union_ty(&scrut_ty) && !is_union_ty(ty) {
+                builder.emit(Instruction::Coerce {
+                    dst: t, src: scrut, from_ty: scrut_ty, to_ty: ty.clone(),
+                });
+            } else {
+                builder.emit(Instruction::Bind { dst: t, src: scrut, ty: ty.clone() });
+            }
             builder.slots.insert(*slot, t);
         }
         TypedPattern::Object { fields, .. } => {
