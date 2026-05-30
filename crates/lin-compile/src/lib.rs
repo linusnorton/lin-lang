@@ -280,6 +280,7 @@ fn stdlib_source(path: &str) -> Option<&'static str> {
         "std/net"      => Some(include_str!("../../../stdlib/net.lin")),
         "std/proc"     => Some(include_str!("../../../stdlib/proc.lin")),
         "std/tty"      => Some(include_str!("../../../stdlib/tty.lin")),
+        "std/signal"   => Some(include_str!("../../../stdlib/signal.lin")),
         _ => None,
     }
 }

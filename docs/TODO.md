@@ -639,10 +639,10 @@ Sequenced in layers. Layer 1 (bytes + bitwise) is the keystone — everything el
 
 ### Layer 4 — Timing, signals; FFI and Worker for the rest
 
-- [ ] **`std/time.sleepMicros`** — `lin_time_sleep_micros(Int64)` intrinsic + wrapper.
-- [ ] **`std/signal.waitSignal`** — `lin_signal_wait(Int32)` intrinsic + wrapper. (Open: blocking-wait vs registered-handler form — decide here.)
-- [ ] **GPIO via existing FFI** — no new core primitive; validate `import foreign` against a C GPIO library, using `sleepMicros` for software PWM.
-- [ ] **Cross-thread state via Worker** — no new core primitive; confirm a `Worker<Msg, Reply>` owning shared state (e.g. a discovered client address) replaces `Arc<Mutex<…>>`.
+- [x] **`std/time.sleepMicros`** — `lin_time_sleep_micros(Int64)` intrinsic + wrapper.
+- [x] **`std/signal.waitSignal`** — `lin_signal_wait(Int32)` intrinsic + wrapper. (Decided: blocking-wait form — block the signal in the thread mask then `sigwait`, race-free, no handler installed.)
+- [ ] **GPIO via existing FFI** — no new core primitive; validate `import foreign` against a C GPIO library, using `sleepMicros` for software PWM. (No core work; `sleepMicros` is the only language-level support, now landed.)
+- [ ] **Cross-thread state via Worker** — no new core primitive; confirm a `Worker<Msg, Reply>` owning shared state (e.g. a discovered client address) replaces `Arc<Mutex<…>>`. (No core work; `Worker` already exists.)
 
 ### Spec / docs amendments
 

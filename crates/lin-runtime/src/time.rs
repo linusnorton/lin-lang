@@ -16,6 +16,12 @@ pub extern "C" fn lin_time_sleep(ms: i64) {
     std::thread::sleep(Duration::from_millis(ms as u64));
 }
 
+/// Block for n microseconds.
+#[no_mangle]
+pub extern "C" fn lin_time_sleep_micros(us: i64) {
+    std::thread::sleep(Duration::from_micros(us as u64));
+}
+
 /// Return a monotonic timer value in milliseconds (for elapsed timing).
 /// Uses the same clock as lin_time_now so subtraction gives elapsed ms.
 #[no_mangle]

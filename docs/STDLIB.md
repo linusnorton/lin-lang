@@ -21,6 +21,7 @@ This document specifies the standard library for the Lin language. All modules a
 | [`std/net`](#stdnet) | UDP and TCP sockets |
 | [`std/proc`](#stdproc) | Subprocess spawn / stdout / wait |
 | [`std/tty`](#stdtty) | Raw terminal mode and key reads |
+| [`std/signal`](#stdsignal) | Blocking wait for OS signals |
 | [`std/async`](#stdasync) | Async, concurrency and workers |
 | [`std/env`](#stdenv) | Environment variables |
 | [`std/process`](#stdprocess) | External process execution |
@@ -3134,6 +3135,31 @@ A real application polls `readKey` repeatedly (typically via a `range(...).for(.
 
 ---
 
+## std/signal
+
+Minimal, blocking signal handling. Import:
+
+```txt
+import { waitSignal } from "std/signal"
+```
+
+---
+
+### waitSignal
+
+```txt
+val waitSignal: (sig: Int32) -> Int32
+```
+
+Blocks the calling thread until OS signal `sig` is delivered, then returns the signal number. The signal is first blocked in the thread's mask and consumed with `sigwait`, so a signal that arrives during setup is not lost (no handler is installed). The mask is per-thread and a single signal is waited on per call.
+
+```txt
+val sig = waitSignal(2)   // block until SIGINT (2); returns 2
+print("caught signal ${toString(sig)}")
+```
+
+---
+
 ## std/async
 
 Concurrency primitives. Import what you need:
@@ -3780,6 +3806,20 @@ Blocks the current thread for at least `ms` milliseconds.
 
 ```txt
 sleep(1000)   // wait 1 second
+```
+
+---
+
+### sleepMicros
+
+```txt
+val sleepMicros: (n: Int64) -> Null
+```
+
+Blocks the current thread for at least `n` microseconds. Microsecond-granularity counterpart to `sleep`, intended for tight timing loops such as software PWM.
+
+```txt
+sleepMicros(500)   // wait ~0.5 ms
 ```
 
 ---

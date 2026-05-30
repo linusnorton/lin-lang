@@ -17,6 +17,7 @@ pub mod object;
 pub mod path;
 pub mod proc;
 pub mod server;
+pub mod signal;
 pub mod string;
 pub mod tagged;
 pub mod template;

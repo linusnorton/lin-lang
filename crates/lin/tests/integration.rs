@@ -3141,3 +3141,17 @@ print("type: ${toString(r["type"])}")
 "#);
     assert_eq!(out, vec!["type: error"]);
 }
+
+#[test]
+fn test_time_sleep_micros() {
+    // sleepMicros(500) should sleep ~0.5ms and then return; the program must run
+    // to completion and print after the sleep. (waitSignal is not tested here as it
+    // would block; see the lin-runtime signal.rs sigwait/raise unit test.)
+    let out = run(r#"import { sleepMicros } from "std/time"
+import { print } from "std/io"
+
+sleepMicros(500)
+print("done")
+"#);
+    assert_eq!(out, vec!["done"]);
+}
