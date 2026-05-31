@@ -1,8 +1,7 @@
 import { expect, toBe, test, suite, run } from "std/test"
 import { contains } from "std/string"
+import { HttpRequest as Request } from "std/http"
 import { getIndex, getStatus, getUser } from "./handlers"
-
-type Request = { "method": String, "path": String, "query": String, "headers": Json, "body": String }
 
 val makeReq = (method: String, path: String): Request =>
   { "method": method, "path": path, "query": "", "headers": {}, "body": "" }

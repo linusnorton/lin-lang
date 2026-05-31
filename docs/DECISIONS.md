@@ -541,3 +541,41 @@ discriminate), since `substitute` passes `StrLit` through its `_ => ty.clone()` 
 fresh inference var, so the strictest checking is via the full `lin build` pipeline. Verified: full
 suite green (288 integration + 6 + 33 + 7; stdlib 19 files; examples 22 files), plus the new
 `examples/result/main.lin` fixture.
+
+## ADR-052: Imported types usable in type position
+
+**Decision**: An `export type Foo = ...` declaration can be imported (`import { Foo } from "m"`,
+including `Foo as Bar` aliases) and used in a type annotation in the importing module. Spec §20.3
+always promised this ("Types may be imported with the same syntax"), but it was never implemented:
+type exports were dropped at the module boundary, so a use-site hit *"Unknown type 'Foo'"*.
+
+**Why it was missing**: a `type` decl produces no runtime code, so the checker resolved it into its
+local `TypeEnv::type_decls` and then returned `TypedStmt::Expr(NullLit)` — it left no trace in the
+`TypedModule`. `ModuleSignature::from_module` only scanned `TypedStmt::Val`, so the dependent
+module's checker (which is seeded from the signature via the `import_types` map) never learned the
+name. Value imports worked; type imports silently didn't.
+
+**Mechanism**: mirror the value path one level up, as *module metadata* rather than a statement.
+- `TypedModule` gains `exported_types: HashMap<String, (Vec<String>, Type)>` (params + resolved
+  body), populated in `check_module` from each `export type` via `env.lookup_type` — alongside the
+  existing `intrinsics` metadata map. It is **not** a `TypedStmt`, so `lin-ir` lowering, codegen,
+  liveness, and rc_elide are entirely unaffected (they never see it).
+- `ModuleSignature` gains `type_exports` (copied from `exported_types`), so dependents that only
+  load the `.sig` still get types. Both new fields are `#[serde(default)]`, so stale `.typed`/`.sig`
+  caches deserialize as empty and trigger a graceful re-check rather than an error.
+- `Checker` gains an `import_type_decls: (module, name) -> (params, body)` input (the type-level
+  analogue of `import_types`). `lin-compile` populates it from each import's `type_exports`.
+- A new `register_imported_types` pre-pass (run before `forward_declare_types`, since
+  forward-declared signatures may annotate with imported types) walks the `Import` stmts and, for
+  each binding matching `import_type_decls`, calls `env.define_type(local_name, params, body)`
+  honouring `as` aliases.
+
+The body stored is the **fully resolved** type (Named cycle points preserved), so no cross-module
+type-env lookup is needed at the use site — it resolves like a local `type` alias. Generic exported
+types work because the stored `params` flow through the same `substitute` path as local generics.
+
+**Scope/limits**: registration is scoped to what is imported — referencing `Foo` without importing
+it is still *"Unknown type"* (verified by `test_imported_type_unknown_without_import`). Verified:
+the web-server example now does `import { HttpRequest as Request, HttpResponse as Response } from
+"std/http"` (its local `Request`/`Response` aliases deleted); full suite green; imported types
+round-trip through both cold and warm module caches.

@@ -1,8 +1,5 @@
 import { getIndex, getStatus, getUser } from "./handlers"
-import { json, matchPath } from "std/http"
-
-type Request = { "method": String, "path": String, "query": String, "headers": Json, "body": String }
-type Response = { "status": Int32, "headers": Json, "body": String }
+import { json, matchPath, HttpRequest as Request, HttpResponse as Response } from "std/http"
 
 export val router = (req: Request): Response =>
   match req["path"]

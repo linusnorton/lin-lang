@@ -1611,6 +1611,50 @@ print(toString(f(21)))
 }
 
 #[test]
+fn test_imported_type_used_in_annotation() {
+    // An exported `type` decl can be imported and used in type position in a dependent
+    // module — covering a plain object type, an aliased import (`as`), and a generic type.
+    // Previously these failed with "Unknown type" because exported type decls were dropped
+    // at the module boundary (only value exports were threaded into the importer's checker).
+    let dir = std::env::temp_dir().join(format!("lin_imptype_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("lib.lin"),
+        "export type Point = { \"x\": Int32, \"y\": Int32 }\n\
+         export type Wrapped<T> = { \"value\": T }\n").unwrap();
+    let main = format!(r#"import {{ print }} from "std/io"
+import {{ toString }} from "std/string"
+import {{ Point, Wrapped as W }} from "{}/lib"
+val sum = (p: Point): Int32 => p["x"] + p["y"]
+val unwrap = (w: W<Int32>): Int32 => w["value"]
+print(toString(sum({{ "x": 3, "y": 4 }})))
+print(toString(unwrap({{ "value": 99 }})))
+"#, dir.to_str().unwrap());
+    let output = run(&main);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(output, vec!["7", "99"]);
+}
+
+#[test]
+fn test_imported_type_unknown_without_import() {
+    // The type is only visible when imported: using `Point` without importing it from the
+    // module that exports it is still "Unknown type" (the registration is scoped to imports).
+    let dir = std::env::temp_dir().join(format!("lin_imptype_neg_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("lib.lin"),
+        "export type Point = { \"x\": Int32, \"y\": Int32 }\n").unwrap();
+    // Import a VALUE-less binding-free module reference: import nothing type-related, then
+    // reference Point. (We import a dummy to make the module a dependency at all.)
+    let main = format!(r#"import {{ print }} from "std/io"
+val sum = (p: Point): Int32 => p["x"]
+print("unused")
+"#);
+    let _ = &dir; // lib not imported on purpose
+    let err = run_expect_err(&main);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(err.contains("Unknown type 'Point'"), "got: {}", err);
+}
+
+#[test]
 fn test_default_args_trailing_comma_still_curries() {
     // A trailing comma requests partial application even when defaults exist,
     // rather than filling the default.

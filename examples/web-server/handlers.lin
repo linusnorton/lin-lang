@@ -1,8 +1,5 @@
-import { json, text, badRequest, matchPath } from "std/http"
+import { json, text, badRequest, matchPath, HttpRequest as Request, HttpResponse as Response } from "std/http"
 import { render } from "std/template"
-
-type Request = { "method": String, "path": String, "query": String, "headers": Json, "body": String }
-type Response = { "status": Int32, "headers": Json, "body": String }
 
 export val getIndex = (req: Request): Response =>
   val data = { "title": "Lin Web Server", "heading": "Welcome", "status": "running", "version": "1.0" }

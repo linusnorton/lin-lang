@@ -10,6 +10,13 @@ pub struct TypedModule {
     /// Maps slot index to intrinsic name (e.g. 0 => "print").
     /// Populated by the checker when it registers intrinsics.
     pub intrinsics: HashMap<usize, String>,
+    /// Exported `type` declarations (`export type Foo = ...`), as name → (params, resolved body).
+    /// Type decls produce no runtime code, so they are recorded here as module metadata (like
+    /// `intrinsics`) rather than as `TypedStmt`s — lowering/codegen ignore this field. A dependent
+    /// module's checker re-registers these into its type env so `import { Foo }` can be used in
+    /// type position (the value-import mechanism via `ModuleSignature::exports` is the analogue).
+    #[serde(default)]
+    pub exported_types: HashMap<String, (Vec<String>, Type)>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

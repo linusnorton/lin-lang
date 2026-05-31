@@ -11,8 +11,8 @@ port, routes each incoming request to a handler by path, and returns a response.
 - `std/http` response helpers: `json`, `text`, `badRequest`, `matchPath`.
 - HTML templating with `std/template`'s `render` (filling `${...}` holes) — the
   rendered HTML is returned in the response body.
-- Named record types: `Request` and `Response` aliases thread the known input
-  and output shapes through every handler.
+- Imported types: `HttpRequest`/`HttpResponse` from `std/http`, brought in under
+  `as Request`/`as Response` aliases and used in every handler's signature.
 
 ## Structure
 

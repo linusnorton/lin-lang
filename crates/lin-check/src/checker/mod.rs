@@ -36,6 +36,10 @@ pub struct Checker {
     /// Pre-resolved import types: (module_path, export_name) -> Type.
     /// When set, used instead of fresh TypeVars for import bindings.
     pub import_types: std::collections::HashMap<(String, String), Type>,
+    /// Exported `type` decls visible from imports: (module_path, type_name) -> (params, body).
+    /// An `import { Foo } from "m"` whose `Foo` matches an entry here registers it into the
+    /// type env so `Foo` resolves in type annotations (the type-level analogue of `import_types`).
+    pub import_type_decls: std::collections::HashMap<(String, String), (Vec<String>, Type)>,
     /// Global accumulator of TypeVar solutions discovered during inference.
     /// Populated by every call to collect_type_subs. Used by the zonking pass.
     solved_type_vars: std::collections::HashMap<u32, Type>,
@@ -70,6 +74,7 @@ impl Checker {
             function_scope_depths: Vec::new(),
             span_type_map: Vec::new(),
             import_types: std::collections::HashMap::new(),
+            import_type_decls: std::collections::HashMap::new(),
             solved_type_vars: std::collections::HashMap::new(),
             protected_type_vars: std::collections::HashSet::new(),
             mutable_global_slots: std::collections::HashMap::new(),
@@ -79,6 +84,11 @@ impl Checker {
 
     pub fn check_module(&mut self, module: &Module) -> Result<TypedModule, Vec<Diagnostic>> {
         self.register_intrinsics();
+
+        // Pre-scan: register any imported `type` decls into the type env, so that a name
+        // brought in by `import { Foo } from "m"` resolves in type annotations below. Must
+        // run before forward_declare_* (whose signatures may annotate with imported types).
+        self.register_imported_types(module);
 
         // Pre-scan: forward-declare all top-level type aliases as Named placeholders
         // so that recursive types (type Tree = { ..., children: Tree[] }) can be resolved.
@@ -99,10 +109,22 @@ impl Checker {
         if self.diagnostics.iter().any(|d| d.severity == lin_common::Severity::Error) {
             Err(self.diagnostics.clone())
         } else {
+            // Collect exported `type` decls as module metadata so dependents can use them in
+            // type position. Resolve each from the env (forward-declared + body-resolved by now);
+            // self-referential/recursive types keep their `Named(name)` cycle points.
+            let mut exported_types = std::collections::HashMap::new();
+            for stmt in &module.statements {
+                if let lin_parse::ast::Stmt::TypeDecl { name, exported: true, .. } = stmt {
+                    if let Some(decl) = self.env.lookup_type(name) {
+                        exported_types.insert(name.clone(), (decl.params.clone(), decl.body.clone()));
+                    }
+                }
+            }
             let mut typed_module = TypedModule {
                 statements: stmts,
                 span: module.span,
                 intrinsics: self.intrinsic_slots.clone(),
+                exported_types,
             };
             // Zonking pass: replace solved TypeVar nodes with their concrete types.
             let subs = self.solved_type_vars.clone();
@@ -149,8 +171,25 @@ impl Checker {
         self.intrinsic_slots.insert(slot, name.to_string());
     }
 
-    /// Forward-declare top-level `val name = (...) => ...` functions so that
-    /// they can call each other (mutual recursion, ADR-015 equivalent).
+    /// Register imported `type` decls into the type env. For each `import { Name } from "m"`
+    /// binding whose `(m, Name)` is a known exported type decl, define it under its local name
+    /// (honouring `as` aliases) so that `Name` resolves when used in a type annotation. Value
+    /// imports are unaffected — a name can be both (rare); both registrations are harmless.
+    fn register_imported_types(&mut self, module: &Module) {
+        for stmt in &module.statements {
+            if let Stmt::Import { bindings, path, .. } = stmt {
+                for binding in bindings {
+                    if let Some((params, body)) =
+                        self.import_type_decls.get(&(path.clone(), binding.name.clone())).cloned()
+                    {
+                        let local_name = binding.alias.as_ref().unwrap_or(&binding.name);
+                        self.env.define_type(local_name.clone(), params, body);
+                    }
+                }
+            }
+        }
+    }
+
     /// Pre-register all top-level type aliases as Named(name) placeholders.
     /// This allows recursive types to be resolved: when `type Tree = { ..., children: Tree[] }`
     /// is resolved, the occurrence of `Tree` in the body will be already in the env.
@@ -170,6 +209,8 @@ impl Checker {
         }
     }
 
+    /// Forward-declare top-level `val name = (...) => ...` functions so that
+    /// they can call each other (mutual recursion, ADR-015 equivalent).
     fn forward_declare_functions(&mut self, module: &Module) {
         for stmt in &module.statements {
             if let Stmt::Val { pattern, value, .. } = stmt {
