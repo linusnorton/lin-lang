@@ -11,7 +11,7 @@ export val squareAsync = (n: Int32): Json =>
 
 // parallel — run three independent computations concurrently; results stay in
 // submission order. Returns [a*1, b*2, c*3].
-export val weightedTriple = (a: Int32, b: Int32, c: Int32): Json =>
+export val weightedTriple = (a: Int32, b: Int32, c: Int32): Json[] =>
   parallel([
     () => a * 1,
     () => b * 2,

@@ -5,10 +5,12 @@ import { parse } from "./parser"
 import { length } from "std/array"
 
 // The value of a successful calc, or -999999 sentinel for a failure (so a single
-// `toBe` covers the end-to-end happy path concisely).
+// `toBe` covers the end-to-end happy path concisely). `calc` returns the named
+// union Success | Failure, narrowed here by pattern-matching the discriminant.
 val valueOf = (src: String): Int32 =>
-  val r = calc(src)
-  if r["type"] == "success" then r["value"] else -999999
+  match calc(src)
+    has { "type": "success", value } => value
+    else => -999999
 
 val s = suite("calc", [
   // --- End-to-end evaluation: the whole tokenize->parse->eval pipeline ---

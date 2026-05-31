@@ -13,6 +13,11 @@
 import { charCode, substring, at } from "std/string"
 import { push, length } from "std/array"
 
+// A lexer token. `kind` is the discriminant ("num" | "op" | "lparen" |
+// "rparen" | "bad"); `text` carries the source slice for the kinds that need
+// it (num/op/bad). lparen/rparen omit `text` — structurally still a Token.
+type Token = { "kind": String, "text": String }
+
 // Character classes (ASCII). charCode gives the codepoint at an index.
 val isDigit = (c: Int32): Boolean =>
   c >= 48 && c <= 57            // '0'..'9'
@@ -27,7 +32,7 @@ val scanNumberEnd = (src: String, i: Int32, n: Int32): Int32 =>
 
 // Append one token (or skip one space) per step, then recurse on the new index.
 // `tokens` is mutated in place via push and threaded through unchanged.
-val scan = (src: String, i: Int32, n: Int32, tokens: Json): Json =>
+val scan = (src: String, i: Int32, n: Int32, tokens: Token[]): Token[] =>
   if i >= n then tokens
   else
     val c = charCode(src, i)
@@ -51,5 +56,5 @@ val scan = (src: String, i: Int32, n: Int32, tokens: Json): Json =>
       scan(src, i + 1, n, tokens)
 
 // Public entry point: source string -> token array.
-export val tokenize = (src: String): Json =>
+export val tokenize = (src: String): Token[] =>
   src.scan(0, length(src), [])

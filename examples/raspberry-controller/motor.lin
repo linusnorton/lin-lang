@@ -21,13 +21,16 @@
 import { clamp, round, abs } from "std/math"
 import { toInt32 } from "std/number"
 
+// A PWM command: which channel to drive ("rpwm"|"lpwm"|"stop") and its duty
+// cycle in microseconds (0..PWM_PERIOD).
+export type MotorCommand = { "channel": String, "duty": Int32 }
+
 // Software-PWM period in microseconds (1 kHz). Duty is in the same units.
 export val PWM_PERIOD = 1000.0
 
-// Map a motor speed in [-1, 1] to a PWM command:
-//   { "channel": "rpwm"|"lpwm"|"stop", "duty": Int32 (0..PWM_PERIOD) }
-// Speed is clamped first (matching Motor::set's leading clamp).
-export val motorCommand = (speed: Float64): { "channel": String, "duty": Int32 } =>
+// Map a motor speed in [-1, 1] to a PWM command. Speed is clamped first
+// (matching Motor::set's leading clamp).
+export val motorCommand = (speed: Float64): MotorCommand =>
   val s = clamp(speed, 0.0 - 1.0, 1.0)
   if s > 0.0 then
     { "channel": "rpwm", "duty": toInt32(round(s * PWM_PERIOD)) }

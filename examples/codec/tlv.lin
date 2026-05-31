@@ -15,34 +15,41 @@ import { push, length, slice } from "std/array"
 import { u16ToBe, u16FromBe } from "std/bytes"
 import { toUInt16, toInt32, toUInt64, toFloat64 } from "std/number"
 
+// One TLV field: a tag byte (0..255) plus its raw value bytes. The value is a
+// flat byte array; decode rebuilds these from slices of the packed buffer.
+type Field = { "tag": Int32, "bytes": Int32[] }
+
 // Append every byte of `src` (a byte list) onto the UInt8[] accumulator `buf`.
-val appendBytes = (buf: Json, src: Json, i: Int32): Null =>
+// `src` stays dynamic Json: it's called with both the field's Int32[] value and
+// the UInt8[] length prefix from u16ToBe, whose flat element widths differ, so a
+// single typed element stride here would misread one of them.
+val appendBytes = (buf: UInt8[], src: Json, i: Int32): Null =>
   if i < length(src) then
     push(buf, src[i])
     appendBytes(buf, src, i + 1)
 
 // Append one field's TLV encoding onto the UInt8[] accumulator `buf`:
 // [tag] ++ u16be(len) ++ value-bytes. `push`/append coerce each Int into a byte.
-val encodeField = (buf: Json, field: Json): Null =>
+val encodeField = (buf: UInt8[], field: Field): Null =>
   push(buf, field["tag"])
   val len = length(field["bytes"])
   appendBytes(buf, u16ToBe(len.toUInt64().toUInt16()), 0)
   appendBytes(buf, field["bytes"], 0)
 
 // Encode each field in turn into the shared accumulator (recursion threads the index).
-val encodeInto = (buf: Json, fields: Json, i: Int32): Null =>
+val encodeInto = (buf: UInt8[], fields: Field[], i: Int32): Null =>
   if i < length(fields) then
     encodeField(buf, fields[i])
     encodeInto(buf, fields, i + 1)
 
 // Public: list of { tag, bytes } -> packed UInt8[].
-export val encode = (fields: Json): Json =>
+export val encode = (fields: Field[]): UInt8[] =>
   var buf: UInt8[] = []
   encodeInto(buf, fields, 0)
   buf
 
 // Decode from byte offset `pos`, accumulating { tag, bytes } records into `out`.
-val decodeFrom = (buf: Json, pos: Int32, out: Json): Json =>
+val decodeFrom = (buf: UInt8[], pos: Int32, out: Field[]): Field[] =>
   if pos >= length(buf) then out
   else
     val tag = buf[pos]
@@ -52,5 +59,5 @@ val decodeFrom = (buf: Json, pos: Int32, out: Json): Json =>
     decodeFrom(buf, valueStart + len, out)
 
 // Public: packed UInt8[] -> list of { tag, bytes }.
-export val decode = (buf: Json): Json =>
+export val decode = (buf: UInt8[]): Field[] =>
   decodeFrom(buf, 0, [])

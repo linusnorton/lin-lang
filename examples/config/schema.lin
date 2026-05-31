@@ -8,6 +8,11 @@ import { keys } from "std/object"
 import { for, length, push } from "std/array"
 import { toString } from "std/string"
 
+// One schema entry: the expected type tag ("string" | "int" | "bool") and an
+// optional default value. The default is heterogeneous across entries (String,
+// Int32 or Boolean) and absent for required fields, so it stays dynamic (Json).
+export type SchemaEntry = { "type": String, "default": Json }
+
 // The schema for our app config. Each entry: { "type", "default" } (default omitted
 // for required fields).
 export val schema = (): Json =>
@@ -40,7 +45,7 @@ export val applyDefaults = (cfg: Json): Json =>
 
 // Validate a (defaults-applied) config against the schema. Returns an array of
 // error message strings (empty array == valid).
-export val validate = (cfg: Json): Json =>
+export val validate = (cfg: Json): String[] =>
   val sch = schema()
   var errors = []
   sch.keys().for(k =>
