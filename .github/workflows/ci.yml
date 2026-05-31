@@ -127,6 +127,19 @@ jobs:
       - name: Build lin (compiler) and the ASan-instrumented runtime
         run: |
           cargo build -p lin
+          # Force a fresh liblin_runtime.a for BOTH the host and the instrumented
+          # target. The restored cache can contain a staticlib built from older
+          # runtime source (runtime source changes don't bump Cargo.lock, so the
+          # same cache key is reused); cargo's fingerprint then reports it
+          # up-to-date and skips the rebuild, so the stale .a survives. The
+          # internal `cc` link `lin build` runs (find_runtime_lib() picks
+          # target/debug) — and the explicit clang link below (target triple
+          # dir) — would then fail with `undefined reference` to any
+          # newer runtime symbol. `cargo clean -p` clears the artifact AND its
+          # fingerprint (a bare rm would leave the fingerprint "fresh" and cargo
+          # would not rebuild), guaranteeing both archives match current source.
+          cargo clean -p lin-runtime
+          cargo clean -p lin-runtime --target x86_64-unknown-linux-gnu
           # `lin build` runs its own internal `cc` link against the host
           # liblin_runtime.a (find_runtime_lib() looks in target/debug). Building
           # the compiler alone only emits lin-runtime as an rlib, so emit the
