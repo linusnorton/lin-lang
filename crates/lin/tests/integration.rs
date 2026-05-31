@@ -1905,7 +1905,7 @@ print(toString(add5(10)))
 
 #[test]
 fn test_map_returns_capturing_closures() {
-    // Regression (ADR-056 owning captures): a `map` callback that RETURNS a closure capturing
+    // Regression (ADR-060 owning captures): a `map` callback that RETURNS a closure capturing
     // the callback parameter. The returned thunks ESCAPE into the result array; each must own
     // its captured value (the element box), not borrow a per-iteration box that is freed and
     // reused. Before the owning-capture fix, calling a thunk returned garbage (`[[object]…]`)
