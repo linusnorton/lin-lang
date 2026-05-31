@@ -757,7 +757,7 @@ impl FuncBuilder {
 fn is_rc_type(ty: &Type) -> bool {
     matches!(
         ty,
-        Type::Str | Type::Array(_) | Type::FixedArray(_) | Type::Object(_) | Type::Function { .. }
+        Type::Str | Type::StrLit(_) | Type::Array(_) | Type::FixedArray(_) | Type::Object(_) | Type::Function { .. }
     )
 }
 
@@ -942,7 +942,7 @@ fn is_union_ty(ty: &Type) -> bool {
 fn is_heap_ty(ty: &Type) -> bool {
     matches!(
         ty,
-        Type::Str | Type::Array(_) | Type::FixedArray(_) | Type::Object(_) | Type::Iterator(_)
+        Type::Str | Type::StrLit(_) | Type::Array(_) | Type::FixedArray(_) | Type::Object(_) | Type::Iterator(_)
     )
 }
 
@@ -1350,7 +1350,8 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
         TypedExpr::FloatLit(v, ty, _) => {
             builder.const_temp(Const::Float(*v, ty.clone()))
         }
-        TypedExpr::StringLit(s, _) => {
+        TypedExpr::StringLit(s, _, _) => {
+            // StrLit is Str at runtime (ADR-053): always lower to an owned Str temp.
             let t = builder.const_temp(Const::Str(s.clone()));
             builder.register_owned(t, Type::Str);
             t
@@ -1420,6 +1421,24 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                     builder.register_owned(t, ty.clone());
                 }
                 t
+            } else if let Some((sym, _)) = ctx.import_fn_slots.get(slot).cloned() {
+                // An imported top-level function (or FFI symbol) referenced as a VALUE rather
+                // than called — e.g. passed as a `Function`-typed argument like
+                // `router.serve(3000)` (desugared to `serve(router, 3000)`) or `arr.map(imported)`.
+                // Without this branch the slot resolves to none of the call-position handling
+                // above and falls through to the placeholder `else`, emitting NO instruction, so
+                // codegen's arg collection silently DROPS the value (the "N args for an N+1-param
+                // call" codegen error). Materialize it as a capture-less closure VALUE bound to the
+                // external symbol — the codegen mirror of the local-named-function case below.
+                let closure_ty = ty.clone();
+                let dst = builder.alloc_temp(closure_ty.clone());
+                builder.emit(Instruction::MakeNamedClosure {
+                    dst,
+                    sym,
+                    ty: closure_ty.clone(),
+                });
+                builder.register_owned(dst, closure_ty);
+                dst
             } else if let Some((wrapper, val_ty)) = ctx.import_val_slots.get(slot).cloned() {
                 // Imported non-function val: call its zero-arg wrapper to compute the value.
                 let dst = builder.alloc_temp(val_ty.clone());
@@ -2201,6 +2220,7 @@ fn lower_intrinsic_call(
         "lin_shared_with_lock" => Intrinsic::SharedWithLock,
         "lin_freeze" => Intrinsic::Freeze,
         "lin_worker" => Intrinsic::Worker,
+        "lin_serve" => Intrinsic::Serve,
         "lin_request" => Intrinsic::Request,
         "lin_message" => Intrinsic::Message,
         "lin_close" => Intrinsic::Close,
@@ -3918,7 +3938,7 @@ fn lower_function_expr_with_id(
             builder.emit(Instruction::Retain { val: base, ty: cap.ty.clone() });
             capture_temps.push(base);
             capture_kinds.push(match &cap.ty {
-                Type::Str => CaptureRelease::Str,
+                Type::Str | Type::StrLit(_) => CaptureRelease::Str,
                 Type::Array(_) | Type::FixedArray(_) => CaptureRelease::Array,
                 Type::Object(_) => CaptureRelease::Object,
                 Type::Function { .. } => CaptureRelease::Closure,

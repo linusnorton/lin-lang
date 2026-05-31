@@ -6,9 +6,17 @@ use super::Parser;
 impl Parser {
     pub(crate) fn parse_type_expr(&mut self) -> TypeExpr {
         let first = self.parse_type_primary();
-        if self.check(TokenKind::Pipe) {
+        // A `|` continuation may sit on the next (indented) line, e.g.
+        // `type R =⏎  { .. }⏎  | { .. }` (first variant without a leading pipe). Peek past
+        // newlines via save/restore: only treat them as a continuation when a `|` follows,
+        // so a real statement boundary (newline not followed by `|`) is left intact.
+        if self.check(TokenKind::Pipe) || self.newline_precedes_pipe() {
             let mut types = vec![first];
-            while self.check(TokenKind::Pipe) {
+            loop {
+                self.skip_newlines();
+                if !self.check(TokenKind::Pipe) {
+                    break;
+                }
                 self.advance();
                 self.skip_newlines();
                 types.push(self.parse_type_primary());
@@ -111,6 +119,12 @@ impl Parser {
                     TypeExpr::Named(name, span)
                 }
             }
+            TokenKind::StringLit(_) => {
+                // A string-literal singleton type, e.g. `"success"`.
+                let span = self.current_span();
+                let s = if let TokenKind::StringLit(s) = self.advance_kind() { s } else { String::new() };
+                TypeExpr::StringLit(s, span)
+            }
             _ => {
                 let span = self.current_span();
                 self.advance();
@@ -118,13 +132,15 @@ impl Parser {
             }
         };
 
-        // Check for postfix [] (array type)
-        if self.check(TokenKind::LBracket) && self.check_ahead(TokenKind::RBracket, 1) {
+        // Check for postfix `[]` (array type), repeated for nested arrays: `T[][]` is
+        // `Array(Array(T))`. A single `if` only matched one `[]`, so `Int32[][]` / `UInt8[][]`
+        // failed to parse (the second `[` was left dangling → "expected Eq, got LBracket").
+        let mut ty = base;
+        while self.check(TokenKind::LBracket) && self.check_ahead(TokenKind::RBracket, 1) {
             self.advance(); // [
             self.advance(); // ]
-            TypeExpr::Array(Box::new(base), Span::dummy())
-        } else {
-            base
+            ty = TypeExpr::Array(Box::new(ty), Span::dummy());
         }
+        ty
     }
 }

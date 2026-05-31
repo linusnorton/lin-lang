@@ -867,7 +867,7 @@ val isDave = (input: String): Boolean =>
 val isAdult = person has { age } && person["age"] >= 18
 ```
 
-Literal values used with `is` have base type, not singleton type. `"Dave" is "Dave"` is true; the type of the literal `"Dave"` is `String`.
+A string literal as a **value** (e.g. on either side of `is`) has base type `String`, not a singleton. `"Dave" is "Dave"` is true and is a runtime equality check; the type of the literal value `"Dave"` is `String`. A string literal in **type** position, however, *is* a singleton type — see §18 (tagged unions) and design principle §33. So `value is "Dave"` tests value equality, whereas `type Name = "Dave"` declares a type whose only inhabitant is the string `"Dave"`.
 
 A single `match` arm may not combine `is` and `has` patterns — each arm uses one keyword.
 
@@ -1263,13 +1263,23 @@ This is not used because JSON-shaped types should describe JSON-shaped data. Ite
 
 ## 18. Tagged Unions
 
-Tagged unions are represented with structural JSON object types.
+Tagged unions are represented with structural JSON object types. The discriminant field uses a
+**string-literal singleton type** (`"success"` / `"failure"`), so the tags are checked at compile
+time: a literal in this position admits only its exact value, an object literal carrying the wrong
+tag (or no tag) is a **compile-time type error**, and assigning a value to a `Result<…>` selects
+the matching variant by its discriminant. The `match`/`has` arms then discriminate the variants at
+runtime via the `"type"` field.
 
 ```txt
 type Result<T, E> =
   | { "type": "success", "value": T }
   | { "type": "failure", "error": E }
 ```
+
+Both the multi-line leading-`|` form above (the canonical spelling) and the equivalent single-line
+form `type Result<T, E> = { "type": "success", "value": T } | { "type": "failure", "error": E }`
+parse. In the multi-line form the leading `|` is optional on the first variant; a `|` may also
+begin a continuation line.
 
 ```txt
 val divide = (a: Float64, b: Float64): Result<Float64, String> =>
@@ -1376,8 +1386,8 @@ std/iter     range, iterOf  (also auto-imported as globals)
 std/result   Result<T, E> type alias
 std/io       print, readLine, lines, readAll
 std/fs       readFile, writeFile, appendFile, readLines, readJson, writeJson, exists
-std/http     fetch, fetchWith, fetchJson, postJson
-std/server   serve, json, text, redirect, notFound, badRequest, pathMatch, parseBody
+std/http     fetch, fetchWith, fetchJson, postJson,
+             serve, json, text, redirect, notFound, badRequest, matchPath, parseBody
 ```
 
 The full signature of every function is specified in `docs/STDLIB.md`.
@@ -1719,7 +1729,7 @@ Decided:
 30. Bracket access is safe: missing object key → `Null`, `Null` propagates; array OOB is a runtime error.
 31. Generic types are covariant in producer positions, contravariant in consumer positions.
 32. Type-expression precedence: `[]` > `<>` > `=>` > `|`.
-33. Literal types: literal values have their base type (`"Dave"` is `String`), not a singleton type.
+33. Literal types: a string literal in **type** position is a singleton type (`type Tag = "ok"` admits only the value `"ok"`). A string literal as a **value** still infers to its base type (`val x = "Dave"` is `String`); the singleton is obtained by checking it against an expected literal type. A literal widens to `String`; `String` does not narrow to a literal. (Numeric/boolean literal types are not yet supported.)
 34. Runtime errors halt the program; they cannot be caught.
 35. Integer division by zero is a runtime error; floating-point follows IEEE 754.
 36. `toString` is defined for every primitive (§27.8); used implicitly by string interpolation.
@@ -1786,7 +1796,7 @@ match result
   is Int32 => print("got ${result}")
 ```
 
-A runtime error inside the thunk (array out of bounds, integer division by zero, non-exhaustive match, etc.) is caught at the OS thread boundary and surfaces as an `Error` value at the `await` call site rather than halting the program. This makes `async` a **fault isolation boundary** — the only place in Lin where runtime errors become recoverable values. The general rule that runtime errors are uncatchable (§19.1) does not apply inside an async thunk.
+An async fault surfaces as an `Error` value whose discriminant is the string-literal `"type": "error"`; since string literals in type position are singleton types (§18, §33), this tag is the same kind of compile-time-checked discriminant used by user-defined tagged unions. A runtime error inside the thunk (array out of bounds, integer division by zero, non-exhaustive match, etc.) is caught at the OS thread boundary and surfaces as an `Error` value at the `await` call site rather than halting the program. This makes `async` a **fault isolation boundary** — the only place in Lin where runtime errors become recoverable values. The general rule that runtime errors are uncatchable (§19.1) does not apply inside an async thunk.
 
 If `await` is called and the result is `Error` but the caller does not inspect it (e.g. assigns to a `val` typed as `Int32`), the type checker will reject the assignment at compile time.
 
@@ -2151,27 +2161,27 @@ export val postJson = (url: String, body: Json): HttpResponse | Error =>
   })
 ```
 
-`parseJson` is an intrinsic (`__parseJson: (String) -> Json | Error`) that parses a JSON string into a Lin value. It is not part of the public stdlib API but is available internally to `std/http` and `std/server`.
+`parseJson` is an intrinsic (`__parseJson: (String) -> Json | Error`) that parses a JSON string into a Lin value. It is not part of the public stdlib API but is available internally to `std/http`.
 
-### 33.5 `std/server` Intrinsics
+### 33.5 HTTP Server (`serve`)
 
-The server module requires two intrinsics — one for sequential serving and one for pool-dispatched serving. Everything else (`json`, `text`, `redirect`, `notFound`, `badRequest`, `pathMatch`, `parseBody`) is written in Lin on top of the `HttpResponse` type and `__parseJson`.
+Server support lives in `std/http` alongside the client. The serving loop itself is the one intrinsic; everything else (`json`, `text`, `redirect`, `notFound`, `badRequest`, `matchPath`, `parseBody`) is written in Lin on top of the `HttpResponse` type and `__parseJson`.
 
 ```txt
-__serverServe:         (port: Int32, handler: (HttpRequest) -> HttpResponse) -> Null
-__serverServeWithPool: (pool: ThreadPool, port: Int32, handler: (HttpRequest) -> HttpResponse) -> Null
+__serverServe: (handler: (HttpRequest) -> HttpResponse, port: Int32) -> Null
 ```
 
-`__serverServeWithPool` is not called directly from Lin. It is invoked via the `pool.serve` dot-call form, which the runtime dispatches to this intrinsic when `.serve` is called on a `ThreadPool` value. The handler is subject to the same `var`-capture restriction as `pool.async` (§32.2.1) — enforced at compile time where statically detectable.
+`__serverServe` binds a TCP listener on `port`, then serves connections **sequentially** (one request at a time): it parses each incoming HTTP/1.1 request into an `HttpRequest`, invokes `handler`, and writes the returned `HttpResponse` back on the wire. It blocks indefinitely (it only returns — as an `Error`-shaped value — if the port cannot be bound). The handler runs inside a fault-isolation boundary: a faulting handler yields a `500` response and the server keeps serving.
 
-The Lin stdlib wrappers in `std/server`:
+The handler argument comes **first** so the dot-call form reads naturally: `router.serve(3000)` desugars (first-argument application, §11.1) to `serve(router, 3000)`. Both forms are equivalent.
+
+A pool-dispatched variant (`pool.serve`, concurrent request handling) is not yet implemented.
+
+The Lin stdlib wrappers in `std/http`:
 
 ```txt
-export val serve = (port: Int32, handler: (HttpRequest) -> HttpResponse): Null =>
-  __serverServe(port, handler)
-
-// pool.serve dispatches to __serverServeWithPool via the runtime's dot-call dispatch
-// on ThreadPool values; it is not a standalone exported function.
+export val serve = (handler: (HttpRequest) -> HttpResponse, port: Int32): Null =>
+  __serverServe(handler, port)
 
 export val json = (status: Int32, body: Json): HttpResponse => {
   "status":  status,
@@ -2181,7 +2191,7 @@ export val json = (status: Int32, body: Json): HttpResponse => {
 
 export val text = (status: Int32, body: String): HttpResponse => {
   "status":  status,
-  "headers": { "Content-Type": "text/plain" },
+  "headers": { "Content-Type": "text/plain; charset=utf-8" },
   "body":    body
 }
 
@@ -2191,20 +2201,20 @@ export val redirect = (url: String): HttpResponse => {
   "body":    ""
 }
 
-export val notFound = (): HttpResponse =>
-  text(404, "Not Found")
+export val notFound: HttpResponse =
+  { "status": 404, "headers": {}, "body": "Not Found" }
 
 export val badRequest = (message: String): HttpResponse =>
-  text(400, message)
+  { "status": 400, "headers": {}, "body": message }
 
 export val parseBody = (req: HttpRequest): Json | Error =>
   __parseJson(req["body"])
 
-export val pathMatch = (pattern: String, path: String): { ...String } | Null =>
+export val matchPath = (path: String, pattern: String): { ...String } | Null =>
   __serverPathMatch(pattern, path)
 ```
 
-`__serverPathMatch: (String, String) -> { ...String } | Null` is a Rust intrinsic that splits both strings on `/`, matches literal segments exactly, captures `:name` segments by name, and returns `Null` on any mismatch.
+`__serverPathMatch` is a Rust intrinsic that splits both strings on `/`, matches literal segments exactly, captures `:name` segments by name, and returns `Null` on any mismatch. `matchPath` takes the **path first** so it reads as `req["path"].matchPath("/users/:id")` in dot-call form.
 
 ## 34. Foreign Function Interface
 
@@ -2420,7 +2430,7 @@ tcpClose:          (fd: Int32)                    => Null | Error
 
 `recv` fills a caller-owned `UInt8[]` (§35.1) and returns the number of bytes read; the buffer is never transferred across the boundary. Non-blocking mode plus a `Null`-on-would-block `recv`/`accept` replaces an explicit `poll`.
 
-Note that `std/server` (§33.5) already provides a high-level blocking HTTP server, and `std/http` (§33.4) an HTTP client; `std/net` is the lower-level byte-stream layer beneath them, for non-HTTP protocols and custom framing.
+Note that `std/http` already provides a high-level blocking HTTP server (`serve`, §33.5) and an HTTP client (§33.4); `std/net` is the lower-level byte-stream layer beneath them, for non-HTTP protocols and custom framing.
 
 ### 35.6 `std/proc` — Subprocesses
 

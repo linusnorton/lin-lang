@@ -31,6 +31,10 @@
 
 import { slice, length, push } from "std/array"
 
+// One parsed NAL unit: its type (low 5 bits of the first byte) and the unit's
+// bytes WITHOUT the start code.
+export type NalUnit = { "nalType": Int32, "data": UInt8[] }
+
 // Length of the start code at position i: 4 for 00 00 00 01, 3 for 00 00 01,
 // else 0. Nested ifs guard each index because Lin's `&&` does not short-circuit
 // array indexing (both operands are evaluated). Mirrors Rust start_code_at.
@@ -49,7 +53,7 @@ export val startCodeAt = (b: UInt8[], i: Int32): Int32 =>
 
 // Emit the NAL spanning [lo, hi) into acc (skipping empties), nal_type = data[0]
 // & 0x1F. Matches the Rust `if !nal_data.is_empty()` guard.
-val emitNal = (b: UInt8[], lo: Int32, hi: Int32, acc: Json): Null =>
+val emitNal = (b: UInt8[], lo: Int32, hi: Int32, acc: NalUnit[]): Null =>
   if hi > lo then
     val data: UInt8[] = slice(b, lo, hi)
     push(acc, { "nalType": data[0] & 0x1F, "data": data })
@@ -58,7 +62,7 @@ val emitNal = (b: UInt8[], lo: Int32, hi: Int32, acc: Json): Null =>
 // Recursive scan: i = cursor, start = index of the current NAL's first byte
 // (start < 0 means "no NAL open yet"), acc = accumulating result array. On each
 // start code, flush the open NAL (if any) and begin a new one after the code.
-val scan = (b: UInt8[], i: Int32, start: Int32, acc: Json): Null =>
+val scan = (b: UInt8[], i: Int32, start: Int32, acc: NalUnit[]): Null =>
   if i >= length(b) then null
   else
     val sc = startCodeAt(b, i)
@@ -69,7 +73,7 @@ val scan = (b: UInt8[], i: Int32, start: Int32, acc: Json): Null =>
       scan(b, i + 1, start, acc)
 
 // Parse a complete buffer into the array of complete NAL units it contains.
-export val parseNals = (b: UInt8[]): Json =>
-  val acc: Json[] = []
+export val parseNals = (b: UInt8[]): NalUnit[] =>
+  val acc: NalUnit[] = []
   scan(b, 0, 0 - 1, acc)
   acc

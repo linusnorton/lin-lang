@@ -6,13 +6,22 @@
 
 import { parseInt32 } from "std/number"
 
-val fail = (msg: String): Json =>
+// Tagged-result shapes. The discriminant field `type` is typed String (spec:
+// string literals have base type String, not a singleton type).
+type Failure = { "type": String, "error": String }
+type EvalSuccess = { "type": String, "value": Int32 }
+type Evaluated = EvalSuccess | Failure
+
+val fail = (msg: String): Failure =>
   { "type": "failure", "error": msg }
 
 val isFailure = (x: Json): Boolean =>
   x["type"] == "failure"
 
 // Evaluate one AST node to either a number wrapped in success, or a failure.
+// `node` walks a recursive AST union ({kind:"num",value} | {kind:"binop",...})
+// indexed by per-variant fields after a `kind` test, so it stays dynamic Json;
+// likewise the recursive sub-results are read via `["value"]` after isFailure.
 val evalNode = (node: Json): Json =>
   if node["kind"] == "num" then
     { "type": "success", "value": node["value"] }
@@ -33,6 +42,6 @@ val evalNode = (node: Json): Json =>
         else { "type": "success", "value": a / b }
 
 // Public entry: an AST result (success/failure from the parser) -> evaluated result.
-export val evalAst = (parsed: Json): Json =>
+export val evalAst = (parsed: Json): Evaluated =>
   if isFailure(parsed) then parsed
   else evalNode(parsed["value"])

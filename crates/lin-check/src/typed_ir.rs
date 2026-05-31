@@ -10,6 +10,13 @@ pub struct TypedModule {
     /// Maps slot index to intrinsic name (e.g. 0 => "print").
     /// Populated by the checker when it registers intrinsics.
     pub intrinsics: HashMap<usize, String>,
+    /// Exported `type` declarations (`export type Foo = ...`), as name → (params, resolved body).
+    /// Type decls produce no runtime code, so they are recorded here as module metadata (like
+    /// `intrinsics`) rather than as `TypedStmt`s — lowering/codegen ignore this field. A dependent
+    /// module's checker re-registers these into its type env so `import { Foo }` can be used in
+    /// type position (the value-import mechanism via `ModuleSignature::exports` is the analogue).
+    #[serde(default)]
+    pub exported_types: HashMap<String, (Vec<String>, Type)>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -83,7 +90,10 @@ pub struct ForeignSlot {
 pub enum TypedExpr {
     IntLit(i64, Type, Span),
     FloatLit(f64, Type, Span),
-    StringLit(String, Span),
+    /// A string literal. The `Type` is normally `Str`, but bidirectional refinement
+    /// (ADR-053) may narrow it to a `StrLit` singleton when checked against an expected
+    /// literal type. The runtime representation is identical either way.
+    StringLit(String, Type, Span),
     BoolLit(bool, Span),
     NullLit(Span),
     LocalGet {
@@ -219,7 +229,7 @@ impl TypedExpr {
         match self {
             TypedExpr::IntLit(_, t, _) => t.clone(),
             TypedExpr::FloatLit(_, t, _) => t.clone(),
-            TypedExpr::StringLit(_, _) => Type::Str,
+            TypedExpr::StringLit(_, ty, _) => ty.clone(),
             TypedExpr::BoolLit(_, _) => Type::Bool,
             TypedExpr::NullLit(_) => Type::Null,
             TypedExpr::LocalGet { ty, .. } => ty.clone(),
@@ -254,7 +264,7 @@ impl TypedExpr {
         match self {
             TypedExpr::IntLit(_, _, s) => *s,
             TypedExpr::FloatLit(_, _, s) => *s,
-            TypedExpr::StringLit(_, s) => *s,
+            TypedExpr::StringLit(_, _, s) => *s,
             TypedExpr::BoolLit(_, s) => *s,
             TypedExpr::NullLit(s) => *s,
             TypedExpr::LocalGet { span, .. } => *span,
