@@ -266,14 +266,19 @@ fn check_module_with_imports(
     lenient_json: bool,
 ) -> Result<TypedModule, Vec<lin_common::Diagnostic>> {
     let mut import_type_map: HashMap<(String, String), Type> = HashMap::new();
+    let mut import_type_decls: HashMap<(String, String), (Vec<String>, Type)> = HashMap::new();
     for (path, imp_module) in imported_modules {
         let sig = ModuleSignature::from_module(imp_module);
         for (name, ty) in sig.exports {
             import_type_map.insert((path.clone(), name), ty);
         }
+        for (name, decl) in sig.type_exports {
+            import_type_decls.insert((path.clone(), name), decl);
+        }
     }
     let mut checker = Checker::new();
     checker.import_types = import_type_map;
+    checker.import_type_decls = import_type_decls;
     // The trusted stdlib forwards Json handles into concrete intrinsic/foreign params by
     // design, so it checks Json->concrete leniently (ADR-046). User code does not.
     checker.lenient_json = lenient_json;

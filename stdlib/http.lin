@@ -47,7 +47,7 @@ export val text = (status: Int32, body: String): HttpResponse =>
 export val redirect = (location: String): HttpResponse =>
   { "status": 302, "headers": { "Location": location }, "body": "" }
 
-export val notFound = { "status": 404, "headers": {}, "body": "Not Found" }
+export val notFound: HttpResponse = { "status": 404, "headers": {}, "body": "Not Found" }
 
 export val badRequest = (message: String): HttpResponse =>
   { "status": 400, "headers": {}, "body": message }
@@ -55,5 +55,8 @@ export val badRequest = (message: String): HttpResponse =>
 export val parseBody = (req: Json): Json =>
   lin_parse_json(req["body"])
 
-export val pathMatch = (pattern: String, path: String): Json =>
+export val matchPath = (path: String, pattern: String): Json =>
   lin_server_path_match(pattern, path)
+
+export val serve = (handler: Json, port: Int32): Null =>
+  lin_serve(handler, port)

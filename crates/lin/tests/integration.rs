@@ -1585,6 +1585,76 @@ print(toString(addDouble(5)))
 }
 
 #[test]
+fn test_imported_fn_passed_as_value() {
+    // Regression: an imported top-level function referenced as a VALUE (not called) was
+    // dropped in IR lowering — the LocalGet branch had no `import_fn_slots` case, so the
+    // slot fell through to a placeholder that emitted no instruction and codegen silently
+    // dropped the argument ("Incorrect number of arguments passed to called function!").
+    // Both forms below pass an imported fn as a value: as a higher-order arg to `map`, and
+    // bound to a local `val` then called. (A local fn used the same way always worked.)
+    let dir = std::env::temp_dir().join(format!("lin_impfnval_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("lib.lin"),
+        "export val double = (x: Int32): Int32 => x * 2\n").unwrap();
+    let main = format!(r#"import {{ print }} from "std/io"
+import {{ toString }} from "std/string"
+import {{ map }} from "std/array"
+import {{ double }} from "{}/lib"
+val doubled = [1, 2, 3].map(double)
+print(toString(doubled))
+val f = double
+print(toString(f(21)))
+"#, dir.to_str().unwrap());
+    let output = run(&main);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(output, vec!["[2, 4, 6]", "42"]);
+}
+
+#[test]
+fn test_imported_type_used_in_annotation() {
+    // An exported `type` decl can be imported and used in type position in a dependent
+    // module — covering a plain object type, an aliased import (`as`), and a generic type.
+    // Previously these failed with "Unknown type" because exported type decls were dropped
+    // at the module boundary (only value exports were threaded into the importer's checker).
+    let dir = std::env::temp_dir().join(format!("lin_imptype_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("lib.lin"),
+        "export type Point = { \"x\": Int32, \"y\": Int32 }\n\
+         export type Wrapped<T> = { \"value\": T }\n").unwrap();
+    let main = format!(r#"import {{ print }} from "std/io"
+import {{ toString }} from "std/string"
+import {{ Point, Wrapped as W }} from "{}/lib"
+val sum = (p: Point): Int32 => p["x"] + p["y"]
+val unwrap = (w: W<Int32>): Int32 => w["value"]
+print(toString(sum({{ "x": 3, "y": 4 }})))
+print(toString(unwrap({{ "value": 99 }})))
+"#, dir.to_str().unwrap());
+    let output = run(&main);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(output, vec!["7", "99"]);
+}
+
+#[test]
+fn test_imported_type_unknown_without_import() {
+    // The type is only visible when imported: using `Point` without importing it from the
+    // module that exports it is still "Unknown type" (the registration is scoped to imports).
+    let dir = std::env::temp_dir().join(format!("lin_imptype_neg_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("lib.lin"),
+        "export type Point = { \"x\": Int32, \"y\": Int32 }\n").unwrap();
+    // Import a VALUE-less binding-free module reference: import nothing type-related, then
+    // reference Point. (We import a dummy to make the module a dependency at all.)
+    let main = format!(r#"import {{ print }} from "std/io"
+val sum = (p: Point): Int32 => p["x"]
+print("unused")
+"#);
+    let _ = &dir; // lib not imported on purpose
+    let err = run_expect_err(&main);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(err.contains("Unknown type 'Point'"), "got: {}", err);
+}
+
+#[test]
 fn test_default_args_trailing_comma_still_curries() {
     // A trailing comma requests partial application even when defaults exist,
     // rather than filling the default.
@@ -3257,14 +3327,135 @@ fn test_server_path_match() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
 
-import { pathMatch } from "std/http"
-val m = pathMatch("/users/:id/posts/:postId", "/users/42/posts/7")
+import { matchPath } from "std/http"
+val m = matchPath("/users/42/posts/7", "/users/:id/posts/:postId")
 print(m["id"])
 print(m["postId"])
-val none = pathMatch("/users/:id", "/products/5")
+val none = matchPath("/products/5", "/users/:id")
 print(toString(none))
 "#);
     assert_eq!(output, vec!["42", "7", "null"]);
+}
+
+/// End-to-end test of the real HTTP `serve` intrinsic (spec §33.5). `serve` blocks
+/// forever, so the compiled program runs as a background child process; we poll-connect
+/// a raw TCP client, send an HTTP/1.1 request, and assert the wire response. The child is
+/// always killed via a guard so a hung server never leaks past the test.
+#[test]
+fn test_serve_real_http() {
+    use std::io::Read;
+    use std::net::TcpStream;
+    use std::time::{Duration, Instant};
+
+    let lin_bin = lin_bin();
+    if !lin_bin.exists() {
+        eprintln!("SKIP test_serve_real_http: lin binary not built");
+        return;
+    }
+
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let ws = workspace_root();
+    // Use a project dir with a SEPARATE router module: `main.lin` imports `router` and calls
+    // `router.serve(port)`. This is the real example's shape and also guards the imported-fn-
+    // as-value lowering fix — passing an imported function value to serve (see
+    // test_imported_fn_passed_as_value).
+    let dir = ws.join(format!("target/lin_serve_{}", id));
+    let _ = fs::create_dir_all(&dir);
+    let src_path = dir.join("main.lin");
+    let bin_path = dir.join("server_bin");
+    // A high, fixed-ish port derived from the test id to avoid collisions across the suite.
+    let port: u16 = 41_900 + (id as u16 % 50);
+
+    fs::write(dir.join("router.lin"),
+        r#"import { json, text, matchPath } from "std/http"
+
+export val router = (req: Json): Json =>
+  match req["path"]
+    is "/" => text(200, "hello from lin")
+    is path when matchPath(path, "/users/:id") != null =>
+      val m = matchPath(path, "/users/:id")
+      json(200, { "id": m["id"] })
+    else => json(404, { "error": "not found" })
+"#).unwrap();
+
+    let source = format!(
+        r#"import {{ serve }} from "std/http"
+import {{ router }} from "./router"
+
+router.serve({port})
+"#
+    );
+    fs::write(&src_path, &source).unwrap();
+
+    let compile = Command::new(&lin_bin)
+        .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
+        .current_dir(&ws)
+        .output()
+        .expect("failed to invoke lin binary");
+    assert!(
+        compile.status.success(),
+        "serve program compilation failed:\nstderr: {}\nsource:\n{}",
+        String::from_utf8_lossy(&compile.stderr),
+        source
+    );
+
+    // Guard that always kills the spawned server and removes the project dir on drop.
+    struct ChildGuard {
+        child: std::process::Child,
+        dir: PathBuf,
+    }
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    let child = Command::new(&bin_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn serve binary");
+    let mut guard = ChildGuard { child, dir: dir.clone() };
+
+    // Poll-connect until the server is accepting (or time out).
+    let addr = format!("127.0.0.1:{}", port);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let request = |path: &str| -> String {
+        let mut last_err = String::new();
+        while Instant::now() < deadline {
+            match TcpStream::connect(&addr) {
+                Ok(mut stream) => {
+                    let req = format!("GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n", path);
+                    stream.write_all(req.as_bytes()).unwrap();
+                    let mut resp = String::new();
+                    stream.read_to_string(&mut resp).unwrap();
+                    return resp;
+                }
+                Err(e) => {
+                    last_err = e.to_string();
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+        panic!("server never came up on {}: {}", addr, last_err);
+    };
+
+    let root = request("/");
+    assert!(root.starts_with("HTTP/1.1 200 OK"), "GET / status: {}", root);
+    assert!(root.contains("hello from lin"), "GET / body: {}", root);
+
+    let user = request("/users/42");
+    assert!(user.starts_with("HTTP/1.1 200 OK"), "GET /users/42 status: {}", user);
+    assert!(user.contains("\"id\": \"42\""), "GET /users/42 body: {}", user);
+
+    let missing = request("/nope");
+    assert!(missing.starts_with("HTTP/1.1 404"), "GET /nope status: {}", missing);
+
+    // Explicit kill (the guard would also do this on drop).
+    let _ = guard.child.kill();
+    let _ = guard.child.wait();
 }
 
 #[test]
@@ -5494,4 +5685,109 @@ print(handle(true)["body"])
 print(handle(false)["body"])
 "#);
     assert_eq!(out, vec!["ok", "no"]);
+}
+
+#[test]
+fn test_multiline_union_leading_pipe() {
+    // The spec §18 canonical form: a multi-line tagged union with a leading `|` on each
+    // variant in a `type` alias. Previously failed to parse ("unexpected token Pipe")
+    // because the indented body's INDENT token sat between `=` and the first `|`.
+    let out = run(r#"import { print } from "std/io"
+type Result =
+  | { "type": "success", "value": Int32 }
+  | { "type": "failure", "error": String }
+val r: Result = { "type": "success", "value": 7 }
+val msg = match r
+  has { "type": "success", "value": v } => "ok ${v}"
+  has { "type": "failure", "error": e } => "err ${e}"
+  else => "?"
+print(msg)
+"#);
+    assert_eq!(out, vec!["ok 7"]);
+}
+
+#[test]
+fn test_multiline_union_no_leading_pipe() {
+    // Multi-line union whose first variant has no leading pipe and a `|` continues the
+    // next line. Previously this STACK-OVERFLOWED the parser; now it parses and runs.
+    let out = run(r#"import { print } from "std/io"
+type Result =
+  { "type": "success", "value": Int32 }
+  | { "type": "failure", "error": String }
+val r: Result = { "type": "failure", "error": "boom" }
+val msg = match r
+  has { "type": "success", "value": v } => "ok ${v}"
+  has { "type": "failure", "error": e } => "err ${e}"
+  else => "?"
+print(msg)
+"#);
+    assert_eq!(out, vec!["err boom"]);
+}
+
+#[test]
+fn test_multiline_single_variant_body_then_decl() {
+    // An indented single-variant body (no pipe) must not swallow the following decl:
+    // the trailing Dedent is consumed without over-running the statement boundary.
+    let out = run(r#"import { print } from "std/io"
+type Box =
+  { "value": Int32 }
+type Other = { "x": String }
+val b: Box = { "value": 9 }
+val o: Other = { "x": "hi" }
+print("${b["value"]} ${o["x"]}")
+"#);
+    assert_eq!(out, vec!["9 hi"]);
+}
+
+#[test]
+fn test_from_json_strlit_discriminates_union() {
+    // ADR-052: fromJson validates the exact literal value of a StrLit field, so a tagged-union
+    // decode discriminates by the discriminant tag. Correct tags decode to the right variant;
+    // first-match-wins probes each variant's KIND_STRLIT check.
+    let out = run(r#"import { print } from "std/io"
+import { fromJson } from "std/json"
+type Result = { "type": "success", "value": Int32 } | { "type": "failure", "error": String }
+val show = (j: Json): String =>
+  val r = Result.fromJson(j)
+  match r
+    is Error => "decode-error"
+    has { "type": "success", "value": v } => "ok ${v}"
+    has { "type": "failure", "error": e } => "fail ${e}"
+    else => "?"
+print(show({ "type": "success", "value": 7 }))
+print(show({ "type": "failure", "error": "boom" }))
+"#);
+    assert_eq!(out, vec!["ok 7", "fail boom"]);
+}
+
+#[test]
+fn test_from_json_strlit_rejects_wrong_tag() {
+    // ADR-052: a wrong discriminant value is a decode error (was a silent mis-decode under the
+    // old KIND_STRING placeholder), with a path-located message.
+    let out = run(r#"import { print } from "std/io"
+import { fromJson } from "std/json"
+type Tagged = { "kind": "alpha", "n": Int32 }
+val r = Tagged.fromJson({ "kind": "beta", "n": 1 })
+match r
+  is Error => print("err: ${r["message"]}")
+  else => print("ok")
+"#);
+    assert_eq!(out.len(), 1);
+    assert!(out[0].contains("alpha") && out[0].contains("beta"),
+        "expected literal-mismatch message naming both tags, got: {}", out[0]);
+}
+
+#[test]
+fn test_from_json_plain_string_field_accepts_any() {
+    // ADR-052 must NOT regress plain String fields: they still encode as KIND_STRING and accept
+    // any string value (only StrLit fields are value-checked).
+    let out = run(r#"import { print } from "std/io"
+import { fromJson } from "std/json"
+type Person = { "name": String, "age": Int32 }
+val r = Person.fromJson({ "name": "anything goes", "age": 5 })
+match r
+  is Error => print("err")
+  else => print("ok ${r["name"]}")
+"#);
+    assert_eq!(out, vec!["ok anything goes"]);
 }
