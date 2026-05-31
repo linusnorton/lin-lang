@@ -124,13 +124,15 @@ impl Parser {
             }
         };
 
-        // Check for postfix [] (array type)
-        if self.check(TokenKind::LBracket) && self.check_ahead(TokenKind::RBracket, 1) {
+        // Check for postfix `[]` (array type), repeated for nested arrays: `T[][]` is
+        // `Array(Array(T))`. A single `if` only matched one `[]`, so `Int32[][]` / `UInt8[][]`
+        // failed to parse (the second `[` was left dangling → "expected Eq, got LBracket").
+        let mut ty = base;
+        while self.check(TokenKind::LBracket) && self.check_ahead(TokenKind::RBracket, 1) {
             self.advance(); // [
             self.advance(); // ]
-            TypeExpr::Array(Box::new(base), Span::dummy())
-        } else {
-            base
+            ty = TypeExpr::Array(Box::new(ty), Span::dummy());
         }
+        ty
     }
 }
