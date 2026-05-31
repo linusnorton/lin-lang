@@ -3825,6 +3825,26 @@ val c: Array<Array<Int32>> = [[1, 2], [3, 4]]
 }
 
 #[test]
+fn test_nested_array_type_postfix() {
+    // Regression: the postfix `[]` type suffix must repeat for nested arrays. `T[][]` is
+    // `Array(Array(T))`; a single `if` only matched one `[]`, so `Int32[][]` / `UInt8[][]`
+    // failed to parse ("expected Eq, got LBracket"). The `Array<Array<T>>` generic form
+    // already worked; the postfix form must too.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { length } from "std/array"
+
+val a: Int32[][] = [[1, 2], [3, 4]]
+val b: UInt8[][] = [[255], [0, 128]]
+val c: String[][][] = [[["x"]]]
+print(toString(a[1][0]))
+print(toString(length(b)))
+print(c[0][0][0])
+"#);
+    assert_eq!(out, vec!["3", "2", "x"]);
+}
+
+#[test]
 fn test_generic_alias_single_param() {
     // A user generic type alias `Box<T>` type-checks AND runs end-to-end: the param `T` is
     // bound while resolving the declaration body, so `Box<Int32>` substitutes correctly.
@@ -5586,4 +5606,56 @@ print(showA(a))
 print(showB(b))
 "#);
     assert_eq!(out, vec!["A ok 42", "B err 7"]);
+}
+
+#[test]
+fn test_multiline_union_leading_pipe() {
+    // The spec §18 canonical form: a multi-line tagged union with a leading `|` on each
+    // variant in a `type` alias. Previously failed to parse ("unexpected token Pipe")
+    // because the indented body's INDENT token sat between `=` and the first `|`.
+    let out = run(r#"import { print } from "std/io"
+type Result =
+  | { "type": "success", "value": Int32 }
+  | { "type": "failure", "error": String }
+val r: Result = { "type": "success", "value": 7 }
+val msg = match r
+  has { "type": "success", "value": v } => "ok ${v}"
+  has { "type": "failure", "error": e } => "err ${e}"
+  else => "?"
+print(msg)
+"#);
+    assert_eq!(out, vec!["ok 7"]);
+}
+
+#[test]
+fn test_multiline_union_no_leading_pipe() {
+    // Multi-line union whose first variant has no leading pipe and a `|` continues the
+    // next line. Previously this STACK-OVERFLOWED the parser; now it parses and runs.
+    let out = run(r#"import { print } from "std/io"
+type Result =
+  { "type": "success", "value": Int32 }
+  | { "type": "failure", "error": String }
+val r: Result = { "type": "failure", "error": "boom" }
+val msg = match r
+  has { "type": "success", "value": v } => "ok ${v}"
+  has { "type": "failure", "error": e } => "err ${e}"
+  else => "?"
+print(msg)
+"#);
+    assert_eq!(out, vec!["err boom"]);
+}
+
+#[test]
+fn test_multiline_single_variant_body_then_decl() {
+    // An indented single-variant body (no pipe) must not swallow the following decl:
+    // the trailing Dedent is consumed without over-running the statement boundary.
+    let out = run(r#"import { print } from "std/io"
+type Box =
+  { "value": Int32 }
+type Other = { "x": String }
+val b: Box = { "value": 9 }
+val o: Other = { "x": "hi" }
+print("${b["value"]} ${o["x"]}")
+"#);
+    assert_eq!(out, vec!["9 hi"]);
 }
